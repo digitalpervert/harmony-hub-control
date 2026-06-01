@@ -1,0 +1,4203 @@
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MQTT_CONFIG "/data/codexmqtt/config.json"
+#define WPA_CONFIG "/etc/wpa_supplicant.conf"
+#define HUB_ID_FILE "/data/codex/hub_id"
+#define DEVICE_LIST "/data/resources/DeviceList.json"
+#define FUNCTION_LIST "/data/resources/FunctionList.json"
+#define PROTOCOL_LIST "/data/resources/ProtocolList.json"
+#define RESOURCE_RELOAD_FLAG "/data/codex/reload_resources"
+#define RESOURCE_BACKUP_DIR "/data/codex/resource-backups"
+#define IR_EVENT_LOG "/data/codex/ir-events.log"
+#define IR_CANCEL_PREFIX "/tmp/codex_ir_cancel_"
+#define IR_EVENT_MAX_BYTES 65536
+#define MAX_REQUEST_BODY (512 * 1024)
+#define MAX_REQUEST_BYTES (MAX_REQUEST_BODY + 8192)
+#define MAX_RESOURCE_FILE (2 * 1024 * 1024)
+#define MAX_IR_DEVICES 32
+#define MAX_IR_COMMANDS 160
+#define MAX_IR_STORED_COMMANDS 2048
+#define MAX_IR_BATCH_COMMANDS 1024
+#define MAX_BT_SEQUENCE_BODY 32768
+
+static const char *BUILTIN_PROTOCOL_TOSHIBA_32 =
+    "{\"IRSegments\":[{\"Header\":[{\"Value\":8990,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":4490,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Payload\":{\"NumberOfBits\":32,\"Encodings\":[{\"Atoms\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":552,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"BitType\":0},{\"Atoms\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":1662,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"BitType\":1}],\"ToggleBit\":null,\"EncodingType\":0},\"Trailer\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null}],\"TotalLength\":107870,\"Name\":\"Toshiba 32 Bit\"}],\"Attributes\":[],\"IsPadded\":true,\"IsFullSequence\":true,\"Rating\":null,\"NumberOfLinkedLanguage\":0,\"Status\":null,\"IsPublic\":true,\"HoldDelay\":null,\"PressMinimumRepeats\":1,\"SendingType\":0,\"Name\":\"Toshiba 32 Bit\",\"ControlSection\":null,\"Flags\":[],\"__type\":\"IrProtocol\",\"CarrierFrequency\":38000,\"Id-\":2,\"CodeSegments\":[{\"Header\":[{\"Value\":8990,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":2230,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Payload\":null,\"TotalLength\":0,\"Trailer\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":96077,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Atoms\":[{\"Value\":8990,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":2230,\"Type\":0,\"MinValue\":null,\"MaxValue\":null},{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":96077,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Name\":\"Toshiba 32 Bit KeyCodeRepeat\"}],\"KeyCode\":{\"Start\":[{\"SegmentType\":1,\"SegmentName\":\"Toshiba 32 Bit\"}],\"Repeat\":[{\"SegmentType\":0,\"SegmentName\":\"Toshiba 32 Bit KeyCodeRepeat\"}],\"Finish\":null},\"HoldMinimumRepeats\":null,\"RelatedProtocols\":[]}";
+
+static const char *BUILTIN_PROTOCOL_MEMOREX_O1 =
+    "{\"IRSegments\":[{\"Header\":[{\"Value\":9000,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":4500,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Payload\":{\"NumberOfBits\":32,\"Encodings\":[{\"Atoms\":[{\"Value\":560,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":560,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"BitType\":0},{\"Atoms\":[{\"Value\":560,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":1690,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"BitType\":1}],\"ToggleBit\":null,\"EncodingType\":0},\"Trailer\":[{\"Value\":560,\"Type\":1,\"MinValue\":null,\"MaxValue\":null}],\"TotalLength\":107600,\"Name\":\"MemorexO1 32 Bit\"}],\"Attributes\":[],\"IsPadded\":null,\"IsFullSequence\":null,\"Rating\":null,\"NumberOfLinkedLanguage\":0,\"Status\":null,\"IsPublic\":true,\"HoldDelay\":null,\"PressMinimumRepeats\":null,\"SendingType\":0,\"Name\":\"MemorexO1 32 Bit\",\"ControlSection\":null,\"Flags\":[],\"__type\":\"IrProtocol\",\"CarrierFrequency\":38000,\"Id-\":679,\"CodeSegments\":[],\"KeyCode\":{\"Start\":null,\"Repeat\":[{\"SegmentType\":1,\"SegmentName\":\"MemorexO1 32 Bit\"}],\"Finish\":null},\"HoldMinimumRepeats\":null,\"RelatedProtocols\":[]}";
+
+struct request {
+    char method[8];
+    char path[256];
+    char auth[512];
+    int body_truncated;
+    char *body;
+    size_t body_len;
+};
+
+struct mqtt_config {
+    int enabled;
+    int ha_discovery;
+    int port;
+    int poll_seconds;
+    int keep_alive;
+    char host[128];
+    char username[128];
+    char password[256];
+    char base_topic[128];
+    char discovery_prefix[128];
+    char client_id[128];
+    char name[128];
+};
+
+struct wifi_config {
+    int hidden;
+    int open;
+    char ssid[256];
+    char psk[256];
+};
+
+struct ir_command {
+    char id[32];
+    char name[128];
+    char keycode[256];
+    int protocol_id;
+    int learned;
+    int has_raw;
+};
+
+struct ir_device {
+    char id[32];
+    char name[128];
+    char manufacturer[128];
+    char model[128];
+    char type[80];
+    int control_port;
+    int transport;
+    int command_count;
+    struct ir_command commands[MAX_IR_COMMANDS];
+};
+
+struct ir_inventory {
+    int device_count;
+    long max_device_id;
+    long max_command_id;
+    struct ir_device devices[MAX_IR_DEVICES];
+};
+
+static void analyze_capture_storage(const char *raw_code, const char *keycode_in, const char *nec_in, const char *protocol_text, char *mode_out, size_t mode_len, char *keycode_out, size_t keycode_len, char *nec_out, size_t nec_len, int *protocol_id_out, char *summary, size_t summary_len);
+static int repair_known_protocols_for_current_commands(void);
+
+static void chomp(char *s) {
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = 0;
+    }
+}
+
+static int read_text(const char *path, char *out, size_t outlen) {
+    FILE *f = fopen(path, "r");
+    size_t n;
+    if (!f) {
+        if (outlen) out[0] = 0;
+        return -1;
+    }
+    n = fread(out, 1, outlen - 1, f);
+    out[n] = 0;
+    fclose(f);
+    return (int)n;
+}
+
+static char *read_file_alloc(const char *path, size_t maxlen, size_t *outlen) {
+    FILE *f = fopen(path, "rb");
+    char *buf;
+    long n;
+    size_t got;
+    if (outlen) *outlen = 0;
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    n = ftell(f);
+    if (n < 0 || (size_t)n > maxlen) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = 0;
+    if (outlen) *outlen = got;
+    return buf;
+}
+
+static int write_file_atomic(const char *path, const char *data, size_t len) {
+    char tmp[256];
+    FILE *f;
+    snprintf(tmp, sizeof(tmp), "%s.new", path);
+    f = fopen(tmp, "wb");
+    if (!f) return -1;
+    if (fwrite(data, 1, len, f) != len) {
+        fclose(f);
+        unlink(tmp);
+        return -1;
+    }
+    fputc('\n', f);
+    fclose(f);
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    sync();
+    return 0;
+}
+
+static char *json_escape_alloc(const char *s) {
+    size_t need = 3;
+    const char *p;
+    char *out, *w;
+    for (p = s; *p; p++) {
+        if (*p == '"' || *p == '\\' || *p == '\n' || *p == '\r' || *p == '\t') need += 2;
+        else need++;
+    }
+    out = (char *)malloc(need);
+    if (!out) return NULL;
+    w = out;
+    *w++ = '"';
+    for (p = s; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            *w++ = '\\';
+            *w++ = *p;
+        } else if (*p == '\n') {
+            *w++ = '\\'; *w++ = 'n';
+        } else if (*p == '\r') {
+            *w++ = '\\'; *w++ = 'r';
+        } else if (*p == '\t') {
+            *w++ = '\\'; *w++ = 't';
+        } else {
+            *w++ = *p;
+        }
+    }
+    *w++ = '"';
+    *w = 0;
+    return out;
+}
+
+static int safe_label(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    if (!s[0]) return 0;
+    while (*p) {
+        if (*p < 32 || *p == 127) return 0;
+        if (*p == '"' || *p == '\\') return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int safe_run_id(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t n = strlen(s);
+    if (n == 0 || n > 96) return 0;
+    while (*p) {
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') return 0;
+        p++;
+    }
+    return 1;
+}
+
+static void shell_escape_single(const char *s, char *out, size_t outlen) {
+    size_t w = 0;
+    if (outlen == 0) return;
+    while (*s && w + 5 < outlen) {
+        if (*s == '\'') {
+            memcpy(out + w, "'\\''", 4);
+            w += 4;
+        } else {
+            out[w++] = *s;
+        }
+        s++;
+    }
+    out[w] = 0;
+}
+
+static int run_cmd(const char *cmd, char *out, size_t outlen) {
+    FILE *p = popen(cmd, "r");
+    size_t n = 0;
+    if (!p) {
+        if (outlen) out[0] = 0;
+        return -1;
+    }
+    if (outlen) {
+        n = fread(out, 1, outlen - 1, p);
+        out[n] = 0;
+    }
+    return pclose(p);
+}
+
+static void html(FILE *f, const char *s) {
+    while (*s) {
+        switch (*s) {
+        case '&': fputs("&amp;", f); break;
+        case '<': fputs("&lt;", f); break;
+        case '>': fputs("&gt;", f); break;
+        case '"': fputs("&quot;", f); break;
+        case '\'': fputs("&#39;", f); break;
+        default: fputc(*s, f); break;
+        }
+        s++;
+    }
+}
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void url_decode(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '+') {
+            *w++ = ' ';
+            r++;
+        } else if (*r == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
+            *w++ = (char)(hexval(r[1]) * 16 + hexval(r[2]));
+            r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
+
+static void form_value(const char *body, const char *name, char *out, size_t outlen) {
+    size_t namelen = strlen(name);
+    const char *p = body;
+    if (!outlen) return;
+    out[0] = 0;
+    if (!body) return;
+    while (p && *p) {
+        const char *eq = strchr(p, '=');
+        const char *amp = strchr(p, '&');
+        size_t keylen, vallen;
+        if (!eq) return;
+        if (amp && amp < eq) {
+            p = amp + 1;
+            continue;
+        }
+        keylen = (size_t)(eq - p);
+        if (keylen == namelen && strncmp(p, name, namelen) == 0) {
+            const char *vstart = eq + 1;
+            const char *vend = amp ? amp : p + strlen(p);
+            vallen = (size_t)(vend - vstart);
+            if (vallen >= outlen) vallen = outlen - 1;
+            memcpy(out, vstart, vallen);
+            out[vallen] = 0;
+            url_decode(out);
+            return;
+        }
+        p = amp ? amp + 1 : NULL;
+    }
+}
+
+static void query_value(const char *path, const char *name, char *out, size_t outlen) {
+    const char *q = strchr(path, '?');
+    if (!q) {
+        if (outlen) out[0] = 0;
+        return;
+    }
+    form_value(q + 1, name, out, outlen);
+}
+
+static int form_checked(const char *body, const char *name) {
+    char tmp[8];
+    form_value(body, name, tmp, sizeof(tmp));
+    return tmp[0] != 0;
+}
+
+static int content_length(const char *headers) {
+    const char *p = headers;
+    const char *needle = "content-length:";
+    size_t nlen = strlen(needle);
+    while (*p) {
+        size_t i;
+        for (i = 0; i < nlen; i++) {
+            if (!p[i] || tolower((unsigned char)p[i]) != needle[i]) break;
+        }
+        if (i == nlen) {
+            long value;
+            char *end;
+            p += nlen;
+            while (*p == ' ' || *p == '\t') p++;
+            errno = 0;
+            value = strtol(p, &end, 10);
+            if (errno != 0 || end == p || value < 0) return 0;
+            if (value > MAX_REQUEST_BODY) return MAX_REQUEST_BODY + 1;
+            return (int)value;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static void send_text(int fd, const char *status, const char *body) {
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status);
+    send(fd, hdr, strlen(hdr), 0);
+    send(fd, body, strlen(body), 0);
+}
+
+static void send_all(int fd, const char *data, size_t len) {
+    while (len > 0) {
+        ssize_t sent = send(fd, data, len, 0);
+        if (sent <= 0) return;
+        data += sent;
+        len -= (size_t)sent;
+    }
+}
+
+static int http_get_body(const char *host, const char *path, char **body, size_t max_body, char *err, size_t errlen) {
+    struct hostent *he;
+    struct sockaddr_in addr;
+    struct timeval tv;
+    int fd, status = 0;
+    char req[1024];
+    char *buf, *hdr_end, *p;
+    size_t cap = max_body + 8192, n = 0, body_len;
+    ssize_t got;
+    *body = NULL;
+    if (errlen) err[0] = 0;
+    he = gethostbyname(host);
+    if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
+        snprintf(err, errlen, "dns failed");
+        return -1;
+    }
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        snprintf(err, errlen, "socket failed");
+        return -1;
+    }
+    tv.tv_sec = 8;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        snprintf(err, errlen, "connect failed");
+        return -1;
+    }
+    snprintf(req, sizeof(req),
+        "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: HarmonyHubControl/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        path, host);
+    send_all(fd, req, strlen(req));
+    buf = (char *)malloc(cap + 1);
+    if (!buf) {
+        close(fd);
+        snprintf(err, errlen, "out of memory");
+        return -1;
+    }
+    while (n < cap) {
+        got = recv(fd, buf + n, cap - n, 0);
+        if (got <= 0) break;
+        n += (size_t)got;
+    }
+    close(fd);
+    buf[n] = 0;
+    if (n == cap) {
+        free(buf);
+        snprintf(err, errlen, "response too large");
+        return -1;
+    }
+    sscanf(buf, "HTTP/%*s %d", &status);
+    hdr_end = strstr(buf, "\r\n\r\n");
+    if (!hdr_end || status != 200) {
+        free(buf);
+        snprintf(err, errlen, "http %d", status);
+        return -1;
+    }
+    p = hdr_end + 4;
+    while (*p && isspace((unsigned char)*p)) p++;
+    body_len = strlen(p);
+    if (body_len > max_body) {
+        free(buf);
+        snprintf(err, errlen, "body too large");
+        return -1;
+    }
+    *body = (char *)malloc(body_len + 1);
+    if (!*body) {
+        free(buf);
+        snprintf(err, errlen, "out of memory");
+        return -1;
+    }
+    memcpy(*body, p, body_len + 1);
+    free(buf);
+    return 0;
+}
+
+static void send_file_download(int fd, const char *path, const char *filename, const char *ctype) {
+    char hdr[512];
+    char *data;
+    size_t len = 0;
+    data = read_file_alloc(path, MAX_RESOURCE_FILE, &len);
+    if (!data) {
+        send_text(fd, "404 Not Found", "file not available\n");
+        return;
+    }
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+        "Cache-Control: no-store\r\nContent-Disposition: attachment; filename=\"%s\"\r\nConnection: close\r\n\r\n",
+        ctype, (unsigned long)len, filename);
+    send_all(fd, hdr, strlen(hdr));
+    send_all(fd, data, len);
+    free(data);
+}
+
+static FILE *send_json_start(int fd, const char *status) {
+    char hdr[256];
+    FILE *f;
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status);
+    send(fd, hdr, strlen(hdr), 0);
+    f = fdopen(dup(fd), "w");
+    return f;
+}
+
+static int json_string(const char *json, const char *key, char *out, size_t outlen) {
+    char needle[64];
+    const char *p;
+    char *w = out;
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    p = strstr(json, needle);
+    if (!p) {
+        out[0] = 0;
+        return 0;
+    }
+    p = strchr(p + strlen(needle), ':');
+    if (!p) {
+        out[0] = 0;
+        return 0;
+    }
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') {
+        out[0] = 0;
+        return 0;
+    }
+    p++;
+    while (*p && *p != '"' && (size_t)(w - out) + 1 < outlen) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'n') *w++ = '\n';
+            else if (*p == 't') *w++ = '\t';
+            else *w++ = *p;
+        } else {
+            *w++ = *p;
+        }
+        p++;
+    }
+    *w = 0;
+    return 1;
+}
+
+static int json_int(const char *json, const char *key, int def) {
+    char needle[64];
+    const char *p;
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    p = strstr(json, needle);
+    if (!p) return def;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return def;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return atoi(p);
+}
+
+static int json_bool(const char *json, const char *key, int def) {
+    char needle[64];
+    const char *p;
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    p = strstr(json, needle);
+    if (!p) return def;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return def;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+    return def;
+}
+
+static const char *find_matching_json(const char *open, char opener, char closer) {
+    int depth = 0, in_string = 0, esc = 0;
+    const char *p;
+    for (p = open; *p; p++) {
+        if (in_string) {
+            if (esc) esc = 0;
+            else if (*p == '\\') esc = 1;
+            else if (*p == '"') in_string = 0;
+        } else {
+            if (*p == '"') in_string = 1;
+            else if (*p == opener) depth++;
+            else if (*p == closer) {
+                depth--;
+                if (depth == 0) return p;
+            }
+        }
+    }
+    return NULL;
+}
+
+static const char *find_key_range(const char *start, const char *end, const char *key) {
+    char needle[96];
+    const char *p = start;
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    while (p && (!end || p < end)) {
+        p = strstr(p, needle);
+        if (!p || (end && p >= end)) return NULL;
+        return p;
+    }
+    return NULL;
+}
+
+static int json_string_range(const char *start, const char *end, const char *key, char *out, size_t outlen) {
+    const char *p = find_key_range(start, end, key);
+    char *w = out;
+    if (!outlen) return 0;
+    out[0] = 0;
+    if (!p) return 0;
+    p = strchr(p + strlen(key) + 2, ':');
+    if (!p || (end && p >= end)) return 0;
+    p++;
+    while (*p && (!end || p < end) && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return 0;
+    p++;
+    while (*p && (!end || p < end) && *p != '"' && (size_t)(w - out) + 1 < outlen) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'n') *w++ = '\n';
+            else if (*p == 't') *w++ = '\t';
+            else if (*p == 'r') *w++ = '\r';
+            else *w++ = *p;
+        } else {
+            *w++ = *p;
+        }
+        p++;
+    }
+    *w = 0;
+    return out[0] != 0;
+}
+
+static long json_long_range(const char *start, const char *end, const char *key, long def) {
+    const char *p = find_key_range(start, end, key);
+    if (!p) return def;
+    p = strchr(p + strlen(key) + 2, ':');
+    if (!p || (end && p >= end)) return def;
+    p++;
+    while (*p && (!end || p < end) && isspace((unsigned char)*p)) p++;
+    return strtol(p, NULL, 10);
+}
+
+static int json_bool_range(const char *start, const char *end, const char *key, int def) {
+    const char *p = find_key_range(start, end, key);
+    if (!p) return def;
+    p = strchr(p + strlen(key) + 2, ':');
+    if (!p || (end && p >= end)) return def;
+    p++;
+    while (*p && (!end || p < end) && isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+    return def;
+}
+
+static int json_has_nonnull_value(const char *start, const char *end, const char *key) {
+    const char *p = find_key_range(start, end, key);
+    if (!p) return 0;
+    p = strchr(p + strlen(key) + 2, ':');
+    if (!p || (end && p >= end)) return 0;
+    p++;
+    while (*p && (!end || p < end) && isspace((unsigned char)*p)) p++;
+    return strncmp(p, "null", 4) != 0;
+}
+
+static void load_mqtt(struct mqtt_config *cfg) {
+    char raw[8192];
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->enabled = 0;
+    cfg->ha_discovery = 1;
+    cfg->port = 1883;
+    cfg->poll_seconds = 10;
+    cfg->keep_alive = 60;
+    strcpy(cfg->base_topic, "harmony/hub");
+    strcpy(cfg->discovery_prefix, "homeassistant");
+    strcpy(cfg->client_id, "harmony-local-mqtt");
+    strcpy(cfg->name, "Harmony Hub");
+    if (read_text(MQTT_CONFIG, raw, sizeof(raw)) <= 0) return;
+    cfg->enabled = json_bool(raw, "enabled", cfg->enabled);
+    cfg->ha_discovery = json_bool(raw, "haDiscovery", cfg->ha_discovery);
+    cfg->port = json_int(raw, "port", cfg->port);
+    cfg->poll_seconds = json_int(raw, "pollSeconds", cfg->poll_seconds);
+    cfg->keep_alive = json_int(raw, "keepAlive", cfg->keep_alive);
+    json_string(raw, "host", cfg->host, sizeof(cfg->host));
+    json_string(raw, "username", cfg->username, sizeof(cfg->username));
+    json_string(raw, "password", cfg->password, sizeof(cfg->password));
+    json_string(raw, "baseTopic", cfg->base_topic, sizeof(cfg->base_topic));
+    json_string(raw, "discoveryPrefix", cfg->discovery_prefix, sizeof(cfg->discovery_prefix));
+    json_string(raw, "clientId", cfg->client_id, sizeof(cfg->client_id));
+    json_string(raw, "name", cfg->name, sizeof(cfg->name));
+}
+
+static void json_write_string(FILE *f, const char *s) {
+    fputc('"', f);
+    while (*s) {
+        if (*s == '"' || *s == '\\') {
+            fputc('\\', f);
+            fputc(*s, f);
+        } else if (*s == '\n') {
+            fputs("\\n", f);
+        } else if (*s == '\r') {
+            fputs("\\r", f);
+        } else if (*s == '\t') {
+            fputs("\\t", f);
+        } else {
+            fputc(*s, f);
+        }
+        s++;
+    }
+    fputc('"', f);
+}
+
+static int save_mqtt(const struct mqtt_config *cfg) {
+    FILE *f = fopen(MQTT_CONFIG ".new", "w");
+    if (!f) return -1;
+    fprintf(f, "{");
+    fprintf(f, "\"baseTopic\":"); json_write_string(f, cfg->base_topic); fprintf(f, ",");
+    fprintf(f, "\"broker\":{\"host\":"); json_write_string(f, cfg->host);
+    fprintf(f, ",\"password\":"); json_write_string(f, cfg->password);
+    fprintf(f, ",\"port\":%d,\"username\":", cfg->port); json_write_string(f, cfg->username);
+    fprintf(f, "},");
+    fprintf(f, "\"clientId\":"); json_write_string(f, cfg->client_id); fprintf(f, ",");
+    fprintf(f, "\"discoveryPrefix\":"); json_write_string(f, cfg->discovery_prefix); fprintf(f, ",");
+    fprintf(f, "\"enabled\":%s,", cfg->enabled ? "true" : "false");
+    fprintf(f, "\"haDiscovery\":%s,", cfg->ha_discovery ? "true" : "false");
+    fprintf(f, "\"keepAlive\":%d,", cfg->keep_alive);
+    fprintf(f, "\"name\":"); json_write_string(f, cfg->name); fprintf(f, ",");
+    fprintf(f, "\"pollSeconds\":%d", cfg->poll_seconds);
+    fprintf(f, "}\n");
+    fclose(f);
+    chmod(MQTT_CONFIG ".new", 0600);
+    if (rename(MQTT_CONFIG ".new", MQTT_CONFIG) != 0) return -1;
+    chmod(MQTT_CONFIG, 0600);
+    sync();
+    return 0;
+}
+
+static void parse_wpa_quoted(const char *raw, const char *key, char *out, size_t outlen) {
+    char needle[32];
+    const char *p;
+    char *w = out;
+    snprintf(needle, sizeof(needle), "%s=", key);
+    p = strstr(raw, needle);
+    out[0] = 0;
+    if (!p) return;
+    p += strlen(needle);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return;
+    p++;
+    while (*p && *p != '"' && (size_t)(w - out) + 1 < outlen) {
+        if (*p == '\\' && p[1]) p++;
+        *w++ = *p++;
+    }
+    *w = 0;
+}
+
+static void load_wifi(struct wifi_config *cfg) {
+    char raw[4096];
+    memset(cfg, 0, sizeof(*cfg));
+    if (read_text(WPA_CONFIG, raw, sizeof(raw)) <= 0) return;
+    parse_wpa_quoted(raw, "ssid", cfg->ssid, sizeof(cfg->ssid));
+    parse_wpa_quoted(raw, "psk", cfg->psk, sizeof(cfg->psk));
+    cfg->hidden = strstr(raw, "scan_ssid=1") != NULL;
+    cfg->open = strstr(raw, "key_mgmt=NONE") != NULL;
+}
+
+static void wpa_write_quoted(FILE *f, const char *s) {
+    fputc('"', f);
+    while (*s) {
+        if (*s == '"' || *s == '\\') fputc('\\', f);
+        fputc(*s, f);
+        s++;
+    }
+    fputc('"', f);
+}
+
+static int save_wifi(const struct wifi_config *cfg) {
+    FILE *f = fopen(WPA_CONFIG ".new", "w");
+    if (!f) return -1;
+    fprintf(f, "ctrl_interface=/var/run/wpa_supplicant\n");
+    fprintf(f, "ap_scan=1\n\n");
+    fprintf(f, "network={\n\tssid=");
+    wpa_write_quoted(f, cfg->ssid);
+    fprintf(f, "\n");
+    if (cfg->hidden) fprintf(f, "\tscan_ssid=1\n");
+    if (cfg->open) {
+        fprintf(f, "\tkey_mgmt=NONE\n");
+    } else {
+        fprintf(f, "\tkey_mgmt=WPA-PSK\n\tpsk=");
+        wpa_write_quoted(f, cfg->psk);
+        fprintf(f, "\n");
+    }
+    fprintf(f, "}\n");
+    fclose(f);
+    chmod(WPA_CONFIG ".new", 0600);
+    if (rename(WPA_CONFIG ".new", WPA_CONFIG) != 0) return -1;
+    chmod(WPA_CONFIG, 0600);
+    sync();
+    return 0;
+}
+
+static void trigger_mqtt_discover(void) {
+    char hub_id[64] = "16042906";
+    char escaped[128];
+    char cmd[384];
+    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
+    chomp(hub_id);
+    shell_escape_single(hub_id, escaped, sizeof(escaped));
+    snprintf(cmd, sizeof(cmd),
+        "/data/codex/bin/codex_hbus '%s' harmony.automation?discover '{\"gatewayType\":\"codexmqtt\"}' >/dev/null 2>&1 &",
+        escaped);
+    system(cmd);
+}
+
+static int tcp_established(const char *host, int port) {
+    FILE *f;
+    char line[256];
+    struct in_addr addr;
+    unsigned long want_addr;
+    if (!host[0] || inet_aton(host, &addr) == 0) return 0;
+    want_addr = ntohl(addr.s_addr);
+    f = fopen("/proc/net/tcp", "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long rem_addr, rem_port, state;
+        if (sscanf(line, " %*d: %*X:%*X %lX:%lX %lX", &rem_addr, &rem_port, &state) == 3) {
+            if (rem_addr == want_addr && rem_port == (unsigned long)port && state == 1) {
+                fclose(f);
+                return 1;
+            }
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static void scan_command_array(const char *arr, const char *arr_end, int *count, long *max_id) {
+    const char *cpos;
+    if (count) *count = 0;
+    if (!arr || !arr_end) return;
+    cpos = arr + 1;
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end) {
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        long cid;
+        if (!obj_end || obj_end > arr_end) break;
+        cid = json_long_range(cpos, obj_end, "Id-", 0);
+        if (max_id && cid > *max_id) *max_id = cid;
+        if (count) (*count)++;
+        cpos = obj_end + 1;
+    }
+}
+
+static int command_array_has_name(const char *arr, const char *arr_end, const char *name) {
+    const char *cpos;
+    if (!arr || !arr_end || !name || !name[0]) return 0;
+    cpos = arr + 1;
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end) {
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        char existing[128];
+        if (!obj_end || obj_end > arr_end) break;
+        json_string_range(cpos, obj_end, "Name", existing, sizeof(existing));
+        if (strcmp(existing, name) == 0) return 1;
+        cpos = obj_end + 1;
+    }
+    return 0;
+}
+
+static int command_fragment_has_name(const char *fragment, const char *name) {
+    const char *cpos = fragment;
+    if (!fragment || !name || !name[0]) return 0;
+    while ((cpos = strchr(cpos, '{')) != NULL) {
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        char existing[128];
+        if (!obj_end) break;
+        json_string_range(cpos, obj_end, "Name", existing, sizeof(existing));
+        if (strcmp(existing, name) == 0) return 1;
+        cpos = obj_end + 1;
+    }
+    return 0;
+}
+
+static void scan_ir_resource_stats_from_raw(const char *raw, int *device_count, int *total_commands, long *max_device_id, long *max_command_id) {
+    const char *p = raw;
+    if (device_count) *device_count = 0;
+    if (total_commands) *total_commands = 0;
+    if (max_device_id) *max_device_id = 0;
+    if (max_command_id) *max_command_id = 0;
+    while ((p = strstr(p, "\"Device\":{")) != NULL) {
+        const char *dev_obj = strchr(p, '{');
+        const char *dev_end = dev_obj ? find_matching_json(dev_obj, '{', '}') : NULL;
+        const char *next_dev, *cmd_key, *cmd_arr, *cmd_end;
+        long id;
+        int cmd_count = 0;
+        if (!dev_obj || !dev_end) break;
+        id = json_long_range(dev_obj, dev_end, "Id-", 0);
+        if (id > 0) {
+            if (device_count) (*device_count)++;
+            if (max_device_id && id > *max_device_id) *max_device_id = id;
+        }
+        next_dev = strstr(dev_end + 1, "\"Device\":{");
+        cmd_key = strstr(dev_end, "\"Commands\":[");
+        if (cmd_key && (!next_dev || cmd_key < next_dev)) {
+            cmd_arr = strchr(cmd_key, '[');
+            cmd_end = cmd_arr ? find_matching_json(cmd_arr, '[', ']') : NULL;
+            scan_command_array(cmd_arr, cmd_end, &cmd_count, max_command_id);
+        }
+        if (total_commands) *total_commands += cmd_count;
+        p = dev_end + 1;
+    }
+}
+
+static int scan_ir_resource_stats(int *device_count, int *total_commands, long *max_device_id, long *max_command_id) {
+    char *raw;
+    size_t len = 0;
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    (void)len;
+    if (!raw) return -1;
+    scan_ir_resource_stats_from_raw(raw, device_count, total_commands, max_device_id, max_command_id);
+    free(raw);
+    return 0;
+}
+
+static int load_ir_inventory(struct ir_inventory *inv) {
+    char *raw;
+    const char *p;
+    size_t len = 0;
+    memset(inv, 0, sizeof(*inv));
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) return -1;
+    p = raw;
+    while ((p = strstr(p, "\"Device\":{")) != NULL && inv->device_count < MAX_IR_DEVICES) {
+        struct ir_device *dev = &inv->devices[inv->device_count];
+        const char *dev_obj = strchr(p, '{');
+        const char *dev_end = dev_obj ? find_matching_json(dev_obj, '{', '}') : NULL;
+        const char *next_dev, *cmd_key, *cmd_arr, *cmd_end, *cpos;
+        long id;
+        if (!dev_obj || !dev_end) break;
+        id = json_long_range(dev_obj, dev_end, "Id-", 0);
+        if (id <= 0) {
+            p = dev_end + 1;
+            continue;
+        }
+        snprintf(dev->id, sizeof(dev->id), "%ld", id);
+        if (id > inv->max_device_id) inv->max_device_id = id;
+        json_string_range(dev_obj, dev_end, "Name", dev->name, sizeof(dev->name));
+        json_string_range(dev_obj, dev_end, "Manufacturer", dev->manufacturer, sizeof(dev->manufacturer));
+        json_string_range(dev_obj, dev_end, "Model", dev->model, sizeof(dev->model));
+        json_string_range(dev_obj, dev_end, "DeviceTypeDisplayName", dev->type, sizeof(dev->type));
+        dev->control_port = (int)json_long_range(dev_obj, dev_end, "ControlPort", 7);
+        dev->transport = (int)json_long_range(dev_obj, dev_end, "Transport", 1);
+        next_dev = strstr(dev_end + 1, "\"Device\":{");
+        cmd_key = strstr(dev_end, "\"Commands\":[");
+        cmd_arr = (cmd_key && (!next_dev || cmd_key < next_dev)) ? strchr(cmd_key, '[') : NULL;
+        cmd_end = cmd_arr ? find_matching_json(cmd_arr, '[', ']') : NULL;
+        if (cmd_arr && cmd_end) {
+            cpos = cmd_arr + 1;
+            while ((cpos = strchr(cpos, '{')) != NULL && cpos < cmd_end && dev->command_count < MAX_IR_COMMANDS) {
+                struct ir_command *cmd = &dev->commands[dev->command_count];
+                const char *obj_end = find_matching_json(cpos, '{', '}');
+                long cid;
+                if (!obj_end || obj_end > cmd_end) break;
+                cid = json_long_range(cpos, obj_end, "Id-", 0);
+                snprintf(cmd->id, sizeof(cmd->id), "%ld", cid);
+                if (cid > inv->max_command_id) inv->max_command_id = cid;
+                json_string_range(cpos, obj_end, "Name", cmd->name, sizeof(cmd->name));
+                json_string_range(cpos, obj_end, "KeyCode", cmd->keycode, sizeof(cmd->keycode));
+                cmd->protocol_id = (int)json_long_range(cpos, obj_end, "ProtocolId", 0);
+                cmd->learned = json_bool_range(cpos, obj_end, "IsLearned", 0);
+                cmd->has_raw = json_has_nonnull_value(cpos, obj_end, "Raw") && !cmd->keycode[0];
+                dev->command_count++;
+                cpos = obj_end + 1;
+            }
+        }
+        inv->device_count++;
+        p = dev_end + 1;
+    }
+    free(raw);
+    return 0;
+}
+
+static int find_ir_device_by_name(const char *name, char *device_id, size_t device_id_len) {
+    struct ir_inventory inv;
+    int i;
+    if (!name || !name[0] || !device_id || !device_id_len) return -1;
+    if (load_ir_inventory(&inv) != 0) return -1;
+    for (i = 0; i < inv.device_count; i++) {
+        if (strcasecmp(inv.devices[i].name, name) == 0) {
+            snprintf(device_id, device_id_len, "%s", inv.devices[i].id);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void capture_ir_command_action(char *out, size_t outlen);
+
+static void render_inventory_json(int fd) {
+    char *raw;
+    size_t len = 0;
+    const char *p;
+    FILE *f = send_json_start(fd, "200 OK");
+    int device_count = 0, total_commands = 0, emitted = 0;
+    if (!f) {
+        return;
+    }
+    repair_known_protocols_for_current_commands();
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        fputs("{\"ok\":false,\"error\":\"unable to read inventory\"}\n", f);
+        fclose(f);
+        return;
+    }
+    scan_ir_resource_stats_from_raw(raw, &device_count, &total_commands, NULL, NULL);
+    fprintf(f, "{\"ok\":true,\"deviceCount\":%d,\"totalCommandCount\":%d,\"displayDeviceLimit\":%d,\"displayCommandLimit\":%d,\"storageCommandLimit\":%d,\"batchCommandLimit\":%d,\"requestBodyLimit\":%d,\"resourceFileLimit\":%d,\"devices\":[",
+        device_count, total_commands, MAX_IR_DEVICES, MAX_IR_COMMANDS, MAX_IR_STORED_COMMANDS,
+        MAX_IR_BATCH_COMMANDS, MAX_REQUEST_BODY, MAX_RESOURCE_FILE);
+    p = raw;
+    while ((p = strstr(p, "\"Device\":{")) != NULL) {
+        const char *dev_obj = strchr(p, '{');
+        const char *dev_end = dev_obj ? find_matching_json(dev_obj, '{', '}') : NULL;
+        const char *next_dev, *cmd_key, *cmd_arr, *cmd_end, *cpos;
+        char id[32], name[128], manufacturer[128], model[128], type[80];
+        long did;
+        int command_emitted = 0;
+        if (!dev_obj || !dev_end) break;
+        did = json_long_range(dev_obj, dev_end, "Id-", 0);
+        if (did <= 0) {
+            p = dev_end + 1;
+            continue;
+        }
+        snprintf(id, sizeof(id), "%ld", did);
+        json_string_range(dev_obj, dev_end, "Name", name, sizeof(name));
+        json_string_range(dev_obj, dev_end, "Manufacturer", manufacturer, sizeof(manufacturer));
+        json_string_range(dev_obj, dev_end, "Model", model, sizeof(model));
+        json_string_range(dev_obj, dev_end, "DeviceTypeDisplayName", type, sizeof(type));
+        if (emitted++) fputc(',', f);
+        fputs("{\"id\":", f); json_write_string(f, id);
+        fputs(",\"name\":", f); json_write_string(f, name);
+        fputs(",\"manufacturer\":", f); json_write_string(f, manufacturer);
+        fputs(",\"model\":", f); json_write_string(f, model);
+        fputs(",\"type\":", f); json_write_string(f, type);
+        fprintf(f, ",\"controlPort\":%ld,\"transport\":%ld,\"commands\":[",
+            json_long_range(dev_obj, dev_end, "ControlPort", 7),
+            json_long_range(dev_obj, dev_end, "Transport", 1));
+        next_dev = strstr(dev_end + 1, "\"Device\":{");
+        cmd_key = strstr(dev_end, "\"Commands\":[");
+        cmd_arr = (cmd_key && (!next_dev || cmd_key < next_dev)) ? strchr(cmd_key, '[') : NULL;
+        cmd_end = cmd_arr ? find_matching_json(cmd_arr, '[', ']') : NULL;
+        cpos = (cmd_arr && cmd_end) ? cmd_arr + 1 : NULL;
+        while (cpos && (cpos = strchr(cpos, '{')) != NULL && cpos < cmd_end) {
+            const char *obj_end = find_matching_json(cpos, '{', '}');
+            char cid[32], cmd_name[128], keycode[256];
+            long cid_num;
+            int has_raw;
+            if (!obj_end || obj_end > cmd_end) break;
+            cid_num = json_long_range(cpos, obj_end, "Id-", 0);
+            snprintf(cid, sizeof(cid), "%ld", cid_num);
+            json_string_range(cpos, obj_end, "Name", cmd_name, sizeof(cmd_name));
+            json_string_range(cpos, obj_end, "KeyCode", keycode, sizeof(keycode));
+            has_raw = json_has_nonnull_value(cpos, obj_end, "Raw") && !keycode[0];
+            if (command_emitted++) fputc(',', f);
+            fputs("{\"id\":", f); json_write_string(f, cid);
+            fputs(",\"name\":", f); json_write_string(f, cmd_name);
+            fputs(",\"keycode\":", f); json_write_string(f, keycode);
+            fprintf(f, ",\"protocolId\":%ld,\"learned\":%s,\"raw\":%s}",
+                json_long_range(cpos, obj_end, "ProtocolId", 0),
+                json_bool_range(cpos, obj_end, "IsLearned", 0) ? "true" : "false",
+                has_raw ? "true" : "false");
+            cpos = obj_end + 1;
+        }
+        fputs("]}", f);
+        p = dev_end + 1;
+    }
+    fputs("]}\n", f);
+    fclose(f);
+    free(raw);
+}
+
+static void render_capture_json(int fd) {
+    char reply[4096];
+    char mode[16], keycode[512], nec[64], summary[160];
+    int protocol_id = 2;
+    FILE *f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    capture_ir_command_action(reply, sizeof(reply));
+    analyze_capture_storage(reply, "", "", "2", mode, sizeof(mode), keycode, sizeof(keycode), nec, sizeof(nec), &protocol_id, summary, sizeof(summary));
+    fputs("{\"ok\":true,\"raw\":", f); json_write_string(f, reply);
+    fputs(",\"mode\":", f); json_write_string(f, mode);
+    fprintf(f, ",\"protocolId\":%d,\"keycode\":", protocol_id); json_write_string(f, keycode);
+    fputs(",\"nec\":", f); json_write_string(f, nec);
+    fputs(",\"analysis\":", f); json_write_string(f, summary);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static int safe_remotecentral_path(const char *path) {
+    const unsigned char *p = (const unsigned char *)path;
+    size_t n = strlen(path);
+    if (n == 0 || n > 360) return 0;
+    if (strncmp(path, "/cgi-bin/codes/", 15) != 0) return 0;
+    if (strstr(path, "..") || strstr(path, "://")) return 0;
+    while (*p) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '/' || *p == '_' ||
+            *p == '-' || *p == '.' || *p == '?' || *p == '=' ||
+            *p == '&') {
+            p++;
+            continue;
+        }
+        if (*p == '%') {
+            int a, b;
+            if (!isxdigit((unsigned char)p[1]) || !isxdigit((unsigned char)p[2])) return 0;
+            a = tolower((unsigned char)p[1]);
+            b = tolower((unsigned char)p[2]);
+            if (a == '2' && b == 'e') return 0;
+            p += 3;
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static void normalize_remotecentral_path(char *path) {
+    const char *hosts[] = {
+        "https://www.remotecentral.com",
+        "http://www.remotecentral.com",
+        "https://remotecentral.com",
+        "http://remotecentral.com"
+    };
+    int i;
+    for (i = 0; i < 4; i++) {
+        const char *host = hosts[i];
+        size_t n = strlen(host);
+        if (strncasecmp(path, host, n) == 0) {
+            memmove(path, path + n, strlen(path + n) + 1);
+            return;
+        }
+    }
+}
+
+static void render_remotecentral_fetch_json(int fd, const struct request *req) {
+    char path[384], err[128];
+    char *remote = NULL;
+    FILE *f;
+    if (strcmp(req->method, "POST") == 0) {
+        form_value(req->body, "path", path, sizeof(path));
+    } else {
+        query_value(req->path, "path", path, sizeof(path));
+    }
+    chomp(path);
+    normalize_remotecentral_path(path);
+    if (!safe_remotecentral_path(path)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"source\":\"remotecentral\",\"error\":\"invalid RemoteCentral path\"}\n", f);
+        fclose(f);
+        return;
+    }
+    if (http_get_body("www.remotecentral.com", path, &remote, MAX_REQUEST_BODY, err, sizeof(err)) != 0) {
+        f = send_json_start(fd, "502 Bad Gateway");
+        if (!f) return;
+        fputs("{\"ok\":false,\"source\":\"remotecentral\",\"path\":", f);
+        json_write_string(f, path);
+        fputs(",\"error\":", f);
+        json_write_string(f, err[0] ? err : "RemoteCentral request failed");
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    }
+    f = send_json_start(fd, "200 OK");
+    if (!f) {
+        free(remote);
+        return;
+    }
+    fputs("{\"ok\":true,\"source\":\"remotecentral\",\"path\":", f);
+    json_write_string(f, path);
+    fputs(",\"html\":", f);
+    json_write_string(f, remote);
+    fputs("}\n", f);
+    fclose(f);
+    free(remote);
+}
+
+static void request_resource_reload(void) {
+    FILE *f = fopen(RESOURCE_RELOAD_FLAG, "w");
+    if (f) {
+        fputs("DeviceList\nFunctionList\nProtocolList\n", f);
+        fclose(f);
+    }
+    sync();
+    trigger_mqtt_discover();
+}
+
+static void backup_resources(void) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "mkdir -p " RESOURCE_BACKUP_DIR "; d=" RESOURCE_BACKUP_DIR "/$(date +%%Y%%m%%d_%%H%%M%%S); "
+        "mkdir -p \"$d\"; cp " DEVICE_LIST " " FUNCTION_LIST " " PROTOCOL_LIST " \"$d\" 2>/dev/null");
+    system(cmd);
+}
+
+static void backup_settings(void) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "mkdir -p " RESOURCE_BACKUP_DIR "; d=" RESOURCE_BACKUP_DIR "/settings_$(date +%%Y%%m%%d_%%H%%M%%S); "
+        "mkdir -p \"$d\"; cp " MQTT_CONFIG " " WPA_CONFIG " \"$d\" 2>/dev/null");
+    system(cmd);
+}
+
+static void bundle_value(FILE *f, const char *key, const char *path, int comma) {
+    char *data;
+    size_t len = 0;
+    if (comma) fputc(',', f);
+    json_write_string(f, key);
+    fputc(':', f);
+    data = read_file_alloc(path, MAX_RESOURCE_FILE, &len);
+    (void)len;
+    json_write_string(f, data ? data : "");
+    free(data);
+}
+
+static void send_bundle_download(int fd) {
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Content-Disposition: attachment; filename=\"harmony-owner-bundle.json\"\r\n"
+        "Connection: close\r\n\r\n";
+    FILE *f;
+    send_all(fd, hdr, strlen(hdr));
+    f = fdopen(dup(fd), "w");
+    if (!f) return;
+    fputs("{\"format\":\"harmony-owner-bundle-v1\",\"files\":{", f);
+    bundle_value(f, "DeviceList.json", DEVICE_LIST, 0);
+    bundle_value(f, "FunctionList.json", FUNCTION_LIST, 1);
+    bundle_value(f, "ProtocolList.json", PROTOCOL_LIST, 1);
+    bundle_value(f, "mqtt-config.json", MQTT_CONFIG, 1);
+    bundle_value(f, "wpa_supplicant.conf", WPA_CONFIG, 1);
+    fputs("}}\n", f);
+    fclose(f);
+}
+
+static int append_top_array_item(const char *path, const char *array_key, const char *item) {
+    size_t len, prefix_len, suffix_len, item_len, out_len;
+    char *raw, *out;
+    const char *key, *arr, *arr_end, *scan;
+    int empty = 1;
+    raw = read_file_alloc(path, MAX_RESOURCE_FILE, &len);
+    if (!raw) return -1;
+    key = strstr(raw, array_key);
+    arr = key ? strchr(key, '[') : NULL;
+    arr_end = arr ? find_matching_json(arr, '[', ']') : NULL;
+    if (!arr || !arr_end) {
+        free(raw);
+        return -1;
+    }
+    for (scan = arr + 1; scan < arr_end; scan++) {
+        if (!isspace((unsigned char)*scan)) {
+            empty = 0;
+            break;
+        }
+    }
+    prefix_len = (size_t)(arr_end - raw);
+    suffix_len = len - prefix_len;
+    item_len = strlen(item);
+    out_len = prefix_len + item_len + (empty ? 0 : 1) + suffix_len;
+    out = (char *)malloc(out_len + 1);
+    if (!out) {
+        free(raw);
+        return -1;
+    }
+    memcpy(out, raw, prefix_len);
+    if (!empty) out[prefix_len++] = ',';
+    memcpy(out + prefix_len, item, item_len);
+    memcpy(out + prefix_len + item_len, raw + (arr_end - raw), suffix_len);
+    out[out_len] = 0;
+    free(raw);
+    if (write_file_atomic(path, out, out_len) != 0) {
+        free(out);
+        return -1;
+    }
+    free(out);
+    return 0;
+}
+
+static int protocol_list_has_id(const char *raw, int protocol_id) {
+    char needle[32];
+    snprintf(needle, sizeof(needle), "\"Id-\":%d", protocol_id);
+    return raw && strstr(raw, needle) != NULL;
+}
+
+static int ensure_protocol_object(int protocol_id, const char *protocol_json) {
+    char *raw = read_file_alloc(PROTOCOL_LIST, MAX_RESOURCE_FILE, NULL);
+    int present;
+    if (!raw) return -1;
+    present = protocol_list_has_id(raw, protocol_id);
+    free(raw);
+    if (present) return 0;
+    return append_top_array_item(PROTOCOL_LIST, "\"Protocols\"", protocol_json);
+}
+
+static int ensure_builtin_protocol_for_id(int protocol_id) {
+    if (protocol_id == 2) return ensure_protocol_object(2, BUILTIN_PROTOCOL_TOSHIBA_32);
+    if (protocol_id == 679) return ensure_protocol_object(679, BUILTIN_PROTOCOL_MEMOREX_O1);
+    return 0;
+}
+
+static int protocol_file_has_id(int protocol_id) {
+    char *raw = read_file_alloc(PROTOCOL_LIST, MAX_RESOURCE_FILE, NULL);
+    int present;
+    if (!raw) return -1;
+    present = protocol_list_has_id(raw, protocol_id);
+    free(raw);
+    return present ? 1 : 0;
+}
+
+static int repair_known_protocols_for_current_commands(void) {
+    char *devices = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, NULL);
+    int need2, need679, missing2 = 0, missing679 = 0, changed = 0;
+    if (!devices) return -1;
+    need2 = strstr(devices, "\"ProtocolId\":2") != NULL;
+    need679 = strstr(devices, "\"ProtocolId\":679") != NULL;
+    free(devices);
+    if (need2) {
+        int present = protocol_file_has_id(2);
+        if (present < 0) return -1;
+        missing2 = !present;
+    }
+    if (need679) {
+        int present = protocol_file_has_id(679);
+        if (present < 0) return -1;
+        missing679 = !present;
+    }
+    if (!missing2 && !missing679) return 0;
+    backup_resources();
+    if (missing2 && ensure_builtin_protocol_for_id(2) != 0) return -1;
+    if (missing679 && ensure_builtin_protocol_for_id(679) != 0) return -1;
+    changed = missing2 || missing679;
+    if (changed) request_resource_reload();
+    return changed ? 1 : 0;
+}
+
+static int find_device_command_array(const char *raw, const char *device_id, const char **arr, const char **arr_end) {
+    const char *p = raw;
+    char idneedle[64];
+    snprintf(idneedle, sizeof(idneedle), "\"Id-\":%s", device_id);
+    while ((p = strstr(p, "\"Device\":{")) != NULL) {
+        const char *dev_obj = strchr(p, '{');
+        const char *dev_end = dev_obj ? find_matching_json(dev_obj, '{', '}') : NULL;
+        const char *cmd_key, *next_dev;
+        if (!dev_obj || !dev_end) return -1;
+        if (strstr(dev_obj, idneedle) && strstr(dev_obj, idneedle) < dev_end) {
+            next_dev = strstr(dev_end + 1, "\"Device\":{");
+            cmd_key = strstr(dev_end, "\"Commands\":[");
+            if (cmd_key && next_dev && cmd_key > next_dev) cmd_key = NULL;
+            *arr = cmd_key ? strchr(cmd_key, '[') : NULL;
+            *arr_end = *arr ? find_matching_json(*arr, '[', ']') : NULL;
+            return (*arr && *arr_end) ? 0 : -1;
+        }
+        p = dev_end + 1;
+    }
+    return -1;
+}
+
+static int append_command_to_device(const char *device_id, const char *command_json) {
+    size_t len, prefix_len, suffix_len, item_len, out_len;
+    char *raw, *out;
+    const char *arr, *arr_end, *scan;
+    int empty = 1;
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) return -1;
+    if (find_device_command_array(raw, device_id, &arr, &arr_end) != 0) {
+        free(raw);
+        return -1;
+    }
+    for (scan = arr + 1; scan < arr_end; scan++) {
+        if (!isspace((unsigned char)*scan)) {
+            empty = 0;
+            break;
+        }
+    }
+    prefix_len = (size_t)(arr_end - raw);
+    suffix_len = len - prefix_len;
+    item_len = strlen(command_json);
+    out_len = prefix_len + item_len + (empty ? 0 : 1) + suffix_len;
+    out = (char *)malloc(out_len + 1);
+    if (!out) {
+        free(raw);
+        return -1;
+    }
+    memcpy(out, raw, prefix_len);
+    if (!empty) out[prefix_len++] = ',';
+    memcpy(out + prefix_len, command_json, item_len);
+    memcpy(out + prefix_len + item_len, raw + (arr_end - raw), suffix_len);
+    out[out_len] = 0;
+    free(raw);
+    if (write_file_atomic(DEVICE_LIST, out, out_len) != 0) {
+        free(out);
+        return -1;
+    }
+    free(out);
+    return 0;
+}
+
+static int remove_json_span(char **pdata, size_t *plen, size_t start, size_t end) {
+    char *raw = *pdata, *out;
+    size_t newlen;
+    if (start > 0 && raw[start - 1] == ',') {
+        start--;
+    } else if (end < *plen && raw[end] == ',') {
+        end++;
+    }
+    newlen = *plen - (end - start);
+    out = (char *)malloc(newlen + 1);
+    if (!out) return -1;
+    memcpy(out, raw, start);
+    memcpy(out + start, raw + end, *plen - end);
+    out[newlen] = 0;
+    free(raw);
+    *pdata = out;
+    *plen = newlen;
+    return 0;
+}
+
+static int delete_ir_device(const char *device_id, char *msg, size_t msglen) {
+    char *raw;
+    const char *p;
+    size_t len;
+    char idneedle[64];
+    snprintf(idneedle, sizeof(idneedle), "\"Id-\":%s", device_id);
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read DeviceList.");
+        return -1;
+    }
+    p = raw;
+    while ((p = strstr(p, "\"Device\":{")) != NULL) {
+        const char *item_start = p;
+        const char *item_end;
+        while (item_start > raw && *item_start != '{') item_start--;
+        item_end = find_matching_json(item_start, '{', '}');
+        if (!item_end) break;
+        if (strstr(item_start, idneedle) && strstr(item_start, idneedle) < item_end) {
+            backup_resources();
+            if (remove_json_span(&raw, &len, (size_t)(item_start - raw), (size_t)(item_end + 1 - raw)) != 0 ||
+                write_file_atomic(DEVICE_LIST, raw, len) != 0) {
+                free(raw);
+                snprintf(msg, msglen, "Failed to delete device %s.", device_id);
+                return -1;
+            }
+            free(raw);
+            request_resource_reload();
+            snprintf(msg, msglen, "Deleted device %s.", device_id);
+            return 0;
+        }
+        p = item_end + 1;
+    }
+    free(raw);
+    snprintf(msg, msglen, "Device %s not found.", device_id);
+    return -1;
+}
+
+static int delete_ir_command(const char *device_id, const char *command_name, char *msg, size_t msglen) {
+    char *raw;
+    size_t len;
+    const char *arr, *arr_end, *cpos;
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read DeviceList.");
+        return -1;
+    }
+    if (find_device_command_array(raw, device_id, &arr, &arr_end) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Device %s not found.", device_id);
+        return -1;
+    }
+    cpos = arr + 1;
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end) {
+        char name[128];
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        if (!obj_end || obj_end > arr_end) break;
+        json_string_range(cpos, obj_end, "Name", name, sizeof(name));
+        if (strcmp(name, command_name) == 0) {
+            backup_resources();
+            if (remove_json_span(&raw, &len, (size_t)(cpos - raw), (size_t)(obj_end + 1 - raw)) != 0 ||
+                write_file_atomic(DEVICE_LIST, raw, len) != 0) {
+                free(raw);
+                snprintf(msg, msglen, "Failed to delete command %s.", command_name);
+                return -1;
+            }
+            free(raw);
+            request_resource_reload();
+            snprintf(msg, msglen, "Deleted command %s from device %s.", command_name, device_id);
+            return 0;
+        }
+        cpos = obj_end + 1;
+    }
+    free(raw);
+    snprintf(msg, msglen, "Command %s not found on device %s.", command_name, device_id);
+    return -1;
+}
+
+static int replace_span(char **pdata, size_t *plen, size_t start, size_t end, const char *replacement);
+
+static int clear_ir_commands(const char *device_id, char *msg, size_t msglen) {
+    char *raw;
+    size_t len;
+    const char *arr, *arr_end;
+    int count = 0;
+    if (!safe_label(device_id)) {
+        snprintf(msg, msglen, "Invalid device %s.", device_id ? device_id : "");
+        return -1;
+    }
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read DeviceList.");
+        return -1;
+    }
+    if (find_device_command_array(raw, device_id, &arr, &arr_end) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Device %s not found.", device_id);
+        return -1;
+    }
+    scan_command_array(arr, arr_end, &count, NULL);
+    backup_resources();
+    if (replace_span(&raw, &len, (size_t)(arr + 1 - raw), (size_t)(arr_end - raw), "") != 0 ||
+        write_file_atomic(DEVICE_LIST, raw, len) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to clear commands from device %s.", device_id);
+        return -1;
+    }
+    free(raw);
+    request_resource_reload();
+    snprintf(msg, msglen, "Cleared %d commands from device %s.", count, device_id);
+    return 0;
+}
+
+static int replace_span(char **pdata, size_t *plen, size_t start, size_t end, const char *replacement) {
+    char *raw = *pdata, *out;
+    size_t rlen = strlen(replacement);
+    size_t newlen = *plen - (end - start) + rlen;
+    out = (char *)malloc(newlen + 1);
+    if (!out) return -1;
+    memcpy(out, raw, start);
+    memcpy(out + start, replacement, rlen);
+    memcpy(out + start + rlen, raw + end, *plen - end);
+    out[newlen] = 0;
+    free(raw);
+    *pdata = out;
+    *plen = newlen;
+    return 0;
+}
+
+static int update_device_string_field(char **pdata, size_t *plen, const char *device_id, const char *key, const char *value) {
+    char idneedle[64];
+    const char *raw = *pdata;
+    const char *p = raw;
+    char *escaped;
+    snprintf(idneedle, sizeof(idneedle), "\"Id-\":%s", device_id);
+    while ((p = strstr(p, "\"Device\":{")) != NULL) {
+        const char *dev_obj = strchr(p, '{');
+        const char *dev_end = dev_obj ? find_matching_json(dev_obj, '{', '}') : NULL;
+        const char *field, *colon, *vstart, *vend;
+        if (!dev_obj || !dev_end) return -1;
+        if (!(strstr(dev_obj, idneedle) && strstr(dev_obj, idneedle) < dev_end)) {
+            p = dev_end + 1;
+            continue;
+        }
+        field = find_key_range(dev_obj, dev_end, key);
+        if (!field) return -1;
+        colon = strchr(field + strlen(key) + 2, ':');
+        if (!colon || colon >= dev_end) return -1;
+        vstart = colon + 1;
+        while (*vstart && vstart < dev_end && isspace((unsigned char)*vstart)) vstart++;
+        if (*vstart != '"') return -1;
+        vend = vstart + 1;
+        while (*vend && vend < dev_end) {
+            if (*vend == '\\' && vend[1]) vend += 2;
+            else if (*vend == '"') break;
+            else vend++;
+        }
+        if (*vend != '"') return -1;
+        escaped = json_escape_alloc(value);
+        if (!escaped) return -1;
+        if (replace_span(pdata, plen, (size_t)(vstart - raw), (size_t)(vend + 1 - raw), escaped) != 0) {
+            free(escaped);
+            return -1;
+        }
+        free(escaped);
+        return 0;
+    }
+    return -1;
+}
+
+static int harmony_device_type_id(const char *type) {
+    if (strcasecmp(type, "Amplifier") == 0) return 19;
+    if (strcasecmp(type, "Television") == 0 || strcasecmp(type, "TV") == 0) return 2;
+    if (strcasecmp(type, "Media Player") == 0) return 22;
+    if (strcasecmp(type, "Game Console") == 0) return 32;
+    if (strcasecmp(type, "HomeAppliance") == 0 || strcasecmp(type, "Home Appliance") == 0) return 44;
+    return 44;
+}
+
+static int create_ir_device_ex(const char *name, const char *manufacturer, const char *model, const char *type, char *msg, size_t msglen, char *created_id, size_t created_id_len) {
+    char *en = NULL, *em = NULL, *emo = NULL, *et = NULL, *item = NULL;
+    long id, max_device_id = 0;
+    int dtype;
+    if (!safe_label(name) || !safe_label(manufacturer) || !safe_label(model) || !safe_label(type)) {
+        snprintf(msg, msglen, "Device fields cannot be empty or contain control characters.");
+        return -1;
+    }
+    scan_ir_resource_stats(NULL, NULL, &max_device_id, NULL);
+    id = max_device_id + 1;
+    if (id < 90000000) id = 90000000 + (long)(time(NULL) % 9000000);
+    dtype = harmony_device_type_id(type);
+    en = json_escape_alloc(name);
+    em = json_escape_alloc(manufacturer);
+    emo = json_escape_alloc(model);
+    et = json_escape_alloc(type);
+    item = (char *)malloc(4096);
+    if (!en || !em || !emo || !et || !item) goto fail;
+    snprintf(item, 4096,
+        "{\"Device\":{\"DongleIndex\":0,\"InterDeviceDelay\":500,\"HoldInterKeyDelay\":100,\"DeviceType\":%d,"
+        "\"RegisterSection\":null,\"ContentProfileKey\":%ld,\"DeviceOrder\":0,\"DeviceProfileUri\":\"\","
+        "\"SetupState\":1,\"DeviceSearchType\":-1,\"GlobalDeviceVersionId-\":0,\"DeviceTypeDisplayName\":%s,"
+        "\"FriendlyName\":null,\"Transport\":1,\"PressMinRepeats\":3,\"PrivateAddType\":1,\"RegionalCharset\":null,"
+        "\"Tokens\":null,\"BTAddress\":null,\"DongleRFID\":0,\"AutoDetectedDevice\":null,\"GlobalLanguageVersionId-\":0,"
+        "\"ParentDeviceId\":null,\"DecodedEdid\":null,\"DefaultPressMinRepeats\":3,\"ParentDeviceModel\":\"\","
+        "\"RenewSection\":null,\"IsMultiCode\":false,\"GroupName\":null,\"DefaultInterDeviceDelay\":0,\"ParentDevice-\":0,"
+        "\"DeviceAddedDate\":\"/Date(%ld000+0000)/\",\"ParentDeviceManufacturer\":%s,\"AppLaunchConfigs\":null,"
+        "\"PictureId\":null,\"IsKeyboardAssociated\":false,\"IsScartCableSupported\":false,\"Manufacturer\":%s,"
+        "\"Icon\":%d,\"Id-\":%ld,\"IsInterKeyDelayOptimized\":false,\"SuggestedDisplay\":\"DEFAULT\",\"ControlPort\":7,"
+        "\"EncodedEdid\":null,\"InterKeyDelay\":300,\"DeviceClassification\":0,\"DeviceCapabilitiesWithPriority\":[],"
+        "\"CopiedDeviceSource\":-1,\"State\":1,\"HoldInterDeviceDelay\":0,\"Name\":%s,\"Model\":%s,"
+        "\"ActivityIds\":null,\"Characterization\":0,\"HoldMinRepeats\":-1,\"DefaultInterKeyDelay\":0},"
+        "\"Commands\":[],\"DeviceFeatures\":[]}",
+        dtype, id, et, (long)time(NULL), em, em, dtype, id, en, emo);
+    backup_resources();
+    if (append_top_array_item(DEVICE_LIST, "\"DevicesWithFeatures\"", item) != 0) goto fail;
+    request_resource_reload();
+    if (created_id && created_id_len) snprintf(created_id, created_id_len, "%ld", id);
+    snprintf(msg, msglen, "Created IR device %s (%ld).", name, id);
+    free(en); free(em); free(emo); free(et); free(item);
+    return 0;
+fail:
+    free(en); free(em); free(emo); free(et); free(item);
+    snprintf(msg, msglen, "Failed to create IR device.");
+    return -1;
+}
+
+static int create_ir_device(const char *name, const char *manufacturer, const char *model, const char *type, char *msg, size_t msglen) {
+    return create_ir_device_ex(name, manufacturer, model, type, msg, msglen, NULL, 0);
+}
+
+static int ensure_lab_target_device(char *device_id, size_t device_id_len, int *created, char *msg, size_t msglen) {
+    const char *name = "Temporary IR Sweep";
+    if (created) *created = 0;
+    if (find_ir_device_by_name(name, device_id, device_id_len) == 0) {
+        snprintf(msg, msglen, "Using existing %s (%s).", name, device_id);
+        return 0;
+    }
+    if (create_ir_device_ex(name, "Local", "Command Sweep", "HomeAppliance", msg, msglen, device_id, device_id_len) == 0) {
+        if (created) *created = 1;
+        return 0;
+    }
+    return -1;
+}
+
+static int update_ir_device(const char *device_id, const char *name, const char *manufacturer, const char *model, const char *type, char *msg, size_t msglen) {
+    char *raw;
+    size_t len;
+    if (!safe_label(device_id) || !safe_label(name) || !safe_label(manufacturer) || !safe_label(model) || !safe_label(type)) {
+        snprintf(msg, msglen, "Device fields cannot be empty or contain control characters.");
+        return -1;
+    }
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read DeviceList.");
+        return -1;
+    }
+    backup_resources();
+    if (update_device_string_field(&raw, &len, device_id, "Name", name) != 0 ||
+        update_device_string_field(&raw, &len, device_id, "Manufacturer", manufacturer) != 0 ||
+        update_device_string_field(&raw, &len, device_id, "Model", model) != 0 ||
+        update_device_string_field(&raw, &len, device_id, "DeviceTypeDisplayName", type) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to update device %s.", device_id);
+        return -1;
+    }
+    if (write_file_atomic(DEVICE_LIST, raw, len) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to save DeviceList.");
+        return -1;
+    }
+    free(raw);
+    request_resource_reload();
+    snprintf(msg, msglen, "Updated device %s.", device_id);
+    return 0;
+}
+
+static int build_nec_keycode(const char *hex, int protocol_id, char *out, size_t outlen) {
+    const char *p = hex;
+    char clean[16];
+    int n = 0;
+    unsigned long value;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    while (*p && n < 8) {
+        if (!isxdigit((unsigned char)*p)) return -1;
+        clean[n++] = *p++;
+    }
+    if (*p || n == 0 || n > 8) return -1;
+    clean[n] = 0;
+    value = strtoul(clean, NULL, 16);
+    if (protocol_id == 679) {
+        snprintf(out, outlen, "G:MemorexO1 32 Bit:()(0x%08lX)():3", value & 0xffffffffUL);
+    } else {
+        snprintf(out, outlen, "G:Toshiba 32 Bit:(0x%08lX)(Repeat)():3", value & 0xffffffffUL);
+    }
+    return 0;
+}
+
+static void copy_text(char *out, size_t outlen, const char *value) {
+    if (!out || !outlen) return;
+    strncpy(out, value ? value : "", outlen - 1);
+    out[outlen - 1] = 0;
+}
+
+static int contains_ci(const char *haystack, const char *needle) {
+    size_t n;
+    if (!haystack || !needle || !needle[0]) return 0;
+    n = strlen(needle);
+    while (*haystack) {
+        if (strncasecmp(haystack, needle, n) == 0) return 1;
+        haystack++;
+    }
+    return 0;
+}
+
+static int extract_harmony_keycode(const char *src, char *out, size_t outlen) {
+    const char *p;
+    size_t n = 0;
+    if (!src || !outlen) return 0;
+    p = strstr(src, "G:");
+    if (!p) return 0;
+    while (p[n] && p[n] != '"' && p[n] != '\'' && p[n] != '<' && p[n] != '>' &&
+           p[n] != '\r' && p[n] != '\n' && n + 1 < outlen) {
+        n++;
+    }
+    while (n && (isspace((unsigned char)p[n - 1]) || p[n - 1] == ',')) n--;
+    if (n < 4) return 0;
+    memcpy(out, p, n);
+    out[n] = 0;
+    return 1;
+}
+
+static int clean_hex_token(const char *src, char *out, size_t outlen) {
+    const char *p;
+    size_t n = 0;
+    if (!src || !outlen) return 0;
+    while (*src && isspace((unsigned char)*src)) src++;
+    p = src;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    while (isxdigit((unsigned char)p[n]) && n < 8 && n + 1 < outlen) n++;
+    if (n == 0 || n > 8) return 0;
+    if (isxdigit((unsigned char)p[n])) return 0;
+    while (p[n] && isspace((unsigned char)p[n])) n++;
+    if (p[n]) return 0;
+    p = src;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    n = 0;
+    while (isxdigit((unsigned char)p[n]) && n < 8 && n + 1 < outlen) {
+        out[n] = (char)toupper((unsigned char)p[n]);
+        n++;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+static int extract_nec_hex(const char *src, char *out, size_t outlen) {
+    const char *p;
+    int hinted;
+    if (!src || !outlen) return 0;
+    if (clean_hex_token(src, out, outlen)) return 1;
+    for (p = src; *p; p++) {
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            size_t i;
+            p += 2;
+            for (i = 0; i < 8 && isxdigit((unsigned char)p[i]); i++) {
+                if (i + 1 < outlen) out[i] = (char)toupper((unsigned char)p[i]);
+            }
+            if (i == 8 && !isxdigit((unsigned char)p[i])) {
+                out[8] = 0;
+                return 1;
+            }
+            p--;
+        }
+    }
+    hinted = contains_ci(src, "nec") || contains_ci(src, "samsung") ||
+             contains_ci(src, "toshiba") || contains_ci(src, "memorex") ||
+             contains_ci(src, "protocol") || contains_ci(src, "keycode");
+    if (!hinted) return 0;
+    for (p = src; *p; p++) {
+        size_t i;
+        if (isxdigit((unsigned char)*p) && (p == src || !isxdigit((unsigned char)p[-1]))) {
+            for (i = 0; i < 8 && isxdigit((unsigned char)p[i]); i++) {
+                if (i + 1 < outlen) out[i] = (char)toupper((unsigned char)p[i]);
+            }
+            if (i == 8 && !isxdigit((unsigned char)p[i])) {
+                out[8] = 0;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int infer_capture_protocol(const char *raw_code, const char *keycode) {
+    if (contains_ci(keycode, "MemorexO1") || contains_ci(raw_code, "MemorexO1")) return 679;
+    return 2;
+}
+
+static void analyze_capture_storage(const char *raw_code, const char *keycode_in, const char *nec_in, const char *protocol_text, char *mode_out, size_t mode_len, char *keycode_out, size_t keycode_len, char *nec_out, size_t nec_len, int *protocol_id_out, char *summary, size_t summary_len) {
+    int protocol_id = protocol_text && protocol_text[0] ? atoi(protocol_text) : 2;
+    if (protocol_id <= 0) protocol_id = 2;
+    if (mode_out && mode_len) mode_out[0] = 0;
+    if (keycode_out && keycode_len) keycode_out[0] = 0;
+    if (nec_out && nec_len) nec_out[0] = 0;
+    if (summary && summary_len) summary[0] = 0;
+    if (extract_harmony_keycode(keycode_in, keycode_out, keycode_len) ||
+        extract_harmony_keycode(raw_code, keycode_out, keycode_len)) {
+        protocol_id = infer_capture_protocol(raw_code, keycode_out);
+        copy_text(mode_out, mode_len, "keycode");
+        copy_text(summary, summary_len, "Decoded Harmony KeyCode; storing compact protocol/keycode data.");
+    } else if (extract_nec_hex(nec_in, nec_out, nec_len) ||
+               extract_nec_hex(raw_code, nec_out, nec_len)) {
+        protocol_id = infer_capture_protocol(raw_code, keycode_in);
+        copy_text(mode_out, mode_len, "nec");
+        if (build_nec_keycode(nec_out, protocol_id, keycode_out, keycode_len) == 0) {
+            copy_text(summary, summary_len, "Decoded NEC-style 32-bit value; storing as compact Harmony KeyCode.");
+        } else {
+            copy_text(summary, summary_len, "Decoded a hex value, but it was not valid for compact storage.");
+        }
+    } else {
+        copy_text(mode_out, mode_len, "raw");
+        copy_text(summary, summary_len, "No supported protocol signature found; storing raw timing data.");
+    }
+    if (protocol_id_out) *protocol_id_out = protocol_id;
+}
+
+static unsigned int reverse8(unsigned int v) {
+    v = ((v & 0xf0) >> 4) | ((v & 0x0f) << 4);
+    v = ((v & 0xcc) >> 2) | ((v & 0x33) << 2);
+    v = ((v & 0xaa) >> 1) | ((v & 0x55) << 1);
+    return v & 0xff;
+}
+
+static int build_irdb_nec_keycode(const char *protocol, const char *device, const char *subdevice, const char *function, char *out, size_t outlen) {
+    unsigned long d, s, fn, inv;
+    unsigned long value;
+    if (strncasecmp(protocol, "NEC", 3) != 0) return -1;
+    d = strtoul(device, NULL, 10);
+    s = subdevice[0] ? strtoul(subdevice, NULL, 10) : (d ^ 0xff);
+    fn = strtoul(function, NULL, 10);
+    if (d > 255 || s > 255 || fn > 255) return -1;
+    inv = (~fn) & 0xff;
+    value = (reverse8((unsigned int)d) << 24) |
+            (reverse8((unsigned int)s) << 16) |
+            (reverse8((unsigned int)fn) << 8) |
+            reverse8((unsigned int)inv);
+    snprintf(out, outlen, "G:Toshiba 32 Bit:(0x%08lX)(Repeat)():3", value & 0xffffffffUL);
+    return 0;
+}
+
+static char *build_ir_command_json(long id, const char *name, const char *mode, int protocol_id, const char *code, const char *raw_code) {
+    char *ename = NULL, *ecode = NULL, *eraw = NULL, *cmd = NULL;
+    size_t cap;
+    ename = json_escape_alloc(name);
+    ecode = json_escape_alloc(code);
+    eraw = json_escape_alloc(raw_code);
+    cap = (ename ? strlen(ename) : 0) + (ecode ? strlen(ecode) : 0) + (eraw ? strlen(eraw) : 0) + 1024;
+    if (cap < 2048) cap = 2048;
+    cmd = (char *)malloc(cap);
+    if (!ename || !ecode || !eraw || !cmd) goto fail;
+    if (strcmp(mode, "raw") == 0) {
+        snprintf(cmd, cap,
+            "{\"Raw\":%s,\"Id-\":%ld,\"KeyCode\":\"\",\"DateTaught\":\"/Date(%ld000+0000)/\","
+            "\"FunctionId\":null,\"Parameters\":null,\"Name\":%s,\"FunctionGroupId\":0,\"TransportType\":1,"
+            "\"ProtocolId\":null,\"CommandTypeId\":\"\",\"IsLearned\":true}",
+            eraw, id, (long)time(NULL), ename);
+    } else {
+        snprintf(cmd, cap,
+            "{\"Raw\":null,\"Id-\":%ld,\"KeyCode\":%s,\"DateTaught\":\"/Date(%ld000+0000)/\","
+            "\"FunctionId\":null,\"Parameters\":null,\"Name\":%s,\"FunctionGroupId\":0,\"TransportType\":1,"
+            "\"ProtocolId\":%d,\"CommandTypeId\":\"\",\"IsLearned\":true}",
+            id, ecode, (long)time(NULL), ename, protocol_id);
+    }
+    free(ename); free(ecode); free(eraw);
+    return cmd;
+fail:
+    free(ename); free(ecode); free(eraw); free(cmd);
+    return NULL;
+}
+
+static int add_ir_command(const char *device_id, const char *name, const char *mode, const char *protocol_text, const char *nec, const char *keycode, const char *raw_code, char *msg, size_t msglen) {
+    char *raw;
+    const char *arr, *arr_end;
+    long id, max_command_id = 0;
+    int protocol_id = atoi(protocol_text);
+    int existing_commands = 0;
+    char effective_mode[16];
+    char effective_keycode[512];
+    char effective_nec[64];
+    char storage_note[160];
+    char code[512];
+    char *cmd = NULL;
+    int auto_mode;
+    if (!safe_label(device_id) || !safe_label(name)) {
+        snprintf(msg, msglen, "Device and command name are required.");
+        return -1;
+    }
+    if (protocol_id <= 0) protocol_id = 2;
+    copy_text(effective_mode, sizeof(effective_mode), mode && mode[0] ? mode : "auto");
+    copy_text(effective_keycode, sizeof(effective_keycode), keycode);
+    copy_text(effective_nec, sizeof(effective_nec), nec);
+    auto_mode = strcmp(effective_mode, "auto") == 0;
+    if (auto_mode) {
+        analyze_capture_storage(raw_code, keycode, nec, protocol_text, effective_mode, sizeof(effective_mode), effective_keycode, sizeof(effective_keycode), effective_nec, sizeof(effective_nec), &protocol_id, storage_note, sizeof(storage_note));
+    }
+    code[0] = 0;
+    if (strcmp(effective_mode, "raw") == 0) {
+        if (!raw_code[0]) {
+            snprintf(msg, msglen, "Raw command data is required.");
+            return -1;
+        }
+    } else if (strcmp(effective_mode, "keycode") == 0) {
+        if (!effective_keycode[0]) {
+            snprintf(msg, msglen, "KeyCode is required.");
+            return -1;
+        }
+        strncpy(code, effective_keycode, sizeof(code) - 1);
+        code[sizeof(code) - 1] = 0;
+    } else {
+        if (build_nec_keycode(effective_nec, protocol_id, code, sizeof(code)) != 0) {
+            snprintf(msg, msglen, "NEC value must be 1-8 hex digits.");
+            return -1;
+        }
+    }
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, NULL);
+    if (!raw || find_device_command_array(raw, device_id, &arr, &arr_end) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Device %s not found.", device_id);
+        return -1;
+    }
+    scan_ir_resource_stats_from_raw(raw, NULL, NULL, NULL, &max_command_id);
+    scan_command_array(arr, arr_end, &existing_commands, NULL);
+    if (existing_commands >= MAX_IR_STORED_COMMANDS) {
+        free(raw);
+        snprintf(msg, msglen, "Device %s already has the local storage limit of %d commands.", device_id, MAX_IR_STORED_COMMANDS);
+        return -1;
+    }
+    if (command_array_has_name(arr, arr_end, name)) {
+        free(raw);
+        snprintf(msg, msglen, "Command %s already exists on device %s.", name, device_id);
+        return -1;
+    }
+    free(raw);
+    id = max_command_id + 1;
+    if (id < 39000000) id = 39000000 + (long)(time(NULL) % 9000000);
+    cmd = build_ir_command_json(id, name, effective_mode, protocol_id, code, raw_code);
+    if (!cmd) goto fail;
+    backup_resources();
+    if (strcmp(effective_mode, "raw") != 0 && ensure_builtin_protocol_for_id(protocol_id) != 0) {
+        snprintf(msg, msglen, "Failed to ensure IR protocol %d.", protocol_id);
+        goto fail;
+    }
+    if (append_command_to_device(device_id, cmd) != 0) goto fail;
+    request_resource_reload();
+    if (auto_mode && storage_note[0]) snprintf(msg, msglen, "Saved command %s on device %s. %s", name, device_id, storage_note);
+    else snprintf(msg, msglen, "Saved command %s on device %s.", name, device_id);
+    free(cmd);
+    return 0;
+fail:
+    free(cmd);
+    if (!msg[0]) snprintf(msg, msglen, "Failed to save IR command.");
+    return -1;
+}
+
+static char *trim_in_place(char *s) {
+    char *end;
+    while (*s && isspace((unsigned char)*s)) s++;
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) *--end = 0;
+    return s;
+}
+
+static int split_fields(char *line, char sep, char **fields, int max_fields) {
+    int count = 0;
+    char *p = line;
+    while (count < max_fields) {
+        fields[count++] = p;
+        p = strchr(p, sep);
+        if (!p) break;
+        *p++ = 0;
+    }
+    return count;
+}
+
+static int safe_raw_import_value(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t n = strlen(s);
+    if (n == 0 || n > 4096) return 0;
+    while (*p) {
+        if (*p < 32 || *p == 127) return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int append_text(char **buf, size_t *len, size_t *cap, const char *text, int comma) {
+    size_t n = strlen(text);
+    size_t need = *len + n + (comma ? 1 : 0) + 1;
+    char *next;
+    if (need > *cap) {
+        size_t newcap = *cap ? *cap : 4096;
+        while (newcap < need) newcap *= 2;
+        next = (char *)realloc(*buf, newcap);
+        if (!next) return -1;
+        *buf = next;
+        *cap = newcap;
+    }
+    if (comma) (*buf)[(*len)++] = ',';
+    memcpy(*buf + *len, text, n);
+    *len += n;
+    (*buf)[*len] = 0;
+    return 0;
+}
+
+static int bulk_import_irdb_commands(const char *device_id, char *payload, char *msg, size_t msglen) {
+    char *line, *save, *joined = NULL, *raw, *out;
+    const char *arr, *arr_end, *scan;
+    size_t joined_len = 0, joined_cap = 0, raw_len, prefix_len, suffix_len, out_len;
+    long next_id, max_command_id = 0;
+    int imported = 0, skipped = 0, empty = 1, remaining, existing_commands = 0, imported_keycodes = 0;
+    if (!safe_label(device_id)) {
+        snprintf(msg, msglen, "Invalid device for IRDB import.");
+        return -1;
+    }
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &raw_len);
+    if (!raw || find_device_command_array(raw, device_id, &arr, &arr_end) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to locate device command list.");
+        return -1;
+    }
+    scan_ir_resource_stats_from_raw(raw, NULL, NULL, NULL, &max_command_id);
+    scan_command_array(arr, arr_end, &existing_commands, NULL);
+    remaining = MAX_IR_STORED_COMMANDS - existing_commands;
+    if (remaining <= 0) {
+        free(raw);
+        snprintf(msg, msglen, "Device %s already has the local storage limit of %d commands.", device_id, MAX_IR_STORED_COMMANDS);
+        return -1;
+    }
+    next_id = max_command_id + 1;
+    if (next_id < 39000000) next_id = 39000000 + (long)(time(NULL) % 9000000);
+    line = strtok_r(payload, "\n", &save);
+    while (line) {
+        char *fields[8], *name = NULL, *mode = "keycode", *keycode = NULL, *raw_code = NULL;
+        char generated[512];
+        char *cmd_json;
+        int field_count;
+        line = trim_in_place(line);
+        if (!line[0]) {
+            line = strtok_r(NULL, "\n", &save);
+            continue;
+        }
+        if (strchr(line, '|')) {
+            field_count = split_fields(line, '|', fields, 8);
+            if (field_count >= 2) {
+                name = trim_in_place(fields[0]);
+                if (field_count >= 3) {
+                    mode = trim_in_place(fields[1]);
+                    if (strcasecmp(mode, "raw") == 0) {
+                        raw_code = trim_in_place(fields[2]);
+                    } else if (strcasecmp(mode, "keycode") == 0) {
+                        keycode = trim_in_place(fields[2]);
+                    } else {
+                        keycode = trim_in_place(fields[1]);
+                        mode = "keycode";
+                    }
+                } else {
+                    keycode = trim_in_place(fields[1]);
+                }
+            }
+        } else {
+            field_count = split_fields(line, ',', fields, 8);
+            if (field_count >= 5 && strcasecmp(trim_in_place(fields[0]), "functionname") != 0) {
+                name = trim_in_place(fields[0]);
+                if (build_irdb_nec_keycode(trim_in_place(fields[1]), trim_in_place(fields[2]), trim_in_place(fields[3]), trim_in_place(fields[4]), generated, sizeof(generated)) == 0) {
+                    keycode = generated;
+                }
+            }
+        }
+        if (!name || !name[0] || !safe_label(name) || command_array_has_name(arr, arr_end, name) ||
+            command_fragment_has_name(joined, name) ||
+            (strcasecmp(mode, "raw") == 0 ? (!raw_code || !safe_raw_import_value(raw_code)) : (!keycode || !keycode[0]))) {
+            skipped++;
+            line = strtok_r(NULL, "\n", &save);
+            continue;
+        }
+        if (imported >= remaining) {
+            skipped++;
+            line = strtok_r(NULL, "\n", &save);
+            continue;
+        }
+        cmd_json = strcasecmp(mode, "raw") == 0 ?
+            build_ir_command_json(next_id++, name, "raw", 2, "", raw_code) :
+            build_ir_command_json(next_id++, name, "keycode", 2, keycode, "");
+        if (!cmd_json || append_text(&joined, &joined_len, &joined_cap, cmd_json, imported > 0) != 0) {
+            free(cmd_json);
+            free(joined);
+            free(raw);
+            snprintf(msg, msglen, "Failed to stage IRDB commands.");
+            return -1;
+        }
+        free(cmd_json);
+        imported++;
+        if (strcasecmp(mode, "raw") != 0) imported_keycodes++;
+        line = strtok_r(NULL, "\n", &save);
+    }
+    if (imported == 0) {
+        free(joined);
+        free(raw);
+        snprintf(msg, msglen, "No supported new IRDB commands were selected.");
+        return -1;
+    }
+    for (scan = arr + 1; scan < arr_end; scan++) {
+        if (!isspace((unsigned char)*scan)) {
+            empty = 0;
+            break;
+        }
+    }
+    prefix_len = (size_t)(arr_end - raw);
+    suffix_len = raw_len - prefix_len;
+    out_len = prefix_len + joined_len + (empty ? 0 : 1) + suffix_len;
+    out = (char *)malloc(out_len + 1);
+    if (!out) {
+        free(raw);
+        free(joined);
+        snprintf(msg, msglen, "Not enough memory to import IRDB commands.");
+        return -1;
+    }
+    memcpy(out, raw, prefix_len);
+    if (!empty) out[prefix_len++] = ',';
+    memcpy(out + prefix_len, joined, joined_len);
+    memcpy(out + prefix_len + joined_len, raw + (arr_end - raw), suffix_len);
+    out[out_len] = 0;
+    backup_resources();
+    if (imported_keycodes > 0 && ensure_builtin_protocol_for_id(2) != 0) {
+        free(raw);
+        free(joined);
+        free(out);
+        snprintf(msg, msglen, "Failed to ensure NEC-compatible IR protocol.");
+        return -1;
+    }
+    if (write_file_atomic(DEVICE_LIST, out, out_len) != 0) {
+        free(raw);
+        free(joined);
+        free(out);
+        snprintf(msg, msglen, "Failed to write imported IRDB commands.");
+        return -1;
+    }
+    free(raw);
+    free(joined);
+    free(out);
+    request_resource_reload();
+    snprintf(msg, msglen, "Imported %d IRDB commands to %s. Skipped %d.", imported, device_id, skipped);
+    return 0;
+}
+
+static int ir_cancel_path(const char *run_id, char *path, size_t pathlen) {
+    if (!run_id || !run_id[0]) return 0;
+    if (!safe_run_id(run_id)) return -1;
+    snprintf(path, pathlen, "%s%s", IR_CANCEL_PREFIX, run_id);
+    return 1;
+}
+
+static int ir_run_canceled(const char *run_id) {
+    char path[192];
+    int ok = ir_cancel_path(run_id, path, sizeof(path));
+    if (ok <= 0) return 0;
+    return access(path, F_OK) == 0;
+}
+
+static int mark_ir_run_canceled(const char *run_id) {
+    char path[192];
+    FILE *f;
+    int ok = ir_cancel_path(run_id, path, sizeof(path));
+    if (ok <= 0) return -1;
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "%ld\n", (long)time(NULL));
+    fclose(f);
+    return 0;
+}
+
+static int cancelable_sleep_ms(int delay_ms, const char *run_id) {
+    int slept = 0;
+    while (slept < delay_ms) {
+        int step = delay_ms - slept;
+        if (ir_run_canceled(run_id)) return 1;
+        if (step > 100) step = 100;
+        usleep((useconds_t)step * 1000);
+        slept += step;
+    }
+    return ir_run_canceled(run_id);
+}
+
+static void rotate_ir_event_log(void) {
+    struct stat st;
+    if (stat(IR_EVENT_LOG, &st) == 0 && st.st_size > IR_EVENT_MAX_BYTES) {
+        unlink(IR_EVENT_LOG ".1");
+        rename(IR_EVENT_LOG, IR_EVENT_LOG ".1");
+    }
+}
+
+static void log_ir_event(const char *source, const char *run_id, const char *device_id, const char *command, const char *reply) {
+    rotate_ir_event_log();
+    FILE *f = fopen(IR_EVENT_LOG, "a");
+    if (!f) return;
+    fputs("{\"event\":\"ir_send\",\"ts\":", f);
+    fprintf(f, "%ld", (long)time(NULL));
+    fputs(",\"source\":", f); json_write_string(f, source ? source : "");
+    fputs(",\"runId\":", f); json_write_string(f, run_id ? run_id : "");
+    fputs(",\"deviceId\":", f); json_write_string(f, device_id ? device_id : "");
+    fputs(",\"command\":", f); json_write_string(f, command ? command : "");
+    fputs(",\"reply\":", f); json_write_string(f, reply ? reply : "");
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void log_ir_note_event(const char *event, const char *source, const char *run_id, const char *detail) {
+    rotate_ir_event_log();
+    FILE *f = fopen(IR_EVENT_LOG, "a");
+    if (!f) return;
+    fputs("{\"event\":", f); json_write_string(f, event ? event : "ir_note");
+    fputs(",\"ts\":", f); fprintf(f, "%ld", (long)time(NULL));
+    fputs(",\"source\":", f); json_write_string(f, source ? source : "");
+    fputs(",\"runId\":", f); json_write_string(f, run_id ? run_id : "");
+    fputs(",\"detail\":", f); json_write_string(f, detail ? detail : "");
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void send_ir_command_action_ex(const char *device_id, const char *command, const char *source, const char *run_id, char *out, size_t outlen) {
+    char hub_id[64] = "16042906";
+    char action[512], params[768], esc_id[128], esc_params[1024], cmd[1400];
+    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
+    chomp(hub_id);
+    snprintf(action, sizeof(action), "{\\\"type\\\":\\\"IRCommand\\\",\\\"deviceId\\\":\\\"%s\\\",\\\"command\\\":\\\"%s\\\"}", device_id, command);
+    snprintf(params, sizeof(params), "{\"status\":\"pressrelease\",\"count\":1,\"action\":\"%s\"}", action);
+    shell_escape_single(hub_id, esc_id, sizeof(esc_id));
+    shell_escape_single(params, esc_params, sizeof(esc_params));
+    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' harmony.engine?holdaction '%s' 2>&1", esc_id, esc_params);
+    run_cmd(cmd, out, outlen);
+    log_ir_event(source, run_id, device_id, command, out && out[0] ? out : "no response");
+}
+
+static void send_ir_command_action(const char *device_id, const char *command, char *out, size_t outlen) {
+    send_ir_command_action_ex(device_id, command, "webui", "", out, outlen);
+}
+
+static void capture_ir_command_action(char *out, size_t outlen) {
+    char hub_id[64] = "16042906";
+    char esc_id[128], cmd[512];
+    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
+    chomp(hub_id);
+    shell_escape_single(hub_id, esc_id, sizeof(esc_id));
+    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' ir.cap '{\"hbusData\":{\"timeout\":15000}}' 2>&1", esc_id);
+    run_cmd(cmd, out, outlen);
+    if (!out[0]) {
+        snprintf(out, outlen, "IR capture returned no payload. The HAL capture path is present, but it only replies when a frame is received during the transaction.");
+    }
+}
+
+static void page_head(FILE *f, const char *title) {
+    fprintf(f,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+        "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>");
+    html(f, title);
+    fputs(
+        "</title><style>"
+        ":root{color-scheme:light;--bg:#f5f7f9;--fg:#182321;--muted:#687672;--line:#dce3e1;--panel:#fff;--soft:#f2f6f5;--accent:#0f766e;--accent2:#32649d;--bad:#b42318;--ok:#087443;--warn:#a05a00;--wash:#fafcfb;--shadow:0 10px 28px rgba(25,41,37,.07)}"
+        "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.48 system-ui,-apple-system,Segoe UI,sans-serif}"
+        "header{position:sticky;top:0;background:rgba(255,255,255,.98);backdrop-filter:saturate(1.15) blur(12px);border-bottom:1px solid var(--line);padding:13px 20px;z-index:2}"
+        ".topbar{max-width:1280px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:center;gap:11px}.brand-mark{width:34px;height:34px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#fff;font-weight:750}.brand h1{letter-spacing:0}.brand small{display:block;color:var(--muted);font-size:12px}.top-status{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}"
+        ".app-shell{max-width:1280px;margin:0 auto;padding:22px 20px;display:grid;grid-template-columns:236px minmax(0,1fr);gap:22px}.side-menu{position:sticky;top:86px;align-self:start;display:grid;gap:4px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px;box-shadow:var(--shadow)}.menu-item{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:center;text-align:left;border:0;background:transparent;color:var(--fg);border-radius:8px;padding:10px 11px;box-shadow:none}.menu-item:hover{background:var(--soft)}.menu-item span:first-child{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:#edf3f2;color:var(--accent);font-size:0;position:relative}.menu-item span:first-child:before{content:\"\";display:block;width:13px;height:13px;border:2px solid currentColor;border-radius:4px}.menu-item[data-view-target=ir] span:first-child:before{width:15px;height:9px;border-radius:9px}.menu-item[data-view-target=lab] span:first-child:before{width:15px;height:15px;border-radius:50%;box-shadow:inset 0 0 0 3px #fff}.menu-item[data-view-target=bluetooth] span:first-child:before{width:15px;height:15px;border-radius:50%;border-width:2px;box-shadow:0 -5px 0 -3px currentColor,0 5px 0 -3px currentColor}.menu-item[data-view-target=mqtt] span:first-child:before{width:14px;height:14px;border-radius:50%;border-width:2px}.menu-item[data-view-target=wifi] span:first-child:before{width:15px;height:10px;border:0;border-top:2px solid currentColor;border-radius:50%}.menu-item[data-view-target=backup] span:first-child:before{width:15px;height:12px;border-radius:3px}.menu-item[data-view-target=system] span:first-child:before{width:13px;height:13px;border-radius:50%}.menu-item strong{display:block;font-size:13px;line-height:1.15}.menu-item small{display:block;color:var(--muted);font-size:11px;margin-top:2px}.menu-item.active{background:#eaf6f4;color:#0c514d}.menu-item.active span:first-child{background:#fff;box-shadow:inset 0 0 0 1px rgba(15,118,110,.14)}.content{min-width:0;display:grid;gap:16px}.section{display:none;scroll-margin-top:94px}.section.active{display:grid;gap:14px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:2px}.section-lead{max-width:780px;color:var(--muted);font-size:13px;margin-top:5px}"
+        "h1{font-size:20px;margin:0}h2{font-size:24px;line-height:1.12;margin:0;font-weight:750}h3{font-size:15px;margin:0 0 10px}.muted{color:var(--muted)}.mini{font-size:12px}.nowrap{white-space:nowrap}.subtle{font-size:12px;color:var(--muted);margin-top:2px}.help{font-size:12px;color:var(--muted);margin-top:5px}.callout{border:1px solid #dbe7ef;border-left:4px solid var(--accent2);background:#fbfdff;border-radius:8px;padding:11px 13px;margin:0 0 12px;color:#263a52}.callout strong{display:block;margin-bottom:2px}.quick-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:2px}.quick-actions button{min-height:64px;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04)}.quick-actions button:hover{border-color:#b9c8c4;background:#fbfefd}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.panel,.stat,.setup-shell{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(20,40,32,.04)}.stat{min-height:86px}.stat .value{font-size:20px;font-weight:700;margin-top:3px}.stat .label{text-transform:uppercase;letter-spacing:0;color:var(--muted);font-size:11px}"
+        ".kv{display:grid;grid-template-columns:132px 1fr;gap:6px 10px}.badge,.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:3px 9px;background:var(--wash);font-size:12px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}"
+        "label{display:block;margin:10px 0 4px;color:var(--muted);font-size:12px}input,select,textarea{width:100%;padding:10px 11px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--fg);min-height:38px}input:focus,select:focus,textarea:focus{outline:2px solid rgba(15,118,110,.16);border-color:var(--accent)}textarea{min-height:88px;resize:vertical}.textarea-tall{min-height:190px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}"
+        "input[type=checkbox]{width:auto;min-height:0}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}"
+        "button,a.button{border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:6px;padding:9px 12px;cursor:pointer;font-weight:650;transition:border-color .12s,background .12s,box-shadow .12s;text-decoration:none;line-height:1.15}a.button{display:inline-flex;align-items:center;justify-content:center}.secondary{background:#fff;color:var(--accent)}.danger{border-color:var(--bad);color:var(--bad);background:#fff}.ghost{background:var(--wash);border-color:var(--line);color:var(--fg)}"
+        "pre{white-space:pre-wrap;word-break:break-word;margin:0;background:var(--soft);border-radius:6px;padding:10px;max-height:340px;overflow:auto}details{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:11px 13px}summary{cursor:pointer;font-weight:650}"
+        ".msg{border-left:4px solid var(--accent2);padding:10px 12px;background:#f8fbff;border-radius:8px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-top:1px solid var(--line);padding:7px;text-align:left;vertical-align:top}.device-list{display:grid;gap:14px}.command-list{display:grid;gap:8px}.command{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.export-list{display:flex;gap:8px;flex-wrap:wrap}.hidden{display:none!important}.preview{display:grid;gap:6px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--soft)}.preview label{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:start;margin:0;color:var(--fg)}.match{width:100%;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:8px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.match strong{color:var(--accent2)}"
+        ".setup-shell{padding:0;overflow:hidden}.wizard-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.wizard-top h3{margin:0}.wizard-grid{display:grid;grid-template-columns:210px 1fr;min-height:420px}.stepper{border-right:1px solid var(--line);background:#f8fbfa;padding:12px;display:grid;align-content:start;gap:6px}.step{display:grid;grid-template-columns:28px 1fr;gap:9px;align-items:center;width:100%;text-align:left;background:transparent;color:var(--fg);border-color:transparent;padding:10px}.step span{width:26px;height:26px;border-radius:999px;display:grid;place-items:center;background:#fff;border:1px solid var(--line);color:var(--accent);font-weight:750}.step.active{background:#fff;border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04)}.wizard-body{padding:18px}.wizard-panel{display:none}.wizard-panel.active{display:block}.wizard-status{min-height:20px;margin-top:10px;color:var(--muted)}.device-sync{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.lab-layout,.bt-layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:14px}.bt-script-layout{display:grid;grid-template-columns:1fr;gap:12px}.bt-script-tools{display:grid;gap:8px;align-content:start}.lab-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.lab-quick{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0 12px}.lab-quick button{text-align:left;min-height:50px;background:#fff;color:var(--accent);border-color:var(--accent)}.lab-quick button:hover{background:#f8fbfa;border-color:#0b625c}.lab-quick button .queue-meta{color:var(--muted);font-weight:600}.lab-presets,.queue-tools{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.lab-presets button,.queue-tools button{padding:6px 9px;font-size:12px}.lab-advanced{margin-top:12px}.inline-check{display:inline-flex;align-items:center;gap:8px;margin-top:10px}.lab-summary{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--wash);padding:9px 10px;margin:8px 0;color:var(--muted);font-size:12px}.queue-list{display:grid;gap:7px;max-height:390px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:8px}.queue-row{display:grid;grid-template-columns:auto 1fr auto;gap:9px;align-items:start;background:#fff;border:1px solid var(--line);border-radius:7px;padding:8px}.queue-row strong{display:block}.queue-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.meter{height:8px;border-radius:999px;background:#e7eeec;overflow:hidden}.meter span{display:block;height:100%;width:0;background:var(--accent)}button:disabled{opacity:.55;cursor:not-allowed}"
+        "@media(max-width:860px){.app-shell{grid-template-columns:1fr}.side-menu{position:static;grid-template-columns:repeat(2,1fr)}.topbar{align-items:flex-start;flex-direction:column}.row,.wizard-grid,.device-sync,.lab-layout,.bt-layout,.bt-script-layout{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.command{grid-template-columns:1fr}.stepper{border-right:0;border-bottom:1px solid var(--line);grid-template-columns:repeat(2,1fr)}}"
+        "@media(max-width:520px){.side-menu{grid-template-columns:1fr}.app-shell{padding:12px}.section-head{align-items:flex-start;flex-direction:column}}"
+        "</style></head><body><header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><div><h1>Harmony Hub Control</h1><small>Local smart-home console</small></div></div><div class='top-status'><span class='pill'>Local control</span><span class='pill'>Cloud services off</span></div></div></header><main class='app-shell'><aside class='side-menu' aria-label='Main menu'><button type='button' class='menu-item active' data-view-target='overview'><span>D</span><div><strong>Dashboard</strong><small>Health and state</small></div></button><button type='button' class='menu-item' data-view-target='ir'><span>IR</span><div><strong>IR Devices</strong><small>Setup and commands</small></div></button><button type='button' class='menu-item' data-view-target='lab'><span>L</span><div><strong>IR Sweep</strong><small>Bulk command tests</small></div></button><button type='button' class='menu-item' data-view-target='bluetooth'><span>BT</span><div><strong>Bluetooth</strong><small>Keyboard control</small></div></button><button type='button' class='menu-item' data-view-target='mqtt'><span>M</span><div><strong>MQTT</strong><small>Home Assistant</small></div></button><button type='button' class='menu-item' data-view-target='wifi'><span>W</span><div><strong>Wi-Fi</strong><small>Network access</small></div></button><button type='button' class='menu-item' data-view-target='backup'><span>B</span><div><strong>Backup</strong><small>Import and export</small></div></button><button type='button' class='menu-item' data-view-target='system'><span>S</span><div><strong>System</strong><small>Logs and reboot</small></div></button></aside><div class='content'>",
+        f);
+}
+
+static void page_end(FILE *f) {
+    fputs(
+        "<script>"
+        "const $=id=>document.getElementById(id);"
+        "if('scrollRestoration' in history)history.scrollRestoration='manual';"
+        "function showView(name){let panel='';if(name&&name.startsWith('ir-')){panel=name.slice(3);name='ir';}if(!name)name='overview';let found=false;document.querySelectorAll('[data-view]').forEach(s=>{const on=s.dataset.view===name;s.classList.toggle('active',on);if(on)found=true;});if(!found&&name!=='overview'){showView('overview');return;}document.querySelectorAll('[data-view-target]').forEach(b=>b.classList.toggle('active',b.dataset.viewTarget===name));if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);if(name==='ir'&&panel)setTimeout(()=>showWizardPanel(panel),0);window.scrollTo(0,0);setTimeout(()=>window.scrollTo(0,0),0);}"
+        "document.querySelectorAll('[data-view-target]').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.viewTarget)));"
+        "showView((location.hash||'#overview').slice(1));"
+        "const importFile=$('importFile');if(importFile){importFile.addEventListener('change',()=>{const file=importFile.files&&importFile.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{const box=document.querySelector('textarea[name=payload]');if(box)box.value=reader.result||''};reader.readAsText(file);});}"
+        "const cap=$('captureNow');if(cap){cap.addEventListener('click',async()=>{const s=$('captureStatus'),raw=$('captureRaw');try{s.textContent='capturing...';const r=await fetch('/api/capture',{method:'POST'});const j=await r.json();raw.value=j.raw||'';s.textContent=j.raw?'capture received':'no capture payload';}catch(e){s.textContent='capture failed';}});}"
+        "let wizardInventory=null;"
+        "function plainText(html){return String(html||'').replace(/<script[\\s\\S]*?<\\/script>/gi,'').replace(/<style[\\s\\S]*?<\\/style>/gi,'').replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim();}"
+        "function escHtml(s){return String(s||'').replace(/[&<>\"']/g,c=>c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':c==='\"'?'&quot;':'&#39;');}"
+        "function wizStatus(id,t){const el=$(id);if(el)el.textContent=t||'';}"
+        "function showWizardPanel(name){document.querySelectorAll('.wizard-panel').forEach(p=>p.classList.toggle('active',p.dataset.panel===name));document.querySelectorAll('.step').forEach(b=>b.classList.toggle('active',b.dataset.stepTarget===name));}"
+        "document.querySelectorAll('[data-step-target]').forEach(b=>b.addEventListener('click',()=>showWizardPanel(b.dataset.stepTarget)));"
+        "document.querySelectorAll('[data-next-step]').forEach(b=>b.addEventListener('click',()=>showWizardPanel(b.dataset.nextStep)));"
+        "function framePost(path,data){return new Promise((resolve,reject)=>{const frame=document.createElement('iframe'),form=document.createElement('form'),name='wizFrame'+Date.now();let done=false,submitted=false;frame.name=name;frame.style.display='none';form.method='post';form.action=path;form.target=name;form.style.display='none';Object.keys(data||{}).forEach(k=>{const i=document.createElement('input');i.type='hidden';i.name=k;i.value=data[k]||'';form.append(i);});function finish(ok,text){if(done)return;done=true;clearTimeout(timer);setTimeout(()=>{frame.remove();form.remove();},200);resolve({ok:ok,text:text||''});}const timer=setTimeout(()=>finish(false,'timeout'),30000);frame.onload=()=>{let text='',href='';try{href=frame.contentWindow.location.href||'';if(!submitted||href==='about:blank')return;const d=frame.contentDocument;text=(d.body&&(d.body.innerText||d.body.textContent))||d.documentElement.textContent||'';}catch(e){text='';}finish(true,text);};document.body.append(frame,form);submitted=true;form.submit();});}"
+        "async function postForm(path,data){return await framePost(path,data);}"
+        "function keyProtocol(k){return /MemorexO1/i.test(k||'')?'679':'2';}"
+        "function extractKeycode(t){const m=String(t||'').match(/G:[^\\r\\n\"'<>]+?:\\d+/);return m?m[0].replace(/,$/,'').trim():'';}"
+        "function extractNecHex(t){t=String(t||'').trim();let m=t.match(/^0x([0-9a-f]{1,8})$/i)||t.match(/^([0-9a-f]{1,8})$/i);if(m)return m[1].toUpperCase();m=t.match(/0x([0-9a-f]{8})(?![0-9a-f])/i);if(m)return m[1].toUpperCase();if(/nec|samsung|toshiba|memorex|protocol|keycode/i.test(t)){m=t.match(/(^|[^0-9a-f])([0-9a-f]{8})(?![0-9a-f])/i);if(m)return m[2].toUpperCase();}return '';}"
+        "function captureLooksEmpty(t){return !String(t||'').trim()||/no payload|returned no|timeout/i.test(t);}"
+        "function applyCaptureAnalysis(j,text){text=String(text||j?.raw||'').trim();if(captureLooksEmpty(text))return false;const mode=$('wizardMode'),proto=$('wizardProtocol'),raw=$('wizardRaw'),key=$('wizardKeycode'),nec=$('wizardNec');if(raw)raw.value=text;let bestMode=j?.mode||'',bestKey=j?.keycode||'',bestNec=j?.nec||'',note=j?.analysis||'';if(!bestKey)bestKey=extractKeycode(text);if(!bestNec)bestNec=extractNecHex(text);if(bestKey){if(key)key.value=bestKey;if(proto)proto.value=String(j?.protocolId||keyProtocol(bestKey));if(mode)mode.value='keycode';wizStatus('wizardLearnStatus',note||'decoded a compact Harmony code');return true;}if(bestNec){if(nec)nec.value=bestNec;if(key)key.value='';if(proto)proto.value=String(j?.protocolId||keyProtocol(text));if(mode)mode.value='nec';wizStatus('wizardLearnStatus',note||'decoded an NEC-style code');return true;}if(mode)mode.value='raw';wizStatus('wizardLearnStatus',note||'captured timing data; storing as raw replay');return true;}"
+        "async function loadWizardInventory(){try{const r=await fetch('/api/inventory');wizardInventory=await r.json();}catch(e){wizardInventory=null;}populateVerifyCommands();}"
+        "function selectedDeviceId(id){const el=$(id);return el?el.value:'';}"
+        "function currentCommandsFor(id){const dev=(wizardInventory&&wizardInventory.devices||[]).find(d=>d.id===id);return dev&&dev.commands?dev.commands:[];}"
+        "function populateVerifyCommands(){const dev=selectedDeviceId('verifyDevice')||selectedDeviceId('wizardDevice'),sel=$('verifyCommand');if(!sel)return;sel.replaceChildren();currentCommandsFor(dev).forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name;sel.append(o);});const typed=($('wizardCommandName')?.value||'').trim();if(typed&&!Array.from(sel.options).some(o=>o.value===typed)){const o=document.createElement('option');o.value=typed;o.textContent=typed;sel.prepend(o);sel.value=typed;}}"
+        "function syncWizardDevice(from,to){const a=$(from),b=$(to);if(a&&b)b.value=a.value;populateVerifyCommands();}"
+        "const wizDevice=$('wizardDevice');if(wizDevice)wizDevice.addEventListener('change',()=>{syncWizardDevice('wizardDevice','verifyDevice');const imp=$('irdbDevice');if(imp)imp.value=wizDevice.value;});"
+        "const verDevice=$('verifyDevice');if(verDevice)verDevice.addEventListener('change',populateVerifyCommands);"
+        "const wizName=$('wizardCommandName');if(wizName)wizName.addEventListener('input',populateVerifyCommands);"
+        "const wizNec=$('wizardNec');if(wizNec)wizNec.addEventListener('input',()=>{if(wizNec.value.trim()&&$('wizardMode'))$('wizardMode').value='nec';});"
+        "const wizKey=$('wizardKeycode');if(wizKey)wizKey.addEventListener('input',()=>{if(wizKey.value.trim()&&$('wizardMode'))$('wizardMode').value='keycode';});"
+        "const wizRaw=$('wizardRaw');if(wizRaw)wizRaw.addEventListener('input',()=>{const m=$('wizardMode');if(wizRaw.value.trim()&&m&&m.value!=='auto')m.value='raw';});"
+        "const wizCap=$('wizardCapture');if(wizCap){wizCap.addEventListener('click',async()=>{try{wizStatus('wizardLearnStatus','listening...');const r=await postForm('/api/capture',{});let txt=(r.text||'').trim(),j={};try{j=JSON.parse(txt);}catch(e){j={raw:txt};}if(!applyCaptureAnalysis(j,j.raw||txt))wizStatus('wizardLearnStatus','no signal received');}catch(e){wizStatus('wizardLearnStatus','capture failed');}});}"
+        "function learnFormData(){return{deviceId:selectedDeviceId('wizardDevice'),name:($('wizardCommandName')?.value||'').trim(),mode:$('wizardMode')?.value||'raw',protocol:$('wizardProtocol')?.value||'2',nec:$('wizardNec')?.value||'',keycode:$('wizardKeycode')?.value||'',raw:$('wizardRaw')?.value||''};}"
+        "function learnHasSignal(d){return!!((d.keycode||'').trim()||(d.nec||'').trim()||(d.raw||'').trim());}"
+        "const wizLearnTest=$('wizardLearnTest');if(wizLearnTest){wizLearnTest.addEventListener('click',async()=>{const data=learnFormData();if(!data.deviceId){wizStatus('wizardLearnStatus','choose a device before testing');return;}if(!learnHasSignal(data)){wizStatus('wizardLearnStatus','learn or enter a signal before testing');return;}try{wizStatus('wizardLearnStatus','testing learned signal...');const j=await postJson('/api/ir-test-learned',data);const tail=String(j.reply||'').trim();wizStatus('wizardLearnStatus','test sent'+(tail?': '+tail.slice(0,180):''));await loadWizardInventory();}catch(e){wizStatus('wizardLearnStatus','test failed: '+(e.message||e));}});}"
+        "const wizForm=$('wizardLearnForm');if(wizForm){wizForm.addEventListener('submit',async e=>{e.preventDefault();const data=learnFormData();try{wizStatus('wizardLearnStatus','saving...');const res=await postForm('/ir/command',data);const msg=plainText(res.text);wizStatus('wizardLearnStatus',msg.includes('Saved command')?'command saved. You can learn another signal or open Verify.':(msg||'save request complete'));await loadWizardInventory();const vd=$('verifyDevice');if(vd)vd.value=data.deviceId;populateVerifyCommands();}catch(err){wizStatus('wizardLearnStatus','save failed');}});}"
+        "const wizTest=$('wizardTest');if(wizTest){wizTest.addEventListener('click',async()=>{const data={deviceId:selectedDeviceId('verifyDevice')||selectedDeviceId('wizardDevice'),command:$('verifyCommand')?.value||($('wizardCommandName')?.value||'')};if(!data.deviceId||!data.command){wizStatus('wizardVerifyStatus','choose a command');return;}try{wizStatus('wizardVerifyStatus','sending...');const res=await postForm('/ir/send',data);const msg=plainText(res.text);wizStatus('wizardVerifyStatus',msg||'test sent');}catch(e){wizStatus('wizardVerifyStatus','test failed');}});}"
+        "loadWizardInventory();"
+        "const IRDB_BASE='https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/';"
+        "const FLIPPER_BASE='https://cdn.jsdelivr.net/gh/Lucaslhm/Flipper-IRDB@main/';"
+        "const FLIPPER_INDEX='https://api.github.com/repos/Lucaslhm/Flipper-IRDB/git/trees/main?recursive=1';let irdbIndex=[],irdbCache={irdb:null,flipper:null};"
+        "function rev8(v){v=((v&240)>>4)|((v&15)<<4);v=((v&204)>>2)|((v&51)<<2);v=((v&170)>>1)|((v&85)<<1);return v&255;}"
+        "function keyFromParts(proto,d,s,f){if(!/^(NEC|Samsung32)/i.test(proto))return '';d=Number(d);s=s===''?(d^255):Number(s);f=Number(f);if([d,s,f].some(x=>!Number.isFinite(x)||x<0||x>255))return '';if(/^Samsung32/i.test(proto))s=d;const val=((rev8(d)<<24)|(rev8(s)<<16)|(rev8(f)<<8)|rev8((~f)&255))>>>0;return 'G:Toshiba 32 Bit:(0x'+val.toString(16).toUpperCase().padStart(8,'0')+')(Repeat)():3';}"
+        "function csvCells(line){const out=[];let cur='',q=false;for(let i=0;i<line.length;i++){const ch=line[i];if(ch==='\"'){if(q&&line[i+1]==='\"'){cur+='\"';i++;}else q=!q;}else if(ch===','&&!q){out.push(cur);cur='';}else cur+=ch;}out.push(cur);return out.map(x=>x.trim());}"
+        "function csvEntries(t){return t.replace(/\\r/g,'').split('\\n').map(x=>x.trim()).filter(Boolean).map(line=>{const p=csvCells(line);return{name:p[0]||'',meta:(p[1]||'')+' '+(p[2]||'')+','+(p[3]||'')+','+(p[4]||''),keycode:p[0]==='functionname'?'':keyFromParts(p[1]||'',p[2]||'',p[3]||'',p[4]||'')};}).filter(r=>r.name&&r.name!=='functionname');}"
+        "function hexBytes(v){return String(v||'').trim().split(/\\s+/).filter(Boolean).map(x=>parseInt(x,16)||0);}"
+        "function hexValue(v){return hexBytes(v).slice(0,4).reduce((a,b,i)=>a|((b&255)<<(8*i)),0)>>>0;}"
+        "function harmonyRawFromTimings(freq,vals){freq=Math.max(10000,Math.min(60000,Math.round(Number(freq)||38000)));vals=(vals||[]).map(v=>Math.max(1,Math.min(0xfffff,Math.round(Math.abs(Number(v)||0))))).filter(Boolean);if(vals.length<4)return'';let raw='F'+freq.toString(16).toUpperCase();vals.forEach((v,i)=>{raw+=(i%2?'S':'P')+v.toString(16).toUpperCase();});return raw.length<=4096?raw:'';}"
+        "function pulse(seq,level,dur){dur=Math.round(dur);if(dur<=0)return;const last=seq[seq.length-1];if(last&&last.level===level)last.dur+=dur;else seq.push({level:level,dur:dur});}"
+        "function seqRaw(freq,seq){if(!seq.length)return'';if(seq[0].level===0)seq.unshift({level:1,dur:1});return harmonyRawFromTimings(freq,seq.map(x=>x.dur));}"
+        "function manchester(seq,bits,half,doubleIndex){bits.forEach((bit,i)=>{const h=i===doubleIndex?half*2:half;if(bit){pulse(seq,1,h);pulse(seq,0,h);}else{pulse(seq,0,h);pulse(seq,1,h);}});}"
+        "function msbBits(v,n){const a=[];for(let i=n-1;i>=0;i--)a.push((v>>i)&1);return a;}"
+        "function lsbBits(v,n){const a=[];for(let i=0;i<n;i++)a.push((v>>i)&1);return a;}"
+        "function rc5Raw(cur){const addr=hexValue(cur.address)&31,cmd=hexValue(cur.command)&127,tog=hexValue(cur.toggle)&1,seq=[];const bits=[1,cmd<64?1:0,tog].concat(msbBits(addr,5),msbBits(cmd&63,6));manchester(seq,bits,889,-1);return seqRaw(36000,seq);}"
+        "function rc6Raw(cur){const addr=hexValue(cur.address)&255,cmd=hexValue(cur.command)&255,tog=hexValue(cur.toggle)&1,seq=[];pulse(seq,1,2666);pulse(seq,0,889);const bits=[1,0,0,0,tog].concat(msbBits(addr,8),msbBits(cmd,8));manchester(seq,bits,444,4);return seqRaw(36000,seq);}"
+        "function sircRaw(cur,proto){const cmd=hexValue(cur.command)&127,addr=hexValue(cur.address),bits=/20/.test(proto)?20:(/15/.test(proto)?15:12),addrBits=bits-7,seq=[];pulse(seq,1,2400);pulse(seq,0,600);lsbBits(cmd,7).concat(lsbBits(addr,addrBits)).forEach(b=>{pulse(seq,1,b?1200:600);pulse(seq,0,600);});return seqRaw(40000,seq);}"
+        "function prontoToHarmonyRaw(hex){const words=String(hex||'').trim().split(/\\s+/).filter(Boolean).map(x=>parseInt(x,16));if(words.length<8||words.some(x=>!Number.isFinite(x)))return'';if(words[0]!==0)return'';const unit=(words[1]||1)*0.241246,freq=Math.round(1000000/unit),pairs=(words[2]||0)+(words[3]||0),vals=words.slice(4,4+pairs*2).map(w=>Math.round(w*unit));return harmonyRawFromTimings(freq,vals);}"
+        "function flipperEntries(t){const out=[];let cur={};function push(){if(!cur.name){cur={};return;}let key='',raw='',meta=(cur.protocol||cur.type||'raw');if(cur.type==='parsed'){const a=hexBytes(cur.address),c=hexBytes(cur.command),p=cur.protocol||'';if(/^Samsung32/i.test(p))key=keyFromParts(p,a[0],a[0],c[0]);else if(/^NECext/i.test(p))key=keyFromParts(p,a[0],a[1],c[0]);else if(/^NEC/i.test(p))key=keyFromParts(p,a[0],a[0]^255,c[0]);else if(/^RC5/i.test(p)){raw=rc5Raw(cur);meta=raw?'RC5 converted timing':'RC5 unsupported';}else if(/^RC6/i.test(p)){raw=rc6Raw(cur);meta=raw?'RC6 converted timing':'RC6 unsupported';}else if(/^SIRC/i.test(p)){raw=sircRaw(cur,p);meta=raw?p+' converted timing':p+' unsupported';}}else if(cur.type==='raw'){const vals=String(cur.data||'').trim().split(/\\s+/).filter(Boolean).map(Number);raw=harmonyRawFromTimings(cur.frequency||38000,vals);meta='raw timings '+(cur.frequency||38000)+' Hz ('+vals.length+' durations)';}out.push({name:cur.name,meta:meta,keycode:key,raw:raw});cur={};}t.replace(/\\r/g,'').split('\\n').forEach(line=>{line=line.trim();if(!line)return;if(line[0]==='#'){push();return;}const i=line.indexOf(':');if(i<0)return;const k=line.slice(0,i).trim(),v=line.slice(i+1).trim();if(k==='name'&&cur.name)push();cur[k]=cur[k]&&k==='data'?cur[k]+' '+v:v;});push();return out;}"
+        "function irdbStatus(t){const s=$('irdbStatus');if(s)s.textContent=t;}"
+        "function irdbLog(t){const l=$('irdbLog');if(!l)return;let p=l.textContent||'';if(/^Ready\\./.test(p))p='';l.textContent=(t?new Date().toLocaleTimeString()+'  '+t+'\\n':'')+p.slice(0,6000);}"
+        "function clearIrdPreview(){const p=$('irdbPayload'),box=$('irdbPreview');if(p)p.value='';if(box){box.replaceChildren();box.classList.add('hidden');}}"
+        "function safeImportName(s){s=String(s||'Command').replace(/[|\"\\\\\\r\\n]/g,' ').replace(/\\s+/g,' ').trim().slice(0,96);return s||'Command';}"
+        "function sourceLabel(s){return s==='flipper'?'Flipper-IRDB':(s==='remotecentral'?'RemoteCentral Pronto':(s==='stored'?'Saved device':'probonopd/irdb'));}"
+        "function harmonyQueryParts(q){q=String(q||'').trim();let m=q.match(/^([^,]+),\\s*(.+)$/);if(m)return{man:m[1].trim(),model:m[2].trim()};const p=q.split(/\\s+/);return{man:p.shift()||'',model:p.join(' ')||''};}"
+        "function decodeHtml(s){const e=document.createElement('textarea');e.innerHTML=String(s||'');return e.value;}"
+        "function rcSlug(s){return normText(String(s||'').replace(/&/g,' ')).replace(/\\s+/g,'_').replace(/^_+|_+$/g,'');}"
+        "function rcNormalizePath(href,base){href=String(href||'').trim();try{if(/^https?:/i.test(href)){const u=new URL(href);href=u.pathname;}}catch(e){}if(!href||href[0]==='#'||href[0]==='?')return'';if(href[0]==='/')return href;return String(base||'/cgi-bin/codes/').replace(/\\/?$/,'/')+href.replace(/^\\.\\//,'');}"
+        "async function rcFetch(path){path=rcNormalizePath(path,'/cgi-bin/codes/');try{const r=await fetch('/api/remotecentral-fetch?path='+encodeURIComponent(path));const j=await r.json();if(j.ok)return j.html||'';if(!/http 30[1278]/i.test(j.error||''))throw new Error(j.error||'RemoteCentral fetch failed');}catch(e){if(/invalid RemoteCentral/i.test(e.message||''))throw e;}const proxy='https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent('https://www.remotecentral.com'+path);const pr=await fetch(proxy);if(!pr.ok)throw new Error('RemoteCentral HTTPS proxy http '+pr.status);return await pr.text();}"
+        "function rcPageLinks(html,brand){const base='/cgi-bin/codes/'+brand+'/',seen=new Set(),out=[],re=/<a\\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;let m;while((m=re.exec(html))){const path=rcNormalizePath(m[1],base);if(path.startsWith(base)&&/\\/page-\\d+\\/?$/i.test(path)&&!seen.has(path)){seen.add(path);out.push(path);}}return out.slice(0,5);}"
+        "function scoreRcMatch(label,q){const toks=queryTokens(q),n=normText(label);if(!toks.length)return 0;let score=0;for(const t of toks){if(!n.includes(t))return -1;score+=n.split(/\\s+/).includes(t)?45:18;}if(n.includes(normText(q)))score+=80;return score-Math.min(n.length/24,20);}"
+        "function rcModelLinks(html,brand,q,weak){const base='/cgi-bin/codes/'+brand+'/',seen=new Set(),out=[],re=/<a\\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;let m;while((m=re.exec(html))){const path=rcNormalizePath(m[1],base),title=plainText(m[2]);if(!path.startsWith(base)||path===base||/\\/page-\\d+\\/?$/i.test(path)||!title||seen.has(path))continue;let score=scoreRcMatch(title+' '+path,q),browse=false;if(score<0){if(!weak)continue;score=8;browse=true;}seen.add(path);out.push({source:'remotecentral',path:path,title:title,meta:browse?'RemoteCentral category page':'RemoteCentral model page',score:score,browseFallback:browse});}return out;}"
+        "async function remoteCentralEntries(q){const parts=harmonyQueryParts(q),brand=rcSlug(parts.man),model=(parts.model||q).trim();if(!brand||!model)return[];let first;try{first=await rcFetch('/cgi-bin/codes/'+brand+'/');}catch(e){return[];}const pages=[first],links=rcPageLinks(first,brand);for(const p of links){try{pages.push(await rcFetch(p));}catch(e){}}let rows=pages.flatMap(h=>rcModelLinks(h,brand,model,false));if(!rows.length)rows=pages.flatMap(h=>rcModelLinks(h,brand,model,true)).slice(0,24);return rows.sort((a,b)=>b.score-a.score||a.title.length-b.title.length).slice(0,80);}"
+        "function rcCleanCommandName(s){s=decodeHtml(String(s||'')).replace(/\\(\\s*Copy\\s+to\\s+Clipboard\\s*\\)/ig,'').replace(/[|\"\\\\]/g,'').replace(/\\s+/g,' ').trim();if(!s||/^(Image|Return|Remote Model|Infrared Hex|This model|Features|Hex Codes|Page:|Copyright|Home|News|Reviews|Files|Forums)$/i.test(s))return'';return s.slice(0,96);}"
+        "function rcCommandName(lines,i,prefix){let n=rcCleanCommandName(prefix);if(n)return n;for(let j=i-1;j>=0&&j>=i-8;j--){n=rcCleanCommandName(lines[j]);if(n&&!/^[0-9a-f]{4}\\s/i.test(n))return n;}return 'Command '+(i+1);}"
+        "function remoteCentralCommandEntries(html){let text=String(html||'').replace(/<script[\\s\\S]*?<\\/script>/gi,'').replace(/<style[\\s\\S]*?<\\/style>/gi,'').replace(/<br\\s*\\/?\\s*>/gi,'\\n').replace(/<\\/(td|tr|p|div|li)>/gi,'\\n').replace(/<[^>]+>/g,' ');text=decodeHtml(text).replace(/\\(Copy to Clipboard\\)/ig,'\\n(Copy to Clipboard)\\n');const lines=text.replace(/\\r/g,'').split('\\n').map(x=>x.replace(/\\s+/g,' ').trim()).filter(Boolean),rows=[];const pronto=/((?:0000|0100|5000|6000|7000)(?:\\s+[0-9a-fA-F]{4}){10,})/g;lines.forEach((line,i)=>{let m;while((m=pronto.exec(line))){const hex=m[1].replace(/\\s+/g,' ').trim(),raw=prontoToHarmonyRaw(hex);rows.push({name:rcCommandName(lines,i,line.slice(0,m.index)),meta:raw?'Pronto converted raw ('+hex.split(' ').length+' words)':'Pronto unsupported format',raw:raw});}});return rows;}"
+        "function normText(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();}"
+        "function queryTokens(s){return normText(s).split(/\\s+/).filter(Boolean);}"
+        "function scoreIrdPath(entry,q){if(entry.source==='remotecentral'&&entry.browseFallback)return entry.score||1;const label=(entry.title||'')+' '+entry.path+' '+(entry.meta||''),toks=queryTokens(q),n=normText(label),parts=n.split(/\\s+/).filter(Boolean);if(!toks.length)return 0;let score=0;for(const t of toks){if(!n.includes(t))return -1;if(parts.includes(t))score+=40;else if(parts.some(p=>p.startsWith(t)))score+=22;else score+=10;}const nq=normText(q);if(n.includes(nq))score+=80;if(label.toLowerCase().includes(q.toLowerCase()))score+=30;score-=Math.min(label.length/16,25);return score;}"
+        "async function loadIrdSource(src){if(irdbCache[src])return irdbCache[src];if(src==='flipper'){const j=await (await fetch(FLIPPER_INDEX)).json();const files=j.tree||j.files||[];irdbCache[src]=files.map(x=>(x.path||x.name||x).replace(/^\\//,'')).filter(x=>x.endsWith('.ir')).map(path=>({source:src,path:path}));}else{const t=await (await fetch(IRDB_BASE+'index')).text();irdbCache[src]=t.replace(/\\r/g,'').split('\\n').map(x=>x.trim()).filter(x=>x.endsWith('.csv')).map(path=>({source:src,path:path}));}return irdbCache[src];}"
+        "async function loadIrdIndexes(){const src=$('irdbSource')?.value||'all',want=src==='all'?['irdb','flipper']:(src==='remotecentral'?[]:[src]);const lists=await Promise.all(want.map(loadIrdSource));irdbIndex=lists.flat();return irdbIndex;}"
+        "function updateIrdPayload(){const p=$('irdbPayload'),pre=$('irdbPrefix');if(!p)return;const prefix=pre?pre.value:'';p.value=Array.from(document.querySelectorAll('#irdbPreview input[type=checkbox]:checked')).map(cb=>{const name=prefix+cb.dataset.name;if(cb.dataset.mode==='raw')return name+'|raw|'+(cb.dataset.raw||'');return name+'|'+cb.dataset.keycode;}).join('\\n');}"
+        "function renderIrdRows(rows){const box=$('irdbPreview');if(!box)return;box.replaceChildren();let ok=0,raw=0,key=0,unsupported={};if(!rows.length){const d=document.createElement('div');d.className='muted mini';d.textContent='No importable commands found on this page. Try another model page or learn the command manually.';box.append(d);box.classList.remove('hidden');updateIrdPayload();irdbStatus('no importable commands found');irdbLog('parsed 0 importable commands');return;}rows.forEach(r=>{const name=safeImportName(r.name),label=document.createElement('label'),cb=document.createElement('input'),span=document.createElement('span'),supported=!!(r.keycode||r.raw);cb.type='checkbox';cb.checked=supported;cb.disabled=!supported;cb.dataset.name=name;cb.dataset.keycode=r.keycode||'';cb.dataset.raw=r.raw||'';cb.dataset.mode=r.raw?'raw':'keycode';span.textContent=name+' / '+(r.meta||'unknown')+(supported?'':' / unsupported');label.append(cb,span);box.append(label);if(supported){ok++;if(r.raw)raw++;else key++;}else{const m=r.meta||'unknown';unsupported[m]=(unsupported[m]||0)+1;}});box.classList.remove('hidden');box.querySelectorAll('input').forEach(x=>x.addEventListener('change',updateIrdPayload));updateIrdPayload();const bad=rows.length-ok;irdbStatus(ok+' importable commands from '+rows.length+' rows ('+key+' compact, '+raw+' timing, '+bad+' unsupported)');irdbLog('parsed '+rows.length+' rows: '+ok+' importable ('+key+' compact, '+raw+' timing), '+bad+' unsupported');const top=Object.entries(unsupported).sort((a,b)=>b[1]-a[1]).slice(0,4).map(x=>x[0]+' x'+x[1]).join(', ');if(top)irdbLog('unsupported protocols: '+top);}"
+        "function renderIrdResults(rows){const box=$('irdbResults'),dl=$('irdbMatches');if(dl)dl.replaceChildren();if(!box)return;box.replaceChildren();if(!rows.length){box.classList.add('hidden');return;}rows.slice(0,80).forEach(r=>{const label=r.title? r.title+' - '+r.path:r.path;if(dl){const o=document.createElement('option');o.value=r.path;o.label=sourceLabel(r.source);dl.append(o);}const b=document.createElement('button');b.type='button';b.className='match';b.innerHTML='<strong>'+escHtml(sourceLabel(r.source))+'</strong> '+escHtml(label);b.addEventListener('click',()=>pickIrdResult(r,true));box.append(b);});box.classList.remove('hidden');}"
+        "function updateIrdMatches(){const q=$('irdbSearch')?.value||'',path=$('irdbPath');let rows=irdbIndex.map(r=>({...r,score:scoreIrdPath(r,q)})).filter(r=>r.score>=0).sort((a,b)=>b.score-a.score||a.path.length-b.path.length);renderIrdResults(rows);if(path&&irdbIndex.some(r=>r.path===q)){const r=irdbIndex.find(r=>r.path===q);pickIrdResult(r,false);}else if(q&&rows.length){irdbStatus('found '+rows.length+' candidate files');}else if(q){irdbStatus('no matching files');}}"
+        "function pickSourceForPath(path){const p=$('irdbPath'),forced=p?.dataset.source,src=$('irdbSource')?.value||'all',low=String(path||'').toLowerCase();if(forced)return forced;if(src!=='all')return src;if(low.includes('remotecentral.com/cgi-bin/codes/')||low.startsWith('/cgi-bin/codes/'))return'remotecentral';return low.endsWith('.ir')?'flipper':'irdb';}"
+        "function pickIrdResult(r,fetchNow){const p=$('irdbPath');if(p){p.value=r.path;p.dataset.source=r.source;}irdbStatus('selected '+sourceLabel(r.source)+' '+r.path);if(fetchNow)fetchIrdPath();}"
+        "async function runIrdSearch(){try{const src=$('irdbSource')?.value||'all',q=$('irdbSearch')?.value||'';clearIrdPreview();irdbStatus('searching libraries...');irdbLog('search '+(q.trim()?JSON.stringify(q.trim()):'all files')+' in '+src);await loadIrdIndexes();irdbLog('loaded '+irdbIndex.length+' local database file entries');if((src==='all'||src==='remotecentral')&&q.trim()){try{const rr=await remoteCentralEntries(q);irdbIndex=irdbIndex.concat(rr);irdbLog('RemoteCentral candidates: '+rr.length);if(src==='remotecentral'&&!rr.length)irdbStatus('no RemoteCentral matches; use Manufacturer, Model');}catch(e){irdbStatus('RemoteCentral search skipped: '+(e.message||e));irdbLog('RemoteCentral skipped: '+(e.message||e));}}updateIrdMatches();if(!q.trim())irdbStatus('loaded '+irdbIndex.length+' library files');}catch(e){irdbStatus('library search failed: '+(e.message||e));irdbLog('search failed: '+(e.message||e));}}"
+        "const loadIndex=$('irdbLoadIndex');if(loadIndex){loadIndex.addEventListener('click',runIrdSearch);}"
+        "const profileSearch=$('profileSearch');if(profileSearch){profileSearch.addEventListener('click',()=>{const man=($('newDeviceManufacturer')?.value||'').trim(),model=($('newDeviceModel')?.value||'').trim(),name=($('newDeviceName')?.value||'').trim();const q=(man&&model)?man+' '+model:(name||model||man);const src=$('irdbSource'),s=$('irdbSearch');if(src)src.value='all';if(s)s.value=q;showWizardPanel('library');if(q)runIrdSearch();else irdbStatus('enter manufacturer and model first');});}"
+        "const search=$('irdbSearch');if(search){search.addEventListener('input',()=>{if(irdbIndex.length)updateIrdMatches();});search.addEventListener('change',()=>{if(irdbIndex.length)updateIrdMatches();});}"
+        "const source=$('irdbSource');if(source)source.addEventListener('change',()=>{irdbIndex=[];const p=$('irdbPath'),s=$('irdbSearch'),r=$('irdbResults');if(p){p.value='';delete p.dataset.source;}if(s)s.value='';if(r){r.replaceChildren();r.classList.add('hidden');}clearIrdPreview();irdbStatus('');});"
+        "const prefix=$('irdbPrefix');if(prefix)prefix.addEventListener('input',updateIrdPayload);"
+        "async function fetchIrdPath(){const pathBox=$('irdbPath');let path=(pathBox?.value||'').trim(),source=pickSourceForPath(path);if(!path){irdbStatus('choose a path');return;}try{clearIrdPreview();irdbLog('fetch '+sourceLabel(source)+' '+path);if(source==='remotecentral'){irdbStatus('fetching RemoteCentral Pronto hex...');const html=await rcFetch(path);const rows=remoteCentralCommandEntries(html);irdbLog('downloaded RemoteCentral page, '+html.length+' bytes');renderIrdRows(rows);return;}irdbStatus('fetching commands...');let url=path;if(!/^https?:/i.test(url)){url=url.replace(/^codes\\//,'').replace(/^\\//,'');url=(source==='flipper'?FLIPPER_BASE:IRDB_BASE)+url;}const r=await fetch(url);if(!r.ok)throw new Error('http '+r.status);const text=await r.text();irdbLog('downloaded '+text.length+' bytes from '+sourceLabel(source));renderIrdRows(source==='flipper'?flipperEntries(text):csvEntries(text));}catch(e){irdbStatus('command fetch failed: '+(e.message||e));irdbLog('fetch failed: '+(e.message||e));}}"
+        "const pathBox=$('irdbPath');if(pathBox)pathBox.addEventListener('input',()=>{delete pathBox.dataset.source;});"
+        "const fetchBtn=$('irdbFetch');if(fetchBtn){fetchBtn.addEventListener('click',fetchIrdPath);}"
+        "async function postJson(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data||{})});const t=await r.text();let j;try{j=JSON.parse(t);}catch(e){throw new Error(t||('http '+r.status));}if(!r.ok||j.ok===false)throw new Error(j.message||j.error||('http '+r.status));return j;}"
+        "function btFields(){return{type:$('btType')?.value||'btkeyboard',name:($('btName')?.value||'Harmony Keyboard').trim(),bdaddr:($('btAddr')?.value||'').trim(),pin:($('btPin')?.value||'').trim(),code:($('btCode')?.value||'').trim(),timeout:$('btTimeout')?.value||'8'};}"
+        "function btLog(t){const el=$('btLog');if(el)el.textContent=t||'';}"
+        "function btAppend(t){const el=$('btLog');if(!el)return;let p=el.textContent||'';if(/^Ready\\./.test(p))p='';if(p.length>6000)p=p.slice(-5000);el.textContent=(p?p+'\\n':'')+String(t||'');el.scrollTop=el.scrollHeight;}"
+        "function btPairStatus(t){const el=$('btPairStatus');if(el)el.textContent=t||'';}"
+        "function btMaybeFillAddr(raw){raw=String(raw||'');let m=raw.match(/ACL\\s+([0-9A-F]{2}(?::[0-9A-F]{2}){5})/i)||raw.match(/dev_([0-9A-F]{2}(?:_[0-9A-F]{2}){5})/i);if(m){const addr=m[1].replace(/_/g,':').toUpperCase(),el=$('btAddr');if(el&&!el.value.trim()){el.value=addr;btAppend('target address detected: '+addr);}}}"
+        "function btSummarizeAdapter(raw){raw=String(raw||'');const addr=(raw.match(/BD Address:\\s*([0-9A-F:]{17})/i)||[])[1]||'',name=(raw.match(/Name:\\s*'([^']+)'/i)||[])[1]||'',mode=(raw.match(/UP RUNNING[^\\n]*/)||[])[0]||'',disc=/\"Discoverable\"[\\s\\S]{0,80}boolean true/.test(raw),pair=/\"Pairable\"[\\s\\S]{0,80}boolean true/.test(raw);return [name?('Name: '+name):'',addr?('Address: '+addr):'',mode?('Mode: '+mode.trim()):'',('Discoverable: '+(disc?'yes':'no')),('Pairable: '+(pair?'yes':'no'))].filter(Boolean).join('\\n')+'\\n\\n'+raw;}"
+        "async function btPost(action,extra,quiet){const data=Object.assign(btFields(),extra||{},{action:action});if(!quiet)btLog(action+'...');try{const j=await postJson('/api/bt-call',data);if(j.detectedAddress){const el=$('btAddr');if(el&&!el.value.trim())el.value=j.detectedAddress;btAppend('target address detected: '+j.detectedAddress);}if(['pairing_on','pairing_off','adapter_status'].includes(action)){btPairStatus(btSummarizeAdapter(j.responseRaw||''));btMaybeFillAddr(j.responseRaw||'');}if(j.connectionRaw)btMaybeFillAddr(j.connectionRaw);if(!quiet)btLog(JSON.stringify(j,null,2));return j;}catch(e){if(quiet)throw e;btLog(action+' failed: '+(e.message||e));}}"
+        "function btSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
+        "function btDelay(){let v=parseInt($('btScriptDelay')?.value||'35',10);if(!Number.isFinite(v))v=35;v=Math.max(15,Math.min(5000,v));const e=$('btScriptDelay');if(e)e.value=String(v);return v;}"
+        "function btCleanKey(s){s=String(s||'').trim().toLowerCase();const a={'return':'enter','esc':'escape','del':'delete','up':'directionup','down':'directiondown','left':'directionleft','right':'directionright','pgup':'pageup','pgdn':'pagedown','vol+':'volumeup','vol-':'volumedown','mute':'volumemute'};s=a[s]||s;if(/^f([1-9]|1[0-2])$/.test(s))return s;if(/^[0-9]$/.test(s))return'number'+s;return s.replace(/[^a-z0-9_-]/g,'');}"
+        "function btComboCode(s){const parts=String(s||'').toLowerCase().split(/[+\\s]+/).map(btCleanKey).filter(Boolean);if(!parts.length)return'';let key=parts.pop();const mods=parts.map(m=>m==='control'?'ctrl':((m==='cmd'||m==='meta'||m==='win')?'windows':m)).filter(m=>['ctrl','alt','shift','windows'].includes(m));return mods.join('')+key;}"
+        "const btTextMap={' ':'space','\\t':'tab','\\n':'enter','.':'period',',':'comma','-':'minus','_':'shiftminus','/':'slash','?':'shiftslash','=':'equal','+':'shiftequal',';':'semicolon',':':'shiftsemicolon','`':'grave','~':'shiftgrave','[':'leftbracket',']':'rightbracket','\\\\':'backslash','|':'shiftbackslash','!':'shift1','@':'shift2','#':'shift3','$':'shift4','%':'shift5','^':'shift6','&':'shift7','*':'shift8','(':'shift9',')':'shift0'};"
+        "function btCharCode(ch){if(/[A-Z]/.test(ch))return'shift'+ch.toLowerCase();if(/[a-z]/.test(ch))return ch;if(/[0-9]/.test(ch))return'number'+ch;return btTextMap[ch]||'';}"
+        "function btAddText(text,steps,notes,lineNo){Array.from(String(text||'')).forEach(ch=>{const c=btCharCode(ch);if(c)steps.push({kind:'key',code:c,line:lineNo});else notes.push('line '+lineNo+': skipped unsupported character '+JSON.stringify(ch));});}"
+        "function btParseScript(){const steps=[],notes=[],raw=$('btScript')?.value||'';raw.replace(/\\r/g,'').split('\\n').forEach((line,i)=>{const n=i+1,clean=line.trim();if(!clean||clean.startsWith('#')||clean.startsWith('//'))return;const m=clean.match(/^([^\\s]+)\\s*(.*)$/),op=(m?m[1]:clean).toUpperCase(),arg=m?(m[2]||''):'';if(op==='WAIT'||op==='SLEEP'){let ms=/s$/i.test(arg.trim())?parseFloat(arg)*1000:parseInt(arg,10);if(!Number.isFinite(ms)||ms<0)notes.push('line '+n+': invalid wait');else steps.push({kind:'wait',ms:Math.min(10000,Math.max(0,ms)),line:n});}else if(op==='TEXT'||op==='TYPE'){btAddText(arg,steps,notes,n);}else if(op==='KEY'||op==='SEND'||op==='PRESS'){const c=btCleanKey(arg);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': missing key name');}else if(op==='COMBO'||op==='HOTKEY'){const c=btComboCode(arg);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': missing combo');}else{const c=btCleanKey(clean);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': unsupported line');}});return{steps:steps,notes:notes};}"
+        "function btPreviewScript(){const p=$('btScriptPreview'),r=btParseScript(),shown=r.steps.slice(0,160).map((s,i)=>String(i+1).padStart(3,' ')+'. '+(s.kind==='wait'?'WAIT '+s.ms+' ms':'KEY '+s.code));const more=r.steps.length>shown.length?'\\n... '+(r.steps.length-shown.length)+' more steps':'';if(p)p.textContent=(r.steps.length?shown.join('\\n')+more:'No script steps found.')+(r.notes.length?'\\n\\nNotes:\\n'+r.notes.join('\\n'):'');return r;}"
+        "let btScriptStop=false,btScriptRunning=false;function btScriptButtons(on){btScriptRunning=on;['btScriptRun','btScriptPreviewBtn'].forEach(id=>{const e=$(id);if(e)e.disabled=on;});}"
+        "async function btRunScript(){if(btScriptRunning)return;const r=btPreviewScript(),gap=btDelay(),chunkSize=24,releaseAll='hex:A101000000000000000000';if(!r.steps.length){btAppend('script has no steps');return;}btScriptStop=false;btScriptButtons(true);let sent=0,buf=[];async function flush(){if(!buf.length)return;const keys=buf.slice();buf=[];const input=$('btCode');if(input)input.value=keys.join('\\n');btAppend('send chunk: '+keys.length+' keys, '+gap+' ms report gap');const j=await btPost('reportseq',{code:keys.join('\\n'),gapMs:String(gap)},true);sent+=keys.length;const tail=String(j.responseRaw||'').trim();btAppend('chunk ok: '+tail.slice(0,180));await btSleep(25);}btAppend('script start: '+r.steps.length+' steps, '+gap+' ms report gap');try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);for(const step of r.steps){if(btScriptStop){await flush();btAppend('script stopped after '+sent+' keys');break;}if(step.kind==='wait'){await flush();btAppend('wait '+step.ms+' ms');await btSleep(step.ms);continue;}buf.push(step.code);if(buf.length>=chunkSize)await flush();}if(!btScriptStop){await flush();btAppend('script complete: '+sent+' keys');}}catch(e){btAppend('script failed: '+(e.message||e));}finally{try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);btAppend('release all sent');}catch(e){}btScriptButtons(false);}}"
+        "const btPairOn=$('btPairingOn');if(btPairOn)btPairOn.addEventListener('click',()=>btPost('pairing_on'));const btPairOff=$('btPairingOff');if(btPairOff)btPairOff.addEventListener('click',()=>btPost('pairing_off'));const btAdapter=$('btAdapterStatus');if(btAdapter)btAdapter.addEventListener('click',()=>btPost('adapter_status'));const btClassic=$('btClassicScan');if(btClassic)btClassic.addEventListener('click',()=>btPost('classic_scan'));const btScan=$('btScan');if(btScan)btScan.addEventListener('click',()=>btPost('scan'));const btStatus=$('btStatus');if(btStatus)btStatus.addEventListener('click',()=>btPost('status'));const btConnect=$('btConnect');if(btConnect)btConnect.addEventListener('click',()=>btPost('connect'));const btDisconnect=$('btDisconnect');if(btDisconnect)btDisconnect.addEventListener('click',()=>btPost('disconnect'));const btSend=$('btSend');if(btSend)btSend.addEventListener('click',()=>btPost('report'));const btRelease=$('btReleaseAll');if(btRelease)btRelease.addEventListener('click',()=>btPost('report',{code:'hex:A101000000000000000000',gapMs:String(btDelay())}));const btEnter=$('btEnterTest');if(btEnter)btEnter.addEventListener('click',()=>{const input=$('btCode');if(input)input.value='enter';btPost('report',{code:'enter'});});const btPrev=$('btScriptPreviewBtn');if(btPrev)btPrev.addEventListener('click',btPreviewScript);const btRun=$('btScriptRun');if(btRun)btRun.addEventListener('click',btRunScript);const btStop=$('btScriptStop');if(btStop)btStop.addEventListener('click',()=>{btScriptStop=true;btAppend('stop requested');});document.querySelectorAll('[data-bt-code]').forEach(b=>b.addEventListener('click',()=>{const c=b.dataset.btCode||'';const input=$('btCode');if(input)input.value=c;btPost('report',{code:c});}));"
+        "const LAB_AUTO_DEVICE='__auto_lab__';const lab={queue:[],index:[],cursor:0,key:'',running:false,stop:false,imported:false,runId:'',streaming:false};"
+        "function labStatus(t){const s=$('labStatus');if(s)s.textContent=t||'';}function labSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
+        "function labNum(id,def,min,max){let v=parseInt($(id)?.value||def,10);if(!Number.isFinite(v))v=def;v=Math.max(min,Math.min(max,v));const e=$(id);if(e)e.value=String(v);return v;}"
+        "function labLog(t){const l=$('labLog');if(!l)return;l.textContent=(t?new Date().toLocaleTimeString()+'  '+t+'\\n':'')+l.textContent.slice(0,5000);}"
+        "function labMeter(done,total){const m=$('labMeter');if(m)m.style.width=(total?Math.round(done*100/total):0)+'%';}"
+        "function setLabValue(id,value){const e=$(id);if(e){e.value=String(value);e.dispatchEvent(new Event('change'));}}"
+        "function labSelectDevice(id,name){['labDevice','irdbDevice','wizardDevice','verifyDevice'].forEach(selId=>{const s=$(selId);if(!s)return;if(!Array.from(s.options).some(o=>o.value===id)){const o=document.createElement('option');o.value=id;o.textContent=(name||'Temporary IR Sweep')+' ('+id+')';s.append(o);}s.value=id;});populateVerifyCommands();}"
+        "async function labResolveDevice(){const sel=$('labDevice');let id=sel?sel.value:'';if(id&&id!==LAB_AUTO_DEVICE)return id;labStatus('preparing temporary sweep device...');const j=await postJson('/api/ir-lab-target',{});labSelectDevice(j.deviceId,j.name);await loadWizardInventory();labLog((j.created?'created ':'using ')+(j.name||'Temporary IR Sweep')+' '+j.deviceId);return j.deviceId;}"
+        "function labTerms(id){return String($(id)?.value||'').split(',').map(x=>normText(x)).filter(Boolean);}function labMatchName(name){const toks=labTerms('labCommandFilter');if(!toks.length)return true;const n=normText(name);return toks.some(t=>n.includes(t));}"
+        "function labSummaryText(){const s=$('labSummary');if(!s)return;const checked=document.querySelectorAll('#labQueue input.labPick:checked').length,total=lab.queue.length,stored=lab.queue.filter(x=>x.stored).length,raw=lab.queue.filter(x=>x.raw).length;s.textContent=checked+' selected / '+total+' queued / '+stored+' saved / '+raw+' timing';}"
+        "function labKey(){return [$('labSource')?.value||'all',$('labPathFilter')?.value||'',$('labCommandFilter')?.value||'',$('labRcPath')?.value||''].join('|');}"
+        "function labSourceList(){const s=$('labSource')?.value||'all';if(s==='all')return['irdb','flipper'];return(s==='irdb'||s==='flipper')?[s]:[];}"
+        "function labPathTitle(path){const p=String(path||'').replace(/\\.(csv|ir)$/i,'').split('/').filter(Boolean);return p.slice(-3).join(' / ')||path;}"
+        "function labRenderCandidates(rows){const box=$('labCandidates');if(!box)return;box.replaceChildren();if(!rows.length){box.classList.add('hidden');return;}rows.slice(0,300).forEach(r=>{const b=document.createElement('button');b.type='button';b.className='match';b.innerHTML='<strong>'+escHtml(sourceLabel(r.source))+'</strong> '+escHtml(labPathTitle(r.path))+'<div class=\"queue-meta\">'+escHtml(r.path)+'</div>';b.addEventListener('click',()=>{const src=$('labSource'),q=$('labPathFilter');if(src)src.value=r.source;if(q)q.value=r.path;lab.key=labKey();lab.index=[{source:r.source,path:r.path,score:r.score||1,man:r.man||'',model:r.model||''}];lab.cursor=0;labStatus('selected '+sourceLabel(r.source)+' '+r.path);});box.append(b);});box.classList.remove('hidden');}"
+        "async function labFindCandidates(){try{const src=$('labSource')?.value||'all',q=($('labPathFilter')?.value||'').trim();labStatus('building device list...');let rows=[];const sourceNames=labSourceList();if(sourceNames.length){const lists=await Promise.all(sourceNames.map(loadIrdSource));rows=rows.concat(lists.flat().map(r=>({...r,title:labPathTitle(r.path),score:q?scoreIrdPath({...r,title:labPathTitle(r.path)},q):1})).filter(r=>r.score>=0));}if(q&&(src==='all'||src==='remotecentral')){try{rows=rows.concat(await remoteCentralEntries(q));}catch(e){labLog('RemoteCentral search skipped: '+(e.message||e));}}rows=rows.sort((a,b)=>(b.score||0)-(a.score||0)||String(a.path).length-String(b.path).length);labRenderCandidates(rows);labStatus(rows.length?'found '+rows.length+' possible devices; showing first 300':(q?'no matching devices found':'loaded broad database device list'));}catch(e){labStatus('device search failed: '+(e.message||e));}}"
+        "function labUniqueName(base){base=safeImportName(base);let name=base,n=2,seen=new Set(lab.queue.map(x=>x.name));while(seen.has(name)){name=(base+' '+n++).slice(0,96);}return name;}"
+        "function labSelected(){return Array.from(document.querySelectorAll('#labQueue input.labPick:checked')).map(cb=>lab.queue[Number(cb.dataset.i)]).filter(Boolean);}"
+        "function labPayloadLines(rows){return (rows||labSelected()).filter(r=>!r.stored&&(r.keycode||r.raw)).map(r=>r.raw?r.name+'|raw|'+r.raw:r.name+'|'+r.keycode);}function labPayload(rows){return labPayloadLines(rows).join('\\n');}"
+        "function labRender(){const box=$('labQueue');if(!box)return;box.replaceChildren();if(!lab.queue.length){const d=document.createElement('div');d.className='muted mini';d.textContent='No commands queued.';box.append(d);labMeter(0,1);labSummaryText();return;}lab.queue.forEach((r,i)=>{const row=document.createElement('label'),cb=document.createElement('input'),main=document.createElement('div'),tag=document.createElement('span');row.className='queue-row';cb.className='labPick';cb.type='checkbox';cb.checked=r.checked!==false;cb.dataset.i=i;cb.addEventListener('change',()=>{r.checked=cb.checked;labSummaryText();});const strong=document.createElement('strong'),meta=document.createElement('div');strong.textContent=r.name;meta.className='queue-meta';meta.textContent=(r.stored?'Saved':'Queued')+' / '+sourceLabel(r.source||'irdb')+' / '+(r.meta||r.path||'');tag.className='badge';tag.textContent=r.raw?'timing':(r.stored?'saved':'code');main.append(strong,meta);row.append(cb,main,tag);box.append(row);});labMeter(lab.queue.length,labNum('labMaxCommands',900,1,2000));labSummaryText();}"
+        "function labAddRows(rows,source,path){const max=labNum('labMaxCommands',900,1,2000);let added=0;for(const r of rows){if(lab.queue.length>=max)break;if(!(r.keycode||r.raw)||!labMatchName(r.name))continue;const src=r.source||source,pth=r.path||path,fp=(r.keycode||r.raw||'')+'|'+safeImportName(r.name);if(lab.queue.some(x=>((x.keycode||x.raw||'')+'|'+x.name)===fp))continue;lab.queue.push({source:src,path:pth,name:labUniqueName(r.name),meta:r.meta||'',keycode:r.keycode||'',raw:r.raw||'',stored:false,checked:true});added++;}lab.imported=false;labRender();return added;}"
+        "async function labFetchEntry(e){if(e.source==='remotecentral'){const html=await rcFetch(e.path);return remoteCentralCommandEntries(html).map(r=>({...r,source:'remotecentral',path:e.path}));}let url=e.path.replace(/^codes\\//,'').replace(/^\\//,'');url=(e.source==='flipper'?FLIPPER_BASE:IRDB_BASE)+url;const r=await fetch(url);if(!r.ok)throw new Error('http '+r.status);const text=await r.text();return (e.source==='flipper'?flipperEntries(text):csvEntries(text)).map(r=>({...r,source:e.source,path:e.path}));}"
+        "async function labEnsureIndex(){const key=labKey();if(key===lab.key&&lab.index.length)return;lab.key=key;lab.cursor=0;lab.index=[];const src=$('labSource')?.value||'all',q=($('labPathFilter')?.value||'').trim(),rc=($('labRcPath')?.value||'').trim();let rows=[];if(src==='remotecentral'&&rc){lab.index=[{source:'remotecentral',path:rc,score:1}];return;}const sourceNames=labSourceList();if(sourceNames.length){const lists=await Promise.all(sourceNames.map(loadIrdSource));rows=rows.concat(lists.flat().map(r=>q?{...r,score:scoreIrdPath(r,q)}:{...r,score:1}).filter(r=>r.score>=0));}if(q&&(src==='all'||src==='remotecentral')){try{rows=rows.concat(await remoteCentralEntries(q));}catch(e){labLog('RemoteCentral search skipped: '+(e.message||e));}}lab.index=rows.sort((a,b)=>(b.score||0)-(a.score||0)||String(a.path).length-String(b.path).length);}"
+        "async function labScanBatch(){try{const maxFiles=labNum('labMaxFiles',600,1,5000),pause=labNum('labFetchDelay',0,0,3000),maxCmd=labNum('labMaxCommands',900,1,2000),workers=labNum('labWorkers',14,1,24),before=lab.queue.length;labStatus('loading library index...');await labEnsureIndex();if(lab.cursor>=lab.index.length){labStatus('end of matching library files');return;}const state={files:0};async function worker(){while(lab.cursor<lab.index.length&&state.files<maxFiles&&lab.queue.length<maxCmd){const e=lab.index[lab.cursor++],n=++state.files;labStatus('fetching '+n+' / '+maxFiles+' with '+workers+' workers - '+e.path);try{labAddRows(await labFetchEntry(e),e.source,e.path);}catch(err){labLog('skip '+e.path+': '+(err.message||err));}labMeter(lab.cursor,lab.index.length);if(pause)await labSleep(pause);}}await Promise.all(Array.from({length:workers},worker));labStatus('queued '+(lab.queue.length-before)+' new commands from '+state.files+' files; cursor '+lab.cursor+' / '+lab.index.length);}catch(e){labStatus(e.message||String(e));}}"
+        "async function labUseStored(){if(!wizardInventory)await loadWizardInventory();const devId=await labResolveDevice(),dev=(wizardInventory&&wizardInventory.devices||[]).find(d=>d.id===devId);lab.queue=[];if(dev){dev.commands.forEach(c=>{if(labMatchName(c.name))lab.queue.push({source:'stored',stored:true,name:c.name,meta:'saved on '+(dev.name||devId),keycode:c.keycode||'',raw:''});});}lab.imported=true;labRender();labStatus('loaded '+lab.queue.length+' saved matching commands');}"
+        "async function labImportQueue(rowsArg){const rows=rowsArg||labSelected(),lines=labPayloadLines(rows),dev=await labResolveDevice();if(!lines.length){lab.imported=true;labStatus('selected commands are already saved');return true;}labStatus('saving '+lines.length+' commands...');const limit=420000;let part=[],size=0,done=0,last='';async function flush(){if(!part.length)return;let j;try{j=await postJson('/api/irdb-import',{deviceId:dev,payload:part.join('\\n')});}catch(e){if(!/No supported new/i.test(e.message||''))throw e;j={message:'No new commands were saved; using existing saved names.'};}done+=part.length;last=j.message||last;labLog((j.message||'saved')+' ('+done+' / '+lines.length+')');part=[];size=0;}for(const line of lines){const n=line.length+1;if(part.length&&size+n>limit)await flush();part.push(line);size+=n;}await flush();lab.imported=true;labStatus(last||'save complete');await labSleep(1000);await loadWizardInventory();const names=new Set(currentCommandsFor(dev).map(c=>c.name));rows.forEach(r=>{if(names.has(r.name))r.stored=true;});labRender();return true;}"
+        "async function labClearLabTarget(dev){try{const j=await postJson('/api/ir-lab-clear',{deviceId:dev});labLog(j.message||'temporary device cleared');await labSleep(700);await loadWizardInventory();lab.queue.forEach(r=>{r.stored=false;});lab.imported=false;labRender();return true;}catch(e){labLog('temporary device clear failed: '+(e.message||e));return false;}}"
+        "async function labCancelRun(){const id=lab.runId;if(!id)return;try{await postJson('/api/ir-cancel',{runId:id});labLog('cancel sent for '+id);}catch(e){labLog('cancel failed: '+(e.message||e));}}"
+        "function labServerChunk(requested,delay){const maxHold=4000,byTime=Math.max(1,Math.floor(maxHold/Math.max(40,delay)));return Math.max(1,Math.min(requested,byTime,1024));}"
+        "async function labRunRows(rows,dev,dry,delay,requestedChunk,offset,total){const chunk=labServerChunk(requestedChunk,delay);let done=0;labLog('run '+lab.runId+' using hub chunk '+chunk+' (requested '+requestedChunk+')');for(let i=0;i<rows.length;i+=chunk){if(lab.stop){labStatus('stopped after '+(offset+done)+' commands');break;}const slice=rows.slice(i,i+chunk),label=(dry?'dry-running ':'sending ')+(i+1)+'-'+(i+slice.length)+' / '+rows.length;labStatus((total&&total>rows.length?('stream '+(offset+done)+' sent, '+label):label));const j=await postJson('/api/ir-batch-send',{deviceId:dev,commands:slice.map(r=>r.name).join('\\n'),delayMs:delay,dryRun:dry?'1':'0',runId:lab.runId});done+=j.sent||0;labMeter(total?Math.min(offset+done,total):done,total||rows.length);labLog((dry?'dry run ':'batch sent ')+(j.sent||0)+' commands in '+(j.elapsedMs||0)+' ms; last '+String(j.lastReply||'').slice(0,120));if(j.canceled){lab.stop=true;labStatus('stopped after '+(offset+done)+' commands');break;}}return done;}"
+        "async function labRunQueue(){if(lab.running)return;const rows=labSelected(),dry=$('labDryRun')?.checked,delay=labNum('labSendDelay',80,40,10000),requestedChunk=labNum('labBatchSize',100,1,1024);if(!rows.length){labStatus('select at least one command');return;}try{const dev=await labResolveDevice();if(!dry&&rows.some(r=>!r.stored))await labImportQueue(rows);lab.running=true;lab.stop=false;lab.runId='run_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);const ready=dry?rows:rows.filter(r=>r.stored);const done=await labRunRows(ready,dev,dry,delay,requestedChunk,0,ready.length);if(!lab.stop)labStatus((dry?'dry run complete: ':'send complete: ')+done+' commands');labMeter(done,ready.length);}catch(e){labStatus('send failed: '+(e.message||e));}finally{lab.running=false;lab.runId='';}}"
+        "function labSetFilter(text,msg){const e=$('labCommandFilter');if(e)e.value=text;lab.index=[];lab.cursor=0;lab.key='';labStatus(msg||'filter updated');}"
+        "async function labQuick(kind){lab.queue=[];lab.index=[];lab.cursor=0;lab.key='';setLabValue('labSource','all');setLabValue('labMaxFiles',kind==='broad'?1200:900);setLabValue('labWorkers',18);setLabValue('labMaxCommands',kind==='broad'?1400:900);setLabValue('labSendDelay',60);setLabValue('labBatchSize',120);if(kind==='broad'){const p=$('labPathFilter');if(p)p.value='';}if(kind==='off'){const f=$('labCommandFilter');if(f)f.value='off, power off, poweroff, standby, shutdown';}else{const f=$('labCommandFilter');if(f)f.value='';}labRender();await labScanBatch();}"
+        "async function labScanThenBeam(){await labScanBatch();const d=$('labDryRun');if(d)d.checked=false;await labRunQueue();}"
+        "async function labBeamLive(){const d=$('labDryRun');if(d)d.checked=false;await labRunQueue();}"
+        "async function labStreamAll(){if(lab.running)return;const dry=$('labDryRun')?.checked,delay=labNum('labSendDelay',80,40,10000),requestedChunk=labNum('labBatchSize',100,1,1024),sel=$('labDevice');try{if(sel)sel.value=LAB_AUTO_DEVICE;const dev=await labResolveDevice();lab.running=true;lab.streaming=true;lab.stop=false;lab.runId='stream_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);lab.queue=[];lab.imported=false;labRender();labStatus('loading stream index...');await labEnsureIndex();const totalFiles=lab.index.length;if(!totalFiles){labStatus('no matching files to stream');return;}labLog('stream sweep '+lab.runId+' across '+totalFiles+' files; dryRun='+!!dry);if(!dry&&!(await labClearLabTarget(dev)))throw new Error('could not clear lab target');let sent=0,cycles=0;while(!lab.stop&&lab.cursor<lab.index.length){cycles++;lab.queue=[];lab.imported=false;labRender();const before=lab.cursor;labStatus('stream cycle '+cycles+': scanning from '+before+' / '+totalFiles);await labScanBatch();const rows=labSelected();if(!rows.length){if(lab.cursor<=before){labLog('stream stopped: cursor did not advance');break;}continue;}if(!dry){await labImportQueue(rows);const ready=rows.filter(r=>r.stored);if(!ready.length){labLog('stream cycle '+cycles+' had no runnable stored commands');continue;}sent+=await labRunRows(ready,dev,false,delay,requestedChunk,sent,sent+ready.length);if(!(await labClearLabTarget(dev)))break;}else{sent+=await labRunRows(rows,dev,true,delay,requestedChunk,sent,sent+rows.length);}labMeter(lab.cursor,totalFiles);labLog('stream cycle '+cycles+' complete; cursor '+lab.cursor+' / '+totalFiles+'; sent '+sent);}if(!lab.stop)labStatus('stream sweep complete: '+sent+' commands across '+lab.cursor+' / '+totalFiles+' files');else labStatus('stream stopped after '+sent+' commands at '+lab.cursor+' / '+totalFiles+' files');}catch(e){labStatus('stream failed: '+(e.message||e));}finally{lab.running=false;lab.streaming=false;lab.runId='';}}"
+        "const labOff=$('labOffFilter');if(labOff)labOff.addEventListener('click',()=>labSetFilter('off, power off, poweroff, standby, shutdown','off-oriented filter loaded'));const labPower=$('labPowerFilter');if(labPower)labPower.addEventListener('click',()=>labSetFilter('power, toggle, on, off, standby','power filter loaded'));const labVol=$('labVolumeFilter');if(labVol)labVol.addEventListener('click',()=>labSetFilter('volume, mute, vol up, vol down','volume filter loaded'));const labInput=$('labInputFilter');if(labInput)labInput.addEventListener('click',()=>labSetFilter('input, hdmi, source, aux, optical, bluetooth','input filter loaded'));const labClearFilter=$('labClearFilter');if(labClearFilter)labClearFilter.addEventListener('click',()=>labSetFilter('','filter cleared'));"
+        "const labCandidatesBtn=$('labCandidatesBtn');if(labCandidatesBtn)labCandidatesBtn.addEventListener('click',labFindCandidates);const labScan=$('labScan');if(labScan)labScan.addEventListener('click',labScanBatch);const labQuickOff=$('labQuickOff');if(labQuickOff)labQuickOff.addEventListener('click',()=>labQuick('off'));const labQuickBroad=$('labQuickBroad');if(labQuickBroad)labQuickBroad.addEventListener('click',()=>labQuick('broad'));const labScanBeam=$('labScanBeam');if(labScanBeam)labScanBeam.addEventListener('click',labScanThenBeam);const labStream=$('labStreamAll');if(labStream)labStream.addEventListener('click',labStreamAll);const labBeam=$('labBeam');if(labBeam)labBeam.addEventListener('click',labBeamLive);const labStored=$('labStored');if(labStored)labStored.addEventListener('click',labUseStored);const labClear=$('labClear');if(labClear)labClear.addEventListener('click',()=>{lab.queue=[];lab.index=[];lab.cursor=0;lab.key='';lab.imported=false;labRender();labStatus('queue cleared');});const labImport=$('labImport');if(labImport)labImport.addEventListener('click',()=>labImportQueue().catch(e=>labStatus('import failed: '+(e.message||e))));const labRun=$('labRun');if(labRun)labRun.addEventListener('click',labRunQueue);const labStop=$('labStop');if(labStop)labStop.addEventListener('click',()=>{lab.stop=true;labStatus('stop requested');labCancelRun();});const labSelectAll=$('labSelectAll');if(labSelectAll)labSelectAll.addEventListener('click',()=>{lab.queue.forEach(r=>r.checked=true);labRender();});const labSelectNone=$('labSelectNone');if(labSelectNone)labSelectNone.addEventListener('click',()=>{lab.queue.forEach(r=>r.checked=false);labRender();});const labDropUnchecked=$('labDropUnchecked');if(labDropUnchecked)labDropUnchecked.addEventListener('click',()=>{lab.queue=lab.queue.filter(r=>r.checked!==false);labRender();});['labSource','labPathFilter','labCommandFilter','labRcPath'].forEach(id=>{const e=$(id);if(e)e.addEventListener('change',()=>{lab.index=[];lab.cursor=0;lab.key='';});});labRender();"
+        "const irdbForm=$('irdbImportForm');if(irdbForm){irdbForm.addEventListener('submit',e=>{updateIrdPayload();const payload=$('irdbPayload')?.value||'';if(!payload){e.preventDefault();irdbStatus('select at least one supported command');irdbLog('import blocked: no supported checked commands');return;}irdbLog('submitting '+payload.split('\\n').filter(Boolean).length+' selected commands');});}"
+        "</script>",
+        f);
+    fputs("</div></main></body></html>", f);
+}
+
+static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
+    char uptime[128], version[128], ifconfig[2048], activity[1024];
+    char uptime_label[80], inventory_label[80];
+    char hub_id[64] = "16042906";
+    int mqtt_up = tcp_established(mqtt->host, mqtt->port);
+    int device_count = -1, command_count = 0;
+    read_text("/proc/uptime", uptime, sizeof(uptime));
+    read_text("/etc/version", version, sizeof(version));
+    chomp(uptime);
+    chomp(version);
+    {
+        long seconds = atol(uptime);
+        long days = seconds / 86400;
+        long hours = (seconds % 86400) / 3600;
+        long minutes = (seconds % 3600) / 60;
+        if (days > 0) snprintf(uptime_label, sizeof(uptime_label), "%ldd %ldh %ldm", days, hours, minutes);
+        else snprintf(uptime_label, sizeof(uptime_label), "%ldh %ldm", hours, minutes);
+    }
+    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
+    chomp(hub_id);
+    run_cmd("ifconfig ath0 2>/dev/null", ifconfig, sizeof(ifconfig));
+    if (scan_ir_resource_stats(&device_count, &command_count, NULL, NULL) != 0) {
+        device_count = -1;
+        command_count = 0;
+    }
+    if (device_count < 0) snprintf(inventory_label, sizeof(inventory_label), "unknown");
+    else snprintf(inventory_label, sizeof(inventory_label), "%d devices", device_count);
+    {
+        char esc_id[128], cmd[384];
+        shell_escape_single(hub_id, esc_id, sizeof(esc_id));
+        snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' harmony.engine?getCurrentActivity '{}' 2>/dev/null", esc_id);
+        run_cmd(cmd, activity, sizeof(activity));
+    }
+    fprintf(f, "<section id='view-overview' data-view='overview' class='section active'><div class='section-head'><div><h2>Dashboard</h2><div class='section-lead'>A quick read on the hub before you make changes. Use the menu on the left to work in one area at a time.</div></div></div>");
+    fprintf(f, "<div class='cards'>");
+    fprintf(f, "<div class='stat'><div class='label'>Firmware</div><div class='value'>"); html(f, version[0] ? version : "unknown"); fprintf(f, "</div></div>");
+    fprintf(f, "<div class='stat'><div class='label'>Uptime</div><div class='value'>"); html(f, uptime_label); fprintf(f, "</div></div>");
+    fprintf(f, "<div class='stat'><div class='label'>MQTT</div><div class='value'><span class='badge %s'>%s</span></div><div class='muted mini'>%s</div></div>",
+        mqtt_up ? "ok" : "bad", mqtt_up ? "connected" : "not connected", mqtt->enabled ? "bridge enabled" : "bridge disabled");
+    fprintf(f, "<div class='stat'><div class='label'>IR Inventory</div><div class='value'>");
+    html(f, inventory_label);
+    fprintf(f, "</div><div class='muted mini'>%d commands</div></div>", command_count);
+    fprintf(f, "<div class='stat'><div class='label'>Cloud services</div><div class='value'><span class='badge ok'>off</span></div></div>");
+    fprintf(f, "<div class='stat'><div class='label'>Activity API</div><div class='value'><span class='badge %s'>%s</span></div></div>",
+        activity[0] ? "ok" : "warn", activity[0] ? "responding" : "quiet");
+    fprintf(f, "</div><div class='quick-actions'><button type='button' data-view-target='ir'><strong>Set up IR commands</strong><div class='muted mini'>Search databases, learn signals, and send tests.</div></button><button type='button' data-view-target='lab'><strong>Open IR sweep</strong><div class='muted mini'>Queue capped batches, dry-run, then send paced sequences.</div></button><button type='button' data-view-target='mqtt'><strong>Home Assistant MQTT</strong><div class='muted mini'>Broker, topics, discovery, and bridge identity.</div></button><button type='button' data-view-target='wifi'><strong>Network settings</strong><div class='muted mini'>Change Wi-Fi and reboot when you are ready.</div></button><button type='button' data-view-target='backup'><strong>Backup or restore</strong><div class='muted mini'>Export before larger edits or import saved resources.</div></button></div><div class='grid' style='margin-top:12px'>");
+    fprintf(f, "<details><summary>Network details</summary><pre>");
+    html(f, ifconfig[0] ? ifconfig : "ath0 not available");
+    fprintf(f, "</pre></details>");
+    fprintf(f, "<details><summary>Current activity payload</summary><pre>");
+    html(f, activity[0] ? activity : "no response");
+    fprintf(f, "</pre></details></div>");
+    fprintf(f, "</section>");
+}
+
+static void mqtt_form(FILE *f, const struct mqtt_config *cfg) {
+    fprintf(f, "<div class='panel'><h2>MQTT Settings</h2><div class='help'>These settings control the local bridge that Home Assistant sees. Leave the password field blank when you only want to edit topics or timing.</div><form method='post' action='/mqtt#mqtt'>");
+    fprintf(f, "<label><input type='checkbox' name='enabled' value='1' %s> Enabled</label>", cfg->enabled ? "checked" : "");
+    fprintf(f, "<div class='row'><div><label>Broker host</label><input name='host' value='"); html(f, cfg->host); fprintf(f, "'><div class='help'>IP address or DNS name of the MQTT broker.</div></div>");
+    fprintf(f, "<div><label>Broker port</label><input name='port' inputmode='numeric' value='%d'><div class='help'>Usually 1883 unless your broker is configured differently.</div></div></div>", cfg->port);
+    fprintf(f, "<div class='row'><div><label>Username</label><input name='username' value='"); html(f, cfg->username); fprintf(f, "'></div>");
+    fprintf(f, "<div><label>Password</label><input name='password' type='password' placeholder='Leave blank to keep current'><label><input type='checkbox' name='keep_password' value='1' checked> Keep current password when blank</label></div></div>");
+    fprintf(f, "<div class='row'><div><label>Base topic</label><input name='baseTopic' value='"); html(f, cfg->base_topic); fprintf(f, "'></div>");
+    fprintf(f, "<div><label>Discovery prefix</label><input name='discoveryPrefix' value='"); html(f, cfg->discovery_prefix); fprintf(f, "'><div class='help'>Home Assistant commonly uses homeassistant.</div></div></div>");
+    fprintf(f, "<div class='row'><div><label>Client ID</label><input name='clientId' value='"); html(f, cfg->client_id); fprintf(f, "'></div>");
+    fprintf(f, "<div><label>Display name</label><input name='name' value='"); html(f, cfg->name); fprintf(f, "'></div></div>");
+    fprintf(f, "<div class='row'><div><label>Poll seconds</label><input name='pollSeconds' inputmode='numeric' value='%d'></div>", cfg->poll_seconds);
+    fprintf(f, "<div><label>Keepalive seconds</label><input name='keepAlive' inputmode='numeric' value='%d'></div></div>", cfg->keep_alive);
+    fprintf(f, "<label><input type='checkbox' name='haDiscovery' value='1' %s> Publish Home Assistant discovery</label>", cfg->ha_discovery ? "checked" : "");
+    fprintf(f, "<div class='actions'><button type='submit'>Save MQTT</button></div></form></div>");
+}
+
+static void wifi_form(FILE *f, const struct wifi_config *cfg) {
+    fprintf(f, "<div class='panel'><h2>Wi-Fi Settings</h2><div class='help'>Save writes the new network file. Save and reboot applies it immediately, so export a backup first if you are changing the active network.</div><form method='post' action='/wifi#wifi'>");
+    fprintf(f, "<label>SSID</label><input name='ssid' required value='"); html(f, cfg->ssid); fprintf(f, "'><div class='help'>The hub will join this network after reboot.</div>");
+    fprintf(f, "<label>Password</label><input name='password' type='password' placeholder='Leave blank to keep current'>");
+    fprintf(f, "<label><input type='checkbox' name='keep_password' value='1' checked> Keep current password when blank</label>");
+    fprintf(f, "<label><input type='checkbox' name='hidden' value='1' %s> Hidden network</label>", cfg->hidden ? "checked" : "");
+    fprintf(f, "<label><input type='checkbox' name='open' value='1' %s> Open network</label>", cfg->open ? "checked" : "");
+    fprintf(f, "<div class='actions'><button name='apply' value='save' type='submit'>Save Wi-Fi</button><button name='apply' value='reboot' type='submit' class='secondary'>Save and reboot</button></div>");
+    fprintf(f, "</form></div>");
+}
+
+static void backup_panel(FILE *f) {
+    fprintf(f, "<section id='view-backup' data-view='backup' class='section'><div class='section-head'><div><h2>Backup & Restore</h2><div class='section-lead'>Export before big edits, database imports, or network changes. Imports create a timestamped backup before writing.</div></div></div>");
+    fprintf(f, "<div class='grid'><div class='panel'><h3>Export</h3><div class='help'>The full bundle is the easiest restore point. Individual exports are useful when you only want devices, protocols, MQTT, or Wi-Fi.</div><div class='export-list'>");
+    fprintf(f, "<a class='button' href='/export/bundle'>All</a>");
+    fprintf(f, "<a class='button' href='/export/devices'>Devices</a>");
+    fprintf(f, "<a class='button' href='/export/functions'>Functions</a>");
+    fprintf(f, "<a class='button' href='/export/protocols'>Protocols</a>");
+    fprintf(f, "<a class='button' href='/export/mqtt'>MQTT</a>");
+    fprintf(f, "<a class='button' href='/export/wifi'>Wi-Fi</a>");
+    fprintf(f, "</div></div>");
+    fprintf(f, "<div class='panel'><h3>Import</h3><div class='help'>Choose the matching target for the file contents you paste below. Wi-Fi imports do not take effect until reboot.</div><form method='post' action='/import#backup'>");
+    fprintf(f, "<label>Target</label><select name='target'>");
+    fprintf(f, "<option value='bundle'>Full backup bundle</option>");
+    fprintf(f, "<option value='devices'>DeviceList.json</option>");
+    fprintf(f, "<option value='functions'>FunctionList.json</option>");
+    fprintf(f, "<option value='protocols'>ProtocolList.json</option>");
+    fprintf(f, "<option value='mqtt'>MQTT config</option>");
+    fprintf(f, "<option value='wifi'>Wi-Fi config</option>");
+    fprintf(f, "</select>");
+    fprintf(f, "<label>File</label><input id='importFile' type='file'>");
+    fprintf(f, "<label>Contents</label><textarea class='textarea-tall' name='payload' spellcheck='false' required></textarea>");
+    fprintf(f, "<div class='actions'><button type='submit'>Import</button></div>");
+    fprintf(f, "</form></div></div></section>");
+}
+
+static void ir_device_options(FILE *f, const struct ir_inventory *inv, const char *selected) {
+    int i;
+    for (i = 0; i < inv->device_count; i++) {
+        const struct ir_device *dev = &inv->devices[i];
+        fprintf(f, "<option value='");
+        html(f, dev->id);
+        fprintf(f, "'%s>", selected && strcmp(selected, dev->id) == 0 ? " selected" : "");
+        html(f, dev->name[0] ? dev->name : dev->id);
+        fprintf(f, " (");
+        html(f, dev->id);
+        fprintf(f, ")</option>");
+    }
+}
+
+static void ir_setup_flow(FILE *f, const struct ir_inventory *inv) {
+    fprintf(f, "<div class='setup-shell'><div class='wizard-top'><div><h3>Command Setup</h3><div class='subtle'>Create a device, search databases, learn missing commands, then verify</div></div><span class='pill'>%d devices</span></div>", inv->device_count);
+    fprintf(f, "<div class='wizard-grid'><div class='stepper'>");
+    fprintf(f, "<button type='button' class='step active' data-step-target='device'><span>1</span><div>Device<div class='subtle'>Profile</div></div></button>");
+    fprintf(f, "<button type='button' class='step' data-step-target='library'><span>2</span><div>Database<div class='subtle'>Lookup</div></div></button>");
+    fprintf(f, "<button type='button' class='step' data-step-target='learn'><span>3</span><div>Learn<div class='subtle'>Capture</div></div></button>");
+    fprintf(f, "<button type='button' class='step' data-step-target='verify'><span>4</span><div>Verify<div class='subtle'>Test</div></div></button>");
+    fprintf(f, "</div><div class='wizard-body'>");
+
+    fprintf(f, "<div class='wizard-panel active' data-panel='device'><div class='callout'><strong>Start with the device profile.</strong>Name the real device and enter the manufacturer and model. That gives the database search enough context before you learn anything manually.</div><form method='post' action='/ir/new-device#ir'>");
+    fprintf(f, "<div class='row'><div><label>Name</label><input id='newDeviceName' name='name' required placeholder='Living Room Receiver'></div><div><label>Type</label><select id='newDeviceType' name='type'><option value='HomeAppliance'>Home appliance</option><option value='Amplifier'>Receiver / amplifier</option><option value='Television'>Television</option><option value='Media Player'>Media player</option><option value='Game Console'>Game console</option></select></div></div>");
+    fprintf(f, "<div class='row'><div><label>Manufacturer</label><input id='newDeviceManufacturer' name='manufacturer' required placeholder='Pioneer'></div><div><label>Model</label><input id='newDeviceModel' name='model' required placeholder='VSX-D1'></div></div>");
+    fprintf(f, "<div class='actions'><button type='submit'>Create Device</button><button id='profileSearch' type='button' class='secondary'>Search Databases</button><button type='button' class='ghost' data-next-step='learn'>Skip to Learning</button></div></form></div>");
+
+    fprintf(f, "<div class='wizard-panel' data-panel='learn'><div class='callout'><strong>Learn only when the databases do not have it.</strong>The hub will try to decode the captured protocol automatically and store the smallest reliable format it can. Test the learned signal here before saving it.</div><form id='wizardLearnForm' method='post' action='/ir/command#ir'>");
+    fprintf(f, "<label>Device</label><select id='wizardDevice' name='deviceId'>");
+    ir_device_options(f, inv, NULL);
+    fprintf(f, "</select><label>Command name</label><input id='wizardCommandName' name='name' required placeholder='Power Toggle'>");
+    fprintf(f, "<div class='row'><div><label>Storage mode</label><select id='wizardMode' name='mode'><option value='auto' selected>Auto-detect best format</option><option value='keycode'>Compact Harmony code</option><option value='nec'>NEC-style 32-bit</option><option value='raw'>Raw timing replay</option></select></div>");
+    fprintf(f, "<div><label>Protocol</label><select id='wizardProtocol' name='protocol'><option value='2'>NEC-compatible</option><option value='679'>MemorexO1 32 Bit</option></select></div></div>");
+    fprintf(f, "<label>NEC value</label><input id='wizardNec' name='nec' placeholder='E0E040BF'>");
+    fprintf(f, "<label>Harmony code</label><input id='wizardKeycode' name='keycode' placeholder='G:Toshiba 32 Bit:(0xE0E040BF)(Repeat)():3'>");
+    fprintf(f, "<label>Captured signal</label><textarea id='wizardRaw' name='raw' placeholder=''></textarea>");
+    fprintf(f, "<div id='wizardLearnStatus' class='wizard-status mini'></div>");
+    fprintf(f, "<div class='actions'><button id='wizardCapture' type='button'>Learn Signal</button><button id='wizardLearnTest' type='button' class='secondary'>Test Signal</button><button type='submit' class='secondary'>Save Command</button><button type='button' class='ghost' data-next-step='library'>Search Databases</button><button type='button' class='ghost' data-next-step='verify'>Verify Saved Commands</button></div></form></div>");
+
+    fprintf(f, "<div class='wizard-panel' data-panel='verify'><div class='callout'><strong>Verify before adding lots of commands.</strong>Send one command from the same device and confirm the controlled equipment reacts as expected.</div>");
+    fprintf(f, "<div class='device-sync'><div><label>Device</label><select id='verifyDevice'>");
+    ir_device_options(f, inv, NULL);
+    fprintf(f, "</select></div><button id='wizardTest' type='button'>Send Test</button></div>");
+    fprintf(f, "<label>Command</label><select id='verifyCommand'></select>");
+    fprintf(f, "<div id='wizardVerifyStatus' class='wizard-status mini'></div>");
+    fprintf(f, "<div class='actions'><button type='button' class='secondary' data-next-step='learn'>Learn Another</button><button type='button' class='ghost' data-next-step='library'>Open Databases</button></div></div>");
+
+    fprintf(f, "<div class='wizard-panel' data-panel='library'><div class='callout'><strong>Search databases before learning.</strong>Try the manufacturer and model first. Supported IRDB and Flipper matches become compact Harmony codes. Flipper raw and RemoteCentral Pronto entries are converted to timing replays, so verify one before importing a large set.</div><form id='irdbImportForm' method='post' action='/ir/irdb-import#ir'>");
+    fprintf(f, "<label>Device</label><select id='irdbDevice' name='deviceId'>");
+    ir_device_options(f, inv, NULL);
+    fprintf(f, "</select><label>Source</label><select id='irdbSource'><option value='all'>All databases</option><option value='irdb'>probonopd/irdb CSV</option><option value='flipper'>Flipper-IRDB .ir</option><option value='remotecentral'>RemoteCentral Pronto hex</option></select>");
+    fprintf(f, "<label>Search</label><input id='irdbSearch' list='irdbMatches' placeholder='Pioneer VSX-D1, Samsung TV, Bang & Olufsen, BeoVision'><datalist id='irdbMatches'></datalist>");
+    fprintf(f, "<div id='irdbResults' class='preview hidden'></div>");
+    fprintf(f, "<label>Path, URL, or RemoteCentral page</label><input id='irdbPath' placeholder='Samsung/TV/7,7.csv, TVs/Samsung/Samsung_TV.ir, or /cgi-bin/codes/pioneer/receiver/'>");
+    fprintf(f, "<label>Command prefix</label><input id='irdbPrefix' placeholder='TV '>");
+    fprintf(f, "<textarea id='irdbPayload' name='payload' class='hidden'></textarea>");
+    fprintf(f, "<div id='irdbStatus' class='muted mini'></div><div id='irdbPreview' class='preview hidden'></div><label>Import log</label><pre id='irdbLog' class='mini' style='max-height:170px'>Ready.</pre>");
+    fprintf(f, "<div class='actions'><button id='irdbLoadIndex' type='button' class='secondary'>Search Databases</button><button id='irdbFetch' type='button' class='secondary'>Fetch Commands</button><button type='submit'>Import Selected</button><button type='button' class='ghost' data-next-step='learn'>Learn Manually</button></div></form></div>");
+    fprintf(f, "</div></div></div>");
+}
+
+static void ir_panel(FILE *f) {
+    struct ir_inventory *inv = (struct ir_inventory *)calloc(1, sizeof(*inv));
+    int i, j;
+    if (!inv) return;
+    fprintf(f, "<section id='view-ir' data-view='ir' class='section'><div class='section-head'><div><h2>IR Devices</h2><div class='section-lead'>Use the setup wizard for new equipment, then manage stored devices and commands below. Database lookup comes before manual learning so you only capture signals when needed.</div></div></div>");
+    if (load_ir_inventory(inv) != 0) {
+        fprintf(f, "<div class='panel'><pre>Unable to read ");
+        html(f, DEVICE_LIST);
+        fprintf(f, "</pre></div></section>");
+        free(inv);
+        return;
+    }
+    ir_setup_flow(f, inv);
+    fprintf(f, "<div class='device-list'>");
+    for (i = 0; i < inv->device_count; i++) {
+        const struct ir_device *dev = &inv->devices[i];
+        fprintf(f, "<div class='panel'><h3>");
+        html(f, dev->name[0] ? dev->name : "Unnamed Device");
+        fprintf(f, "</h3><div class='muted mini'>");
+        html(f, dev->manufacturer);
+        fprintf(f, " ");
+        html(f, dev->model);
+        fprintf(f, " / ");
+        html(f, dev->type);
+        fprintf(f, " / id ");
+        html(f, dev->id);
+        fprintf(f, "</div>");
+        fprintf(f, "<form method='post' action='/ir/device#ir'><input type='hidden' name='deviceId' value='");
+        html(f, dev->id);
+        fprintf(f, "'><div class='row'><div><label>Name</label><input name='name' value='");
+        html(f, dev->name);
+        fprintf(f, "'></div><div><label>Type</label><input name='type' value='");
+        html(f, dev->type);
+        fprintf(f, "'></div></div><div class='row'><div><label>Manufacturer</label><input name='manufacturer' value='");
+        html(f, dev->manufacturer);
+        fprintf(f, "'></div><div><label>Model</label><input name='model' value='");
+        html(f, dev->model);
+        fprintf(f, "'></div></div><div class='actions'><button type='submit'>Save Device</button></div></form>");
+        fprintf(f, "<form method='post' action='/ir/delete-device#ir'><input type='hidden' name='deviceId' value='");
+        html(f, dev->id);
+        fprintf(f, "'><div class='actions'><button class='danger' type='submit'>Delete Device</button></div></form>");
+        fprintf(f, "<div class='command-list mini'>");
+        for (j = 0; j < dev->command_count; j++) {
+            const struct ir_command *cmd = &dev->commands[j];
+            fprintf(f, "<div class='command'><div><strong>");
+            html(f, cmd->name);
+            fprintf(f, "</strong><div class='muted'>Protocol %d / learned %s</div><div class='muted'>", cmd->protocol_id, cmd->learned ? "yes" : "no");
+            if (cmd->has_raw) {
+                fprintf(f, "raw timing");
+            } else {
+                html(f, cmd->keycode);
+            }
+            fprintf(f, "</div></div><div class='actions'>");
+            fprintf(f, "<form method='post' action='/ir/send#ir'><input type='hidden' name='deviceId' value='");
+            html(f, dev->id);
+            fprintf(f, "'><input type='hidden' name='command' value='");
+            html(f, cmd->name);
+            fprintf(f, "'><button type='submit'>Send</button></form>");
+            fprintf(f, "<form method='post' action='/ir/delete-command#ir'><input type='hidden' name='deviceId' value='");
+            html(f, dev->id);
+            fprintf(f, "'><input type='hidden' name='command' value='");
+            html(f, cmd->name);
+            fprintf(f, "'><button class='danger' type='submit'>Delete</button></form></div></div>");
+        }
+        if (dev->command_count == 0) {
+            fprintf(f, "<div class='muted'>No commands stored</div>");
+        }
+        fprintf(f, "</div></div>");
+    }
+    fprintf(f, "</div></section>");
+    free(inv);
+}
+
+static void ir_lab_panel(FILE *f) {
+    struct ir_inventory *inv = (struct ir_inventory *)calloc(1, sizeof(*inv));
+    if (!inv) return;
+    fprintf(f, "<section id='view-lab' data-view='lab' class='section'><div class='section-head'><div><h2>IR Sweep</h2><div class='section-lead'>Scan IR libraries, queue matching commands, and send paced sequences. Normal runs save selected commands; stream runs recycle a temporary device so large database walks do not bloat storage.</div></div><span class='pill'>up to %d saved commands/device</span></div>", MAX_IR_STORED_COMMANDS);
+    if (load_ir_inventory(inv) != 0) {
+        fprintf(f, "<div class='panel'><pre>Unable to read ");
+        html(f, DEVICE_LIST);
+        fprintf(f, "</pre></div></section>");
+        free(inv);
+        return;
+    }
+    fprintf(f, "<div class='lab-layout'><div class='panel'><h3>Quick Sweep</h3><div class='callout'><strong>Fast path.</strong>Use the temporary sweep device, pull matches from every available source, then save and send the checked queue. Stream search walks the full matching index in repeatable cycles.</div>");
+    fprintf(f, "<div class='lab-quick'><button id='labQuickOff' type='button'>Power-off sweep<div class='queue-meta'>Find shutdown-style commands</div></button><button id='labQuickBroad' type='button' class='secondary'>Broad search<div class='queue-meta'>Pull any importable command</div></button><button id='labScanBeam' type='button' class='secondary'>Find and send<div class='queue-meta'>Scan one batch, save, send live</div></button><button id='labStreamAll' type='button' class='secondary'>Stream search<div class='queue-meta'>Scan, save, send, clear, repeat</div></button><button id='labBeam' type='button'>Send selected<div class='queue-meta'>Send the checked queue now</div></button></div>");
+    fprintf(f, "<div class='lab-toolbar'><div><label>Target device</label><select id='labDevice'><option value='__auto_lab__' selected>Temporary sweep device</option>");
+    ir_device_options(f, inv, NULL);
+    fprintf(f, "</select></div><div><label>Source</label><select id='labSource'><option value='all'>All databases</option><option value='irdb'>probonopd/irdb</option><option value='flipper'>Flipper-IRDB</option><option value='remotecentral'>RemoteCentral</option></select></div></div>");
+    fprintf(f, "<div class='row'><div><label>Device or path filter</label><input id='labPathFilter' placeholder='air conditioner, Pioneer, Samsung/TV'></div><div><label>Command filter</label><input id='labCommandFilter' placeholder='off, power off, standby'></div></div>");
+    fprintf(f, "<div class='lab-presets'><button id='labOffFilter' type='button' class='ghost'>Off</button><button id='labPowerFilter' type='button' class='ghost'>Power</button><button id='labVolumeFilter' type='button' class='ghost'>Volume</button><button id='labInputFilter' type='button' class='ghost'>Inputs</button><button id='labClearFilter' type='button' class='ghost'>Clear filter</button></div>");
+    fprintf(f, "<details class='lab-advanced'><summary>Advanced scan controls</summary><label>RemoteCentral path</label><input id='labRcPath' placeholder='Optional direct page, e.g. /cgi-bin/codes/pioneer/receiver/'>");
+    fprintf(f, "<div class='lab-toolbar'><div><label>Max files per scan</label><input id='labMaxFiles' inputmode='numeric' value='600'></div><div><label>Parallel fetches</label><input id='labWorkers' inputmode='numeric' value='14'></div><div><label>Max queued commands per cycle</label><input id='labMaxCommands' inputmode='numeric' value='900'></div><div><label>Fetch pause (ms)</label><input id='labFetchDelay' inputmode='numeric' value='0'></div></div>");
+    fprintf(f, "<div class='lab-toolbar'><div><label>Send interval (ms)</label><input id='labSendDelay' inputmode='numeric' value='80'></div><div><label>Commands per hub batch</label><input id='labBatchSize' inputmode='numeric' value='100'></div></div>");
+    fprintf(f, "<label class='inline-check'><input id='labDryRun' type='checkbox'> Dry run</label></details>");
+    fprintf(f, "<div class='actions'><button id='labCandidatesBtn' type='button' class='secondary'>Find Devices</button><button id='labScan' type='button'>Load Next Batch</button><button id='labStored' type='button' class='secondary'>Use Saved Commands</button><button id='labClear' type='button' class='ghost'>Clear Queue</button></div>");
+    fprintf(f, "<div id='labStatus' class='wizard-status mini'></div><div class='meter'><span id='labMeter'></span></div><div id='labCandidates' class='preview hidden' style='margin-top:10px'></div></div>");
+    fprintf(f, "<div class='panel'><h3>Send Queue</h3><div class='help'>Checked commands are sent in short cancellable chunks. Live mode saves queued commands first. Stop interrupts the active hub-side batch instead of waiting for a long chunk to drain.</div><div class='lab-summary'><span id='labSummary'>0 queued</span><span>batch limit %d</span></div><div class='queue-tools'><button id='labSelectAll' type='button' class='ghost'>Select all</button><button id='labSelectNone' type='button' class='ghost'>Select none</button><button id='labDropUnchecked' type='button' class='ghost'>Drop unchecked</button></div><div id='labQueue' class='queue-list'><div class='muted mini'>No commands queued.</div></div>", MAX_IR_BATCH_COMMANDS);
+    fprintf(f, "<div class='actions'><button id='labImport' type='button' class='secondary'>Save Queue</button><button id='labRun' type='button'>Send Queue</button><button id='labStop' type='button' class='danger'>Stop</button></div>");
+    fprintf(f, "<pre id='labLog' class='mini' style='margin-top:12px;max-height:180px'>Ready.</pre></div></div></section>");
+    free(inv);
+}
+
+struct bt_quick_key {
+    const char *code;
+    const char *label;
+};
+
+static void bluetooth_panel(FILE *f) {
+    const struct bt_quick_key commands[] = {
+        {"directionup", "Up"}, {"directiondown", "Down"}, {"directionleft", "Left"}, {"directionright", "Right"},
+        {"enter", "Enter"}, {"escape", "Escape"}, {"back", "Back"}, {"menu", "Menu"}, {"home", "Home"}, {"end", "End"}, {"insert", "Insert"},
+        {"space", "Space"}, {"tab", "Tab"}, {"backspace", "Backspace"}, {"delete", "Delete"}, {"pageup", "Page Up"}, {"pagedown", "Page Down"},
+        {"number1", "1"}, {"number2", "2"}, {"number3", "3"}, {"number4", "4"}, {"number5", "5"},
+        {"number6", "6"}, {"number7", "7"}, {"number8", "8"}, {"number9", "9"}, {"number0", "0"},
+        {"f1", "F1"}, {"f2", "F2"}, {"f3", "F3"}, {"f4", "F4"}, {"f5", "F5"}, {"f6", "F6"}, {"f7", "F7"}, {"f8", "F8"},
+        {"f9", "F9"}, {"f10", "F10"}, {"f11", "F11"}, {"f12", "F12"}, {"ctrll", "Ctrl+L"}, {"ctrlr", "Ctrl+R"}, {"ctrlw", "Ctrl+W"},
+        {"ctrlc", "Ctrl+C"}, {"ctrlv", "Ctrl+V"}, {"ctrlx", "Ctrl+X"}, {"alttab", "Alt+Tab"}, {"altf4", "Alt+F4"}, {"ctrlaltdelete", "Ctrl+Alt+Delete"}
+    };
+    size_t i;
+    fprintf(f, "<section id='view-bluetooth' data-view='bluetooth' class='section'><div class='section-head'><div><h2>Bluetooth Keyboard</h2><div class='section-lead'>Make the hub discoverable as a keyboard, pair from the target device, then send keys or scripts to the paired target.</div></div><span class='pill'>Bluetooth HID</span></div>");
+    fprintf(f, "<div class='bt-layout'><div class='panel'><h3>Pair a Target</h3><div class='callout'><strong>Normal flow.</strong>Start pairing mode here, then on the TV, phone, console, or computer choose Add Bluetooth Keyboard and select the hub by name.</div>");
+    fprintf(f, "<div class='row'><div><label>Advertised name</label><input id='btName' value='Harmony Keyboard' maxlength='48'></div><div><label>Device preset</label><select id='btType'><option value='btkeyboard' selected>Standard keyboard</option><option value='btkeyboard-nexus'>Nexus keyboard</option><option value='fire'>Fire TV / media keys</option><option value='ps3'>PlayStation 3</option><option value='wii'>Nintendo Wii</option></select></div></div>");
+    fprintf(f, "<div class='actions'><button id='btPairingOn' type='button'>Start Pairing Mode</button><button id='btAdapterStatus' type='button' class='secondary'>Refresh Status</button><button id='btPairingOff' type='button' class='danger'>Hide From Discovery</button></div>");
+    fprintf(f, "<div class='help'>After the target pairs, Refresh Status usually finds its address automatically. The raw adapter details are shown here when you need to troubleshoot pairing.</div><pre id='btPairStatus' class='mini' style='margin-top:12px'>Pairing status has not been refreshed yet.</pre>");
+    fprintf(f, "<details class='lab-advanced'><summary>Advanced connection tools</summary><div class='row'><div><label>Paired target address</label><input id='btAddr' placeholder='AA:BB:CC:DD:EE:FF'></div><div><label>PIN</label><input id='btPin' inputmode='numeric' placeholder='Optional legacy PIN'></div></div><div class='row'><div><label>Scan seconds</label><input id='btTimeout' inputmode='numeric' value='8'></div><div></div></div><div class='actions'><button id='btClassicScan' type='button' class='secondary'>Scan Classic</button><button id='btScan' type='button' class='secondary'>Scan BLE</button><button id='btStatus' type='button' class='secondary'>Connection Status</button><button id='btConnect' type='button' class='secondary'>Connect to Target</button><button id='btDisconnect' type='button' class='danger'>Disconnect</button></div></details></div>");
+    fprintf(f, "<div class='panel'><h3>Keyboard Controls</h3><div class='help'>Use these after the target has paired and connected. Named keys are sent with explicit press and release frames. Advanced users can still send a full hex report, for example hex:A101000028000000000000.</div><label>Key or shortcut</label><input id='btCode' list='btCodes' placeholder='enter, space, ctrl+l, alt+f4'><datalist id='btCodes'>");
+    for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        fprintf(f, "<option value='");
+        html(f, commands[i].code);
+        fprintf(f, "'>");
+    }
+    fprintf(f, "</datalist><div class='lab-presets' id='btCommandGrid'>");
+    for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        fprintf(f, "<button type='button' class='ghost' data-bt-code='");
+        html(f, commands[i].code);
+        fprintf(f, "'>");
+        html(f, commands[i].label);
+        fprintf(f, "</button>");
+    }
+    fprintf(f, "</div><div class='actions'><button id='btSend' type='button'>Send Key</button><button id='btEnterTest' type='button' class='secondary'>Test Enter</button><button id='btReleaseAll' type='button' class='danger'>Release All</button></div>");
+    fprintf(f, "<h3 style='margin-top:18px'>Keyboard Script</h3><div class='bt-script-layout'><div><label>Script</label><textarea id='btScript' class='textarea-tall' spellcheck='false' placeholder='TEXT hello from harmony&#10;WAIT 300&#10;KEY enter&#10;COMBO ctrl+l&#10;TEXT https://home-assistant.io&#10;KEY enter'></textarea></div><div class='bt-script-tools'><div class='callout'><strong>Syntax</strong>TEXT words, KEY enter, COMBO ctrl+l, WAIT 500. Bare key names are sent as KEY lines. Text is sent in small press-release chunks for accuracy.</div><label>Gap between reports (ms)</label><input id='btScriptDelay' inputmode='numeric' value='35'><div class='actions'><button id='btScriptPreviewBtn' type='button' class='secondary'>Preview</button><button id='btScriptRun' type='button'>Run Script</button><button id='btScriptStop' type='button' class='danger'>Stop</button></div></div></div><pre id='btScriptPreview' class='mini' style='margin-top:12px'>Paste a script to preview or run.</pre></div></div>");
+    fprintf(f, "<div class='panel'><h3>Bluetooth Log</h3><pre id='btLog' class='mini'>Ready. Start Pairing Mode, then pair from the target device.</pre></div></section>");
+}
+
+static void system_panel(FILE *f) {
+    char info[8192], logs[8192];
+    run_cmd("echo '--- uname ---'; uname -a; echo; echo '--- memory ---'; cat /proc/meminfo; echo; echo '--- mounts ---'; mount; echo; echo '--- processes ---'; ps", info, sizeof(info));
+    run_cmd("echo '--- startup log ---'; cat /cache/codex-init.log 2>/dev/null; echo; echo '--- recovery log ---'; cat /cache/codex-recovery.log 2>/dev/null; echo; echo '--- local service syslog ---'; logread 2>/dev/null | grep -i 'codex\\|mqtt' 2>/dev/null", logs, sizeof(logs));
+    fprintf(f, "<section id='view-system' data-view='system' class='section'><div class='section-head'><div><h2>System</h2><div class='section-lead'>Diagnostics, logs, and maintenance actions. Reboot only when Wi-Fi or low-level changes need to take effect.</div></div></div>");
+    fprintf(f, "<div class='grid'><details><summary>System information</summary><pre>");
+    html(f, info);
+    fprintf(f, "</pre></details><details><summary>Logs</summary><pre>");
+    html(f, logs[0] ? logs : "no matching logs");
+    fprintf(f, "</pre></details></div><div class='panel' style='margin-top:12px'><div class='help'>Reload discovery if Home Assistant does not show new entities after device or command changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Reload MQTT Discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot Hub</button></div></form></div></section>");
+}
+
+static void render_page(int fd, const char *message) {
+    struct mqtt_config mqtt;
+    struct wifi_config wifi;
+    FILE *f = fdopen(dup(fd), "w");
+    if (!f) return;
+    load_mqtt(&mqtt);
+    load_wifi(&wifi);
+    page_head(f, "Harmony Hub Control");
+    if (message && message[0]) {
+        fprintf(f, "<div class='msg'>");
+        html(f, message);
+        fprintf(f, "</div>");
+    }
+    status_panel(f, &mqtt);
+    fprintf(f, "<section id='view-mqtt' data-view='mqtt' class='section'><div class='section-head'><div><h2>MQTT</h2><div class='section-lead'>Connect the hub to Home Assistant through the local MQTT bridge. Discovery can publish remotes and command metadata automatically.</div></div></div><div class='grid'>");
+    mqtt_form(f, &mqtt);
+    fprintf(f, "</div></section>");
+    fprintf(f, "<section id='view-wifi' data-view='wifi' class='section'><div class='section-head'><div><h2>Wi-Fi</h2><div class='section-lead'>Update the network the hub joins. The recovery AP remains available from the reset-button workflow if the saved Wi-Fi stops working.</div></div></div><div class='grid'>");
+    wifi_form(f, &wifi);
+    fprintf(f, "</div></section>");
+    ir_panel(f);
+    ir_lab_panel(f);
+    bluetooth_panel(f);
+    backup_panel(f);
+    system_panel(f);
+    page_end(f);
+    fclose(f);
+}
+
+static void handle_mqtt(int fd, const struct request *req) {
+    struct mqtt_config old, cfg;
+    char tmp[256];
+    load_mqtt(&old);
+    cfg = old;
+    cfg.enabled = form_checked(req->body, "enabled");
+    cfg.ha_discovery = form_checked(req->body, "haDiscovery");
+    form_value(req->body, "host", cfg.host, sizeof(cfg.host));
+    form_value(req->body, "username", cfg.username, sizeof(cfg.username));
+    form_value(req->body, "baseTopic", cfg.base_topic, sizeof(cfg.base_topic));
+    form_value(req->body, "discoveryPrefix", cfg.discovery_prefix, sizeof(cfg.discovery_prefix));
+    form_value(req->body, "clientId", cfg.client_id, sizeof(cfg.client_id));
+    form_value(req->body, "name", cfg.name, sizeof(cfg.name));
+    form_value(req->body, "port", tmp, sizeof(tmp));
+    cfg.port = atoi(tmp);
+    if (cfg.port <= 0) cfg.port = 1883;
+    form_value(req->body, "pollSeconds", tmp, sizeof(tmp));
+    cfg.poll_seconds = atoi(tmp);
+    if (cfg.poll_seconds <= 0) cfg.poll_seconds = 10;
+    form_value(req->body, "keepAlive", tmp, sizeof(tmp));
+    cfg.keep_alive = atoi(tmp);
+    if (cfg.keep_alive <= 0) cfg.keep_alive = 60;
+    form_value(req->body, "password", tmp, sizeof(tmp));
+    if (tmp[0] || !form_checked(req->body, "keep_password")) {
+        strncpy(cfg.password, tmp, sizeof(cfg.password) - 1);
+        cfg.password[sizeof(cfg.password) - 1] = 0;
+    }
+    if (save_mqtt(&cfg) == 0) {
+        trigger_mqtt_discover();
+        render_page(fd, "MQTT settings saved. The bridge will reconnect when it notices the config change.");
+    } else {
+        render_page(fd, "Failed to save MQTT settings.");
+    }
+}
+
+static void handle_wifi(int fd, const struct request *req) {
+    struct wifi_config old, cfg;
+    char tmp[256], apply[32];
+    load_wifi(&old);
+    cfg = old;
+    form_value(req->body, "ssid", cfg.ssid, sizeof(cfg.ssid));
+    form_value(req->body, "password", tmp, sizeof(tmp));
+    cfg.hidden = form_checked(req->body, "hidden");
+    cfg.open = form_checked(req->body, "open");
+    if (tmp[0] || !form_checked(req->body, "keep_password")) {
+        strncpy(cfg.psk, tmp, sizeof(cfg.psk) - 1);
+        cfg.psk[sizeof(cfg.psk) - 1] = 0;
+    }
+    if (!cfg.ssid[0]) {
+        render_page(fd, "Wi-Fi SSID is required.");
+        return;
+    }
+    if (!cfg.open && !cfg.psk[0]) {
+        render_page(fd, "Wi-Fi password is required unless Open network is checked.");
+        return;
+    }
+    if (save_wifi(&cfg) != 0) {
+        render_page(fd, "Failed to save Wi-Fi settings.");
+        return;
+    }
+    form_value(req->body, "apply", apply, sizeof(apply));
+    if (strcmp(apply, "reboot") == 0) {
+        render_page(fd, "Wi-Fi settings saved. Rebooting now.");
+        sync();
+        system("/sbin/reboot >/dev/null 2>&1 &");
+    } else {
+        render_page(fd, "Wi-Fi settings saved. Reboot when ready to use them.");
+    }
+}
+
+static void handle_system(int fd, const struct request *req) {
+    char action[64];
+    form_value(req->body, "action", action, sizeof(action));
+    if (strcmp(action, "reboot") == 0) {
+        render_page(fd, "Rebooting now.");
+        sync();
+        system("/sbin/reboot >/dev/null 2>&1 &");
+    } else if (strcmp(action, "rediscover") == 0) {
+        trigger_mqtt_discover();
+        render_page(fd, "MQTT discovery reload requested.");
+    } else {
+        render_page(fd, "Unknown system action.");
+    }
+}
+
+static char *trim_payload(char *s) {
+    char *end;
+    while (*s && isspace((unsigned char)*s)) s++;
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) *--end = 0;
+    return s;
+}
+
+static int looks_like_json_object(const char *s) {
+    const char *end;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (*s != '{') return 0;
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    return end > s && end[-1] == '}';
+}
+
+static const char *import_path_for_target(const char *target) {
+    if (strcmp(target, "devices") == 0) return DEVICE_LIST;
+    if (strcmp(target, "functions") == 0) return FUNCTION_LIST;
+    if (strcmp(target, "protocols") == 0) return PROTOCOL_LIST;
+    if (strcmp(target, "mqtt") == 0) return MQTT_CONFIG;
+    if (strcmp(target, "wifi") == 0) return WPA_CONFIG;
+    return NULL;
+}
+
+static const char *import_label_for_target(const char *target) {
+    if (strcmp(target, "bundle") == 0) return "backup bundle";
+    if (strcmp(target, "devices") == 0) return "DeviceList.json";
+    if (strcmp(target, "functions") == 0) return "FunctionList.json";
+    if (strcmp(target, "protocols") == 0) return "ProtocolList.json";
+    if (strcmp(target, "mqtt") == 0) return "MQTT config";
+    if (strcmp(target, "wifi") == 0) return "Wi-Fi config";
+    return "import";
+}
+
+static int validate_import_payload(const char *target, const char *payload, char *msg, size_t msglen) {
+    if (!payload[0]) {
+        snprintf(msg, msglen, "Import payload is empty.");
+        return -1;
+    }
+    if (strcmp(target, "bundle") == 0) {
+        if (looks_like_json_object(payload) && strstr(payload, "harmony-owner-bundle-v1") && strstr(payload, "\"DeviceList.json\"")) return 0;
+        snprintf(msg, msglen, "Bundle import must be a harmony-owner-bundle-v1 JSON export.");
+        return -1;
+    }
+    if (strcmp(target, "wifi") == 0) {
+        if (strstr(payload, "network={") && strstr(payload, "ssid=")) return 0;
+        snprintf(msg, msglen, "Wi-Fi import must look like a wpa_supplicant config with a network block and ssid.");
+        return -1;
+    }
+    if (!looks_like_json_object(payload)) {
+        snprintf(msg, msglen, "%s import must be a JSON object.", import_label_for_target(target));
+        return -1;
+    }
+    if (strcmp(target, "devices") == 0 && !strstr(payload, "\"DevicesWithFeatures\"")) {
+        snprintf(msg, msglen, "DeviceList import must contain DevicesWithFeatures.");
+        return -1;
+    }
+    if (strcmp(target, "functions") == 0 && !strstr(payload, "\"FunctionMaps\"")) {
+        snprintf(msg, msglen, "FunctionList import must contain FunctionMaps.");
+        return -1;
+    }
+    if (strcmp(target, "protocols") == 0 && !strstr(payload, "\"Protocols\"")) {
+        snprintf(msg, msglen, "ProtocolList import must contain Protocols.");
+        return -1;
+    }
+    if (strcmp(target, "mqtt") == 0 && (!strstr(payload, "\"broker\"") || !strstr(payload, "\"baseTopic\""))) {
+        snprintf(msg, msglen, "MQTT import must contain broker and baseTopic.");
+        return -1;
+    }
+    return 0;
+}
+
+static int bundle_extract(const char *bundle, const char *key, char *out, size_t outlen, char *msg, size_t msglen) {
+    if (!json_string(bundle, key, out, outlen) || !out[0]) {
+        snprintf(msg, msglen, "Bundle is missing %s.", key);
+        return -1;
+    }
+    return 0;
+}
+
+static void handle_import_bundle(int fd, const char *payload) {
+    char msg[256];
+    char *devices, *functions, *protocols, *mqtt, *wifi;
+    devices = (char *)malloc(MAX_REQUEST_BODY);
+    functions = (char *)malloc(MAX_REQUEST_BODY);
+    protocols = (char *)malloc(MAX_REQUEST_BODY);
+    mqtt = (char *)malloc(MAX_REQUEST_BODY);
+    wifi = (char *)malloc(MAX_REQUEST_BODY);
+    if (!devices || !functions || !protocols || !mqtt || !wifi) {
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        render_page(fd, "Not enough memory to import bundle.");
+        return;
+    }
+    if (bundle_extract(payload, "DeviceList.json", devices, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
+        bundle_extract(payload, "FunctionList.json", functions, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
+        bundle_extract(payload, "ProtocolList.json", protocols, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
+        bundle_extract(payload, "mqtt-config.json", mqtt, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
+        bundle_extract(payload, "wpa_supplicant.conf", wifi, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        return;
+    }
+    if (validate_import_payload("devices", devices, msg, sizeof(msg)) != 0 ||
+        validate_import_payload("functions", functions, msg, sizeof(msg)) != 0 ||
+        validate_import_payload("protocols", protocols, msg, sizeof(msg)) != 0 ||
+        validate_import_payload("mqtt", mqtt, msg, sizeof(msg)) != 0 ||
+        validate_import_payload("wifi", wifi, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        return;
+    }
+    backup_resources();
+    backup_settings();
+    if (write_file_atomic(DEVICE_LIST, devices, strlen(devices)) != 0 ||
+        write_file_atomic(FUNCTION_LIST, functions, strlen(functions)) != 0 ||
+        write_file_atomic(PROTOCOL_LIST, protocols, strlen(protocols)) != 0 ||
+        write_file_atomic(MQTT_CONFIG, mqtt, strlen(mqtt)) != 0 ||
+        write_file_atomic(WPA_CONFIG, wifi, strlen(wifi)) != 0) {
+        render_page(fd, "Failed to import owner bundle.");
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        return;
+    }
+    chmod(MQTT_CONFIG, 0600);
+    chmod(WPA_CONFIG, 0600);
+    request_resource_reload();
+    render_page(fd, "Backup bundle imported. Reboot when ready if Wi-Fi settings changed.");
+    free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+}
+
+static void handle_import(int fd, const struct request *req) {
+    char target[64], msg[256];
+    char *payload_buf, *payload;
+    const char *path;
+    size_t len;
+    if (req->body_truncated) {
+        render_page(fd, "Import payload was too large for this device-side form. Use a smaller file or import one resource at a time.");
+        return;
+    }
+    form_value(req->body, "target", target, sizeof(target));
+    path = import_path_for_target(target);
+    if (!path && strcmp(target, "bundle") != 0) {
+        render_page(fd, "Unknown import target.");
+        return;
+    }
+    payload_buf = (char *)malloc(MAX_REQUEST_BODY);
+    if (!payload_buf) {
+        render_page(fd, "Not enough memory to receive import payload.");
+        return;
+    }
+    form_value(req->body, "payload", payload_buf, MAX_REQUEST_BODY);
+    payload = trim_payload(payload_buf);
+    if (validate_import_payload(target, payload, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+        free(payload_buf);
+        return;
+    }
+    if (strcmp(target, "bundle") == 0) {
+        handle_import_bundle(fd, payload);
+        free(payload_buf);
+        return;
+    }
+    len = strlen(payload);
+    if (strcmp(target, "devices") == 0 || strcmp(target, "functions") == 0 || strcmp(target, "protocols") == 0) {
+        backup_resources();
+    } else {
+        backup_settings();
+    }
+    if (write_file_atomic(path, payload, len) != 0) {
+        snprintf(msg, sizeof(msg), "Failed to import %s.", import_label_for_target(target));
+        render_page(fd, msg);
+        free(payload_buf);
+        return;
+    }
+    if (strcmp(target, "mqtt") == 0) {
+        chmod(MQTT_CONFIG, 0600);
+        trigger_mqtt_discover();
+        render_page(fd, "MQTT settings imported. The bridge will reconnect when it notices the config change.");
+    } else if (strcmp(target, "wifi") == 0) {
+        chmod(WPA_CONFIG, 0600);
+        render_page(fd, "Wi-Fi settings imported. Reboot when ready to use them.");
+    } else {
+        request_resource_reload();
+        snprintf(msg, sizeof(msg), "Imported %s and requested a Harmony resource reload.", import_label_for_target(target));
+        render_page(fd, msg);
+    }
+    free(payload_buf);
+}
+
+static void handle_ir_send(int fd, const struct request *req) {
+    char device_id[64], command[128], reply[4096], message[4608];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "command", command, sizeof(command));
+    if (!safe_label(device_id) || !safe_label(command)) {
+        render_page(fd, "Invalid IR command request.");
+        return;
+    }
+    repair_known_protocols_for_current_commands();
+    send_ir_command_action(device_id, command, reply, sizeof(reply));
+    snprintf(message, sizeof(message), "Sent %s to %s. Reply: %s", command, device_id, reply[0] ? reply : "no response");
+    render_page(fd, message);
+}
+
+static void render_ir_send_json(int fd, const struct request *req) {
+    char device_id[64], command[128], reply[4096];
+    FILE *f;
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "command", command, sizeof(command));
+    if (!safe_label(device_id) || !safe_label(command)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"invalid IR command request\"}\n", f);
+        fclose(f);
+        return;
+    }
+    repair_known_protocols_for_current_commands();
+    send_ir_command_action_ex(device_id, command, "api", "", reply, sizeof(reply));
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"deviceId\":", f); json_write_string(f, device_id);
+    fputs(",\"command\":", f); json_write_string(f, command);
+    fputs(",\"reply\":", f); json_write_string(f, reply[0] ? reply : "no response");
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void render_ir_batch_send_json(int fd, const struct request *req) {
+    char device_id[64], delay_text[32], dry_text[16], run_id[128], reply[1024], last_reply[1024];
+    char *commands, *line, *save;
+    int delay_ms, dry_run, sent = 0, skipped = 0, attempted = 0, canceled = 0;
+    struct timeval start, end;
+    FILE *f;
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "delayMs", delay_text, sizeof(delay_text));
+    form_value(req->body, "dryRun", dry_text, sizeof(dry_text));
+    form_value(req->body, "runId", run_id, sizeof(run_id));
+    if (!safe_label(device_id)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"invalid IR batch device\"}\n", f);
+        fclose(f);
+        return;
+    }
+    if (run_id[0] && !safe_run_id(run_id)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"invalid IR run id\"}\n", f);
+        fclose(f);
+        return;
+    }
+    dry_run = strcmp(dry_text, "1") == 0 || strcasecmp(dry_text, "true") == 0;
+    delay_ms = atoi(delay_text);
+    if (delay_ms < 40) delay_ms = 40;
+    if (delay_ms > 10000) delay_ms = 10000;
+    if (!dry_run) repair_known_protocols_for_current_commands();
+    commands = (char *)malloc(MAX_REQUEST_BODY);
+    if (!commands) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"not enough memory for IR batch\"}\n", f);
+        fclose(f);
+        return;
+    }
+    form_value(req->body, "commands", commands, MAX_REQUEST_BODY);
+    gettimeofday(&start, NULL);
+    last_reply[0] = 0;
+    line = strtok_r(commands, "\n", &save);
+    while (line && attempted < MAX_IR_BATCH_COMMANDS) {
+        char *cmd_name = trim_in_place(line);
+        size_t n = strlen(cmd_name);
+        if (ir_run_canceled(run_id)) {
+            canceled = 1;
+            break;
+        }
+        while (n && cmd_name[n - 1] == '\r') cmd_name[--n] = 0;
+        if (!cmd_name[0] || !safe_label(cmd_name)) {
+            skipped++;
+            line = strtok_r(NULL, "\n", &save);
+            continue;
+        }
+        attempted++;
+        if (!dry_run) {
+            send_ir_command_action_ex(device_id, cmd_name, "api-batch", run_id, reply, sizeof(reply));
+            copy_text(last_reply, sizeof(last_reply), reply[0] ? reply : "no response");
+            if (delay_ms > 0 && cancelable_sleep_ms(delay_ms, run_id)) {
+                canceled = 1;
+                sent++;
+                break;
+            }
+        }
+        sent++;
+        line = strtok_r(NULL, "\n", &save);
+    }
+    while (line) {
+        skipped++;
+        line = strtok_r(NULL, "\n", &save);
+    }
+    gettimeofday(&end, NULL);
+    free(commands);
+    if (sent == 0 && !canceled) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"no valid commands selected\"}\n", f);
+        fclose(f);
+        return;
+    }
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"deviceId\":", f); json_write_string(f, device_id);
+    fputs(",\"runId\":", f); json_write_string(f, run_id);
+    fprintf(f, ",\"dryRun\":%s,\"canceled\":%s,\"sent\":%d,\"skipped\":%d,\"attempted\":%d,\"delayMs\":%d,\"elapsedMs\":%ld,\"lastReply\":",
+        dry_run ? "true" : "false", canceled ? "true" : "false", sent, skipped, attempted, delay_ms,
+        (long)((end.tv_sec - start.tv_sec) * 1000L + (end.tv_usec - start.tv_usec) / 1000L));
+    json_write_string(f, last_reply);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void render_ir_cancel_json(int fd, const struct request *req) {
+    char run_id[128];
+    FILE *f;
+    form_value(req->body, "runId", run_id, sizeof(run_id));
+    if (!safe_run_id(run_id)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"invalid IR run id\"}\n", f);
+        fclose(f);
+        return;
+    }
+    if (mark_ir_run_canceled(run_id) != 0) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"unable to mark IR run canceled\"}\n", f);
+        fclose(f);
+        return;
+    }
+    log_ir_note_event("ir_cancel", "api", run_id, "cancel requested");
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"runId\":", f); json_write_string(f, run_id);
+    fputs(",\"canceled\":true}\n", f);
+    fclose(f);
+}
+
+static void render_ir_lab_target_json(int fd) {
+    char device_id[64], msg[512];
+    int created = 0;
+    int rc = ensure_lab_target_device(device_id, sizeof(device_id), &created, msg, sizeof(msg));
+    FILE *f = send_json_start(fd, rc == 0 ? "200 OK" : "500 Internal Server Error");
+    if (!f) return;
+    fputs("{\"ok\":", f); fputs(rc == 0 ? "true" : "false", f);
+    fputs(",\"deviceId\":", f); json_write_string(f, rc == 0 ? device_id : "");
+    fputs(",\"name\":\"Temporary IR Sweep\",\"created\":", f); fputs(created ? "true" : "false", f);
+    fputs(",\"message\":", f); json_write_string(f, msg);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void render_ir_lab_clear_json(int fd, const struct request *req) {
+    char device_id[64], lab_id[64], msg[512];
+    int rc;
+    FILE *f;
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    rc = ensure_lab_target_device(lab_id, sizeof(lab_id), NULL, msg, sizeof(msg));
+    if (rc != 0) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":", f); json_write_string(f, msg);
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    }
+    if (!device_id[0]) copy_text(device_id, sizeof(device_id), lab_id);
+    if (strcmp(device_id, lab_id) != 0) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"clear only supports the temporary sweep device\"}\n", f);
+        fclose(f);
+        return;
+    }
+    rc = clear_ir_commands(device_id, msg, sizeof(msg));
+    f = send_json_start(fd, rc == 0 ? "200 OK" : "500 Internal Server Error");
+    if (!f) return;
+    fputs("{\"ok\":", f); fputs(rc == 0 ? "true" : "false", f);
+    fputs(",\"deviceId\":", f); json_write_string(f, device_id);
+    fputs(",\"message\":", f); json_write_string(f, msg);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static int safe_bt_addr(const char *s) {
+    int i;
+    if (strlen(s) != 17) return 0;
+    for (i = 0; i < 17; i++) {
+        if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) {
+            if (s[i] != ':') return 0;
+        } else if (!isxdigit((unsigned char)s[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int safe_bt_token(const char *s, size_t maxlen) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t n = strlen(s);
+    if (n == 0 || n > maxlen) return 0;
+    while (*p) {
+        if (!isalnum(*p) && *p != '_' && *p != '-') return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int safe_bt_pin(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    if (strlen(s) > 16) return 0;
+    while (*p) {
+        if (!isdigit(*p)) return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int safe_bt_name(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t n = strlen(s);
+    if (n == 0 || n > 48) return 0;
+    while (*p) {
+        if (!isalnum(*p) && *p != ' ' && *p != '_' && *p != '-' && *p != '.') return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int extract_bt_addr_from_text(const char *text, char *out, size_t outlen) {
+    const char *p = text;
+    if (!text || !out || outlen < 18) return 0;
+    out[0] = 0;
+    while (*p) {
+        int i;
+        if (isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1]) &&
+            p[2] == ':' && isxdigit((unsigned char)p[3]) && isxdigit((unsigned char)p[4])) {
+            char candidate[18];
+            for (i = 0; i < 17 && p[i]; i++) candidate[i] = (char)toupper((unsigned char)p[i]);
+            candidate[17] = 0;
+            if (safe_bt_addr(candidate)) {
+                snprintf(out, outlen, "%s", candidate);
+                return 1;
+            }
+        }
+        p++;
+    }
+    return 0;
+}
+
+static int detect_connected_bt_addr(char *out, size_t outlen, char *raw, size_t rawlen) {
+    char reply[2048];
+    if (!out || outlen < 18) return 0;
+    out[0] = 0;
+    reply[0] = 0;
+    run_cmd("hcitool con 2>&1", reply, sizeof(reply));
+    if (raw && rawlen) {
+        snprintf(raw, rawlen, "%s", reply);
+    }
+    return extract_bt_addr_from_text(reply, out, outlen);
+}
+
+static int bt_type_allowed(const char *type) {
+    return strcmp(type, "fire") == 0 ||
+        strcmp(type, "btkeyboard") == 0 ||
+        strcmp(type, "btkeyboard-nexus") == 0 ||
+        strcmp(type, "ps3") == 0 ||
+        strcmp(type, "wii") == 0;
+}
+
+static int run_hal_json(const char *cmd_name, const char *params_json, int timeout, char *out, size_t outlen) {
+    char esc_cmd[128], esc_params[2048], cmd[2400];
+    if (timeout < 1) timeout = 1;
+    if (timeout > 30) timeout = 30;
+    shell_escape_single(cmd_name, esc_cmd, sizeof(esc_cmd));
+    shell_escape_single(params_json, esc_params, sizeof(esc_params));
+    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hal_ltcp '%s' '%s' %d 2>&1", esc_cmd, esc_params, timeout);
+    return run_cmd(cmd, out, outlen);
+}
+
+static int run_hal_json_binary_hex(const char *cmd_name, const char *params_json, const char *payload_hex, int timeout, char *out, size_t outlen) {
+    char esc_cmd[128], esc_params[2048], esc_payload[512], cmd[3000];
+    if (timeout < 1) timeout = 1;
+    if (timeout > 30) timeout = 30;
+    shell_escape_single(cmd_name, esc_cmd, sizeof(esc_cmd));
+    shell_escape_single(params_json, esc_params, sizeof(esc_params));
+    shell_escape_single(payload_hex, esc_payload, sizeof(esc_payload));
+    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hal_ltcp '%s' '%s' %d '%s' 2>&1", esc_cmd, esc_params, timeout, esc_payload);
+    return run_cmd(cmd, out, outlen);
+}
+
+static int run_hal_json_binary_sequence(const char *cmd_name, const char *params_json, const char *sequence, int timeout, int gap_ms, char *out, size_t outlen) {
+    char esc_cmd[128], esc_params[2048], esc_path[256], cmd[3000], path[160];
+    long stamp = (long)time(NULL);
+    if (timeout < 1) timeout = 1;
+    if (timeout > 30) timeout = 30;
+    if (gap_ms < 15) gap_ms = 15;
+    if (gap_ms > 5000) gap_ms = 5000;
+    snprintf(path, sizeof(path), "/tmp/codex_bt_seq_%ld_%ld", (long)getpid(), stamp);
+    if (write_file_atomic(path, sequence, strlen(sequence)) != 0) {
+        snprintf(out, outlen, "failed to stage Bluetooth report sequence");
+        return -1;
+    }
+    shell_escape_single(cmd_name, esc_cmd, sizeof(esc_cmd));
+    shell_escape_single(params_json, esc_params, sizeof(esc_params));
+    shell_escape_single(path, esc_path, sizeof(esc_path));
+    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hal_ltcp '%s' '%s' %d --gap-ms=%d --seq-file='%s' 2>&1; rm -f '%s'",
+        esc_cmd, esc_params, timeout, gap_ms, esc_path, esc_path);
+    return run_cmd(cmd, out, outlen);
+}
+
+static int bt_hex_payload_from_input(const char *s, char *out, size_t outlen) {
+    const char *p = s;
+    int saw_prefix = 0, saw_separator = 0;
+    size_t n = 0, digits = 0;
+    if (!s || !out || outlen < 3) return 0;
+    out[0] = 0;
+    if (strncasecmp(p, "hex:", 4) == 0) {
+        saw_prefix = 1;
+        p += 4;
+    }
+    while (*p) {
+        if (*p == ' ' || *p == ':' || *p == '-' || *p == '\t' || *p == '\r' || *p == '\n') {
+            saw_separator = 1;
+            p++;
+            continue;
+        }
+        if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            saw_prefix = 1;
+            p += 2;
+            continue;
+        }
+        if (!isxdigit((unsigned char)*p)) return 0;
+        if (n + 2 >= outlen) return 0;
+        out[n++] = (char)toupper((unsigned char)*p);
+        digits++;
+        p++;
+    }
+    out[n] = 0;
+    if (!digits || (digits & 1)) return 0;
+    if (!saw_prefix && !saw_separator && digits < 8) return 0;
+    if (digits > 64) return 0;
+    return 1;
+}
+
+static int bt_key_usage(const char *key) {
+    if (!key || !key[0]) return -1;
+    if (strlen(key) == 1) {
+        if (key[0] >= 'a' && key[0] <= 'z') return 0x04 + (key[0] - 'a');
+        if (key[0] >= '1' && key[0] <= '9') return 0x1e + (key[0] - '1');
+        if (key[0] == '0') return 0x27;
+    }
+    if (strncmp(key, "number", 6) == 0 && key[6] && !key[7]) {
+        if (key[6] >= '1' && key[6] <= '9') return 0x1e + (key[6] - '1');
+        if (key[6] == '0') return 0x27;
+    }
+    if (key[0] == 'f' && isdigit((unsigned char)key[1])) {
+        int n = atoi(key + 1);
+        if (n >= 1 && n <= 12) return 0x3a + (n - 1);
+    }
+    if (strcmp(key, "enter") == 0 || strcmp(key, "return") == 0) return 0x28;
+    if (strcmp(key, "escape") == 0 || strcmp(key, "esc") == 0 || strcmp(key, "back") == 0) return 0x29;
+    if (strcmp(key, "backspace") == 0) return 0x2a;
+    if (strcmp(key, "tab") == 0) return 0x2b;
+    if (strcmp(key, "space") == 0) return 0x2c;
+    if (strcmp(key, "minus") == 0 || strcmp(key, "dash") == 0) return 0x2d;
+    if (strcmp(key, "equal") == 0 || strcmp(key, "equals") == 0) return 0x2e;
+    if (strcmp(key, "leftbracket") == 0 || strcmp(key, "openbracket") == 0) return 0x2f;
+    if (strcmp(key, "rightbracket") == 0 || strcmp(key, "closebracket") == 0) return 0x30;
+    if (strcmp(key, "backslash") == 0) return 0x31;
+    if (strcmp(key, "semicolon") == 0) return 0x33;
+    if (strcmp(key, "apostrophe") == 0 || strcmp(key, "quote") == 0) return 0x34;
+    if (strcmp(key, "grave") == 0 || strcmp(key, "graveaccent") == 0) return 0x35;
+    if (strcmp(key, "comma") == 0) return 0x36;
+    if (strcmp(key, "period") == 0 || strcmp(key, "dot") == 0) return 0x37;
+    if (strcmp(key, "slash") == 0) return 0x38;
+    if (strcmp(key, "capslock") == 0) return 0x39;
+    if (strcmp(key, "printscreen") == 0) return 0x46;
+    if (strcmp(key, "scrolllock") == 0) return 0x47;
+    if (strcmp(key, "pause") == 0) return 0x48;
+    if (strcmp(key, "insert") == 0) return 0x49;
+    if (strcmp(key, "home") == 0) return 0x4a;
+    if (strcmp(key, "pageup") == 0 || strcmp(key, "pgup") == 0) return 0x4b;
+    if (strcmp(key, "delete") == 0 || strcmp(key, "del") == 0) return 0x4c;
+    if (strcmp(key, "end") == 0) return 0x4d;
+    if (strcmp(key, "pagedown") == 0 || strcmp(key, "pgdn") == 0) return 0x4e;
+    if (strcmp(key, "directionright") == 0 || strcmp(key, "right") == 0) return 0x4f;
+    if (strcmp(key, "directionleft") == 0 || strcmp(key, "left") == 0) return 0x50;
+    if (strcmp(key, "directiondown") == 0 || strcmp(key, "down") == 0) return 0x51;
+    if (strcmp(key, "directionup") == 0 || strcmp(key, "up") == 0) return 0x52;
+    if (strcmp(key, "menu") == 0 || strcmp(key, "application") == 0) return 0x65;
+    return -1;
+}
+
+static int bt_keyboard_report_hex(const char *input, char *press, size_t presslen, char *release, size_t releaselen, char *err, size_t errlen) {
+    char norm[80], key[80];
+    const char *p = input;
+    size_t n = 0;
+    unsigned int mod = 0;
+    int usage;
+
+    if (!input || !input[0]) {
+        snprintf(err, errlen, "missing Bluetooth HID command");
+        return -1;
+    }
+    if (bt_hex_payload_from_input(input, press, presslen)) {
+        release[0] = 0;
+        return 0;
+    }
+    while (*p && n + 1 < sizeof(norm)) {
+        if (isalnum((unsigned char)*p)) norm[n++] = (char)tolower((unsigned char)*p);
+        p++;
+    }
+    norm[n] = 0;
+    copy_text(key, sizeof(key), norm);
+    while (key[0]) {
+        if (strncmp(key, "control", 7) == 0) {
+            mod |= 0x01;
+            memmove(key, key + 7, strlen(key + 7) + 1);
+        } else if (strncmp(key, "ctrl", 4) == 0) {
+            mod |= 0x01;
+            memmove(key, key + 4, strlen(key + 4) + 1);
+        } else if (strncmp(key, "shift", 5) == 0) {
+            mod |= 0x02;
+            memmove(key, key + 5, strlen(key + 5) + 1);
+        } else if (strncmp(key, "altgr", 5) == 0) {
+            mod |= 0x40;
+            memmove(key, key + 5, strlen(key + 5) + 1);
+        } else if (strncmp(key, "alt", 3) == 0) {
+            mod |= 0x04;
+            memmove(key, key + 3, strlen(key + 3) + 1);
+        } else if (strncmp(key, "windows", 7) == 0) {
+            mod |= 0x08;
+            memmove(key, key + 7, strlen(key + 7) + 1);
+        } else if (strncmp(key, "win", 3) == 0) {
+            mod |= 0x08;
+            memmove(key, key + 3, strlen(key + 3) + 1);
+        } else if (strncmp(key, "cmd", 3) == 0 || strncmp(key, "meta", 4) == 0) {
+            mod |= 0x08;
+            memmove(key, key + (key[0] == 'm' ? 4 : 3), strlen(key + (key[0] == 'm' ? 4 : 3)) + 1);
+        } else {
+            break;
+        }
+    }
+    usage = bt_key_usage(key);
+    if (usage < 0) {
+        snprintf(err, errlen, "unsupported Bluetooth keyboard command: %s", input);
+        return -1;
+    }
+    snprintf(press, presslen, "A101%02X00%02X0000000000", mod & 0xff, usage & 0xff);
+    snprintf(release, releaselen, "A101000000000000000000");
+    return 0;
+}
+
+static int bt_sequence_add_code(const char *input, char **seq, size_t *seq_len, size_t *seq_cap, int *keys, char *err, size_t errlen) {
+    char code[128], press[96], release[32];
+    char *clean;
+    copy_text(code, sizeof(code), input);
+    clean = trim_in_place(code);
+    while (*clean && clean[strlen(clean) - 1] == '\r') clean[strlen(clean) - 1] = 0;
+    if (!clean[0]) return 0;
+    if (bt_keyboard_report_hex(clean, press, sizeof(press), release, sizeof(release), err, errlen) != 0) {
+        return -1;
+    }
+    if (append_text(seq, seq_len, seq_cap, press, 0) != 0 ||
+        append_text(seq, seq_len, seq_cap, "\n", 0) != 0 ||
+        (release[0] && (append_text(seq, seq_len, seq_cap, release, 0) != 0 ||
+        append_text(seq, seq_len, seq_cap, "\n", 0) != 0))) {
+        snprintf(err, errlen, "not enough memory for Bluetooth report sequence");
+        return -1;
+    }
+    if (keys) (*keys)++;
+    return 0;
+}
+
+static void render_bluetooth_call_json(int fd, const struct request *req) {
+    char action[32], type[40], bdaddr[32], pin[24], code[MAX_BT_SEQUENCE_BODY], name[64], timeout_text[24], gap_text[24];
+    char params[768], reply[8192], cmd[2048], esc_name[128], *jt = NULL, *ja = NULL, *jp = NULL, *jc = NULL;
+    char detected_addr[32], connection_raw[2048];
+    const char *cmd_name = NULL;
+    int timeout, call_timeout, gap_ms, auto_detected_addr = 0;
+    FILE *f;
+
+    form_value(req->body, "action", action, sizeof(action));
+    form_value(req->body, "type", type, sizeof(type));
+    form_value(req->body, "bdaddr", bdaddr, sizeof(bdaddr));
+    form_value(req->body, "pin", pin, sizeof(pin));
+    form_value(req->body, "code", code, sizeof(code));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "timeout", timeout_text, sizeof(timeout_text));
+    form_value(req->body, "gapMs", gap_text, sizeof(gap_text));
+    chomp(action);
+    chomp(type);
+    chomp(bdaddr);
+    chomp(pin);
+    chomp(code);
+    chomp(name);
+    if (!type[0]) strcpy(type, "fire");
+    if (!name[0]) strcpy(name, "Harmony Keyboard");
+    timeout = atoi(timeout_text);
+    if (timeout < 1) timeout = 2;
+    if (timeout > 20) timeout = 20;
+    gap_ms = atoi(gap_text);
+    if (gap_ms < 15) gap_ms = 35;
+    if (gap_ms > 5000) gap_ms = 5000;
+    params[0] = 0;
+    detected_addr[0] = 0;
+    connection_raw[0] = 0;
+
+    if (strcmp(action, "adapter_status") == 0) {
+        reply[0] = 0;
+        run_cmd("echo '--- adapter ---'; hciconfig hci0 -a 2>&1; echo; echo '--- connections ---'; hcitool con 2>&1; echo; echo '--- bluez ---'; adapter=$(dbus-send --system --print-reply --dest=org.bluez / org.bluez.Manager.DefaultAdapter 2>/dev/null | sed -n 's/.*object path \"\\(.*\\)\".*/\\1/p'); if [ -n \"$adapter\" ]; then dbus-send --system --print-reply --dest=org.bluez \"$adapter\" org.bluez.Adapter.GetProperties 2>&1; else echo 'BlueZ adapter not found'; fi", reply, sizeof(reply));
+        f = send_json_start(fd, "200 OK");
+        if (!f) return;
+        fputs("{\"ok\":true,\"action\":", f); json_write_string(f, action);
+        fputs(",\"cmd\":\"adapter_status\",\"params\":\"\",\"responseRaw\":", f);
+        json_write_string(f, reply[0] ? reply : "no response");
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    } else if (strcmp(action, "pairing_on") == 0) {
+        if (!safe_bt_name(name)) {
+            f = send_json_start(fd, "400 Bad Request");
+            if (!f) return;
+            fputs("{\"ok\":false,\"error\":\"invalid Bluetooth display name\"}\n", f);
+            fclose(f);
+            return;
+        }
+        shell_escape_single(name, esc_name, sizeof(esc_name));
+        snprintf(cmd, sizeof(cmd),
+            "echo '--- enabling keyboard pairing mode ---'; "
+            "hciconfig hci0 up 2>&1; "
+            "hciconfig hci0 name '%s' 2>&1; "
+            "hciconfig hci0 class 0x002540 2>&1; "
+            "adapter=$(dbus-send --system --print-reply --dest=org.bluez / org.bluez.Manager.DefaultAdapter 2>/dev/null | sed -n 's/.*object path \"\\(.*\\)\".*/\\1/p'); "
+            "if [ -n \"$adapter\" ]; then "
+            "dbus-send --system --dest=org.bluez \"$adapter\" org.bluez.Adapter.SetProperty string:Pairable variant:boolean:true 2>&1; "
+            "dbus-send --system --dest=org.bluez \"$adapter\" org.bluez.Adapter.SetProperty string:Discoverable variant:boolean:true 2>&1; "
+            "fi; "
+            "hciconfig hci0 piscan 2>&1; "
+            "echo; echo '--- adapter ---'; hciconfig hci0 -a 2>&1; "
+            "echo; echo '--- bluez ---'; if [ -n \"$adapter\" ]; then dbus-send --system --print-reply --dest=org.bluez \"$adapter\" org.bluez.Adapter.GetProperties 2>&1; fi",
+            esc_name);
+        reply[0] = 0;
+        run_cmd(cmd, reply, sizeof(reply));
+        f = send_json_start(fd, "200 OK");
+        if (!f) return;
+        fputs("{\"ok\":true,\"action\":", f); json_write_string(f, action);
+        fputs(",\"cmd\":\"pairing_on\",\"params\":", f); json_write_string(f, name);
+        fputs(",\"responseRaw\":", f); json_write_string(f, reply[0] ? reply : "no response");
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    } else if (strcmp(action, "pairing_off") == 0) {
+        reply[0] = 0;
+        run_cmd("echo '--- disabling discoverable mode ---'; adapter=$(dbus-send --system --print-reply --dest=org.bluez / org.bluez.Manager.DefaultAdapter 2>/dev/null | sed -n 's/.*object path \"\\(.*\\)\".*/\\1/p'); if [ -n \"$adapter\" ]; then dbus-send --system --dest=org.bluez \"$adapter\" org.bluez.Adapter.SetProperty string:Discoverable variant:boolean:false 2>&1; fi; hciconfig hci0 pscan 2>&1; echo; echo '--- adapter ---'; hciconfig hci0 -a 2>&1; echo; echo '--- bluez ---'; if [ -n \"$adapter\" ]; then dbus-send --system --print-reply --dest=org.bluez \"$adapter\" org.bluez.Adapter.GetProperties 2>&1; fi", reply, sizeof(reply));
+        f = send_json_start(fd, "200 OK");
+        if (!f) return;
+        fputs("{\"ok\":true,\"action\":", f); json_write_string(f, action);
+        fputs(",\"cmd\":\"pairing_off\",\"params\":\"\",\"responseRaw\":", f);
+        json_write_string(f, reply[0] ? reply : "no response");
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    } else if (strcmp(action, "scan") == 0) {
+        cmd_name = "bt.lediscovery";
+        snprintf(params, sizeof(params), "{\"timeout\":%d}", timeout);
+        call_timeout = timeout + 3;
+    } else if (strcmp(action, "classic_scan") == 0) {
+        reply[0] = 0;
+        run_cmd("hcitool scan 2>&1", reply, sizeof(reply));
+        f = send_json_start(fd, "200 OK");
+        if (!f) return;
+        fputs("{\"ok\":true,\"action\":", f); json_write_string(f, action);
+        fputs(",\"cmd\":\"hcitool scan\",\"params\":\"\",\"responseRaw\":", f);
+        json_write_string(f, reply[0] ? reply : "no response");
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    } else {
+        if (!bt_type_allowed(type)) {
+            f = send_json_start(fd, "400 Bad Request");
+            if (!f) return;
+            fputs("{\"ok\":false,\"error\":\"unsupported Bluetooth HID type\"}\n", f);
+            fclose(f);
+            return;
+        }
+        if (!bdaddr[0] && (strcmp(action, "report") == 0 || strcmp(action, "reportseq") == 0 || strcmp(action, "status") == 0 || strcmp(action, "disconnect") == 0)) {
+            auto_detected_addr = detect_connected_bt_addr(detected_addr, sizeof(detected_addr), connection_raw, sizeof(connection_raw));
+            if (auto_detected_addr) copy_text(bdaddr, sizeof(bdaddr), detected_addr);
+        }
+        if (!bdaddr[0] && strcmp(action, "status") == 0) {
+            strcpy(bdaddr, "00:00:00:00:00:00");
+        }
+        if (!bdaddr[0] && (strcmp(action, "report") == 0 || strcmp(action, "reportseq") == 0)) {
+            f = send_json_start(fd, "400 Bad Request");
+            if (!f) return;
+            fputs("{\"ok\":false,\"error\":\"no connected Bluetooth target found; pair the target, click Adapter Status, or enter the paired target address\"}\n", f);
+            fclose(f);
+            return;
+        }
+        if (!safe_bt_addr(bdaddr) || !safe_bt_pin(pin)) {
+            f = send_json_start(fd, "400 Bad Request");
+            if (!f) return;
+            fputs("{\"ok\":false,\"error\":\"invalid Bluetooth address or PIN\"}\n", f);
+            fclose(f);
+            return;
+        }
+        jt = json_escape_alloc(type);
+        ja = json_escape_alloc(bdaddr);
+        jp = json_escape_alloc(pin);
+        jc = json_escape_alloc(code);
+        if (!jt || !ja || !jp || !jc) {
+            free(jt); free(ja); free(jp); free(jc);
+            f = send_json_start(fd, "500 Internal Server Error");
+            if (!f) return;
+            fputs("{\"ok\":false,\"error\":\"not enough memory for Bluetooth command\"}\n", f);
+            fclose(f);
+            return;
+        }
+        if (strcmp(action, "status") == 0) {
+            cmd_name = "bthid.status";
+            snprintf(params, sizeof(params), "{\"type\":%s,\"bdaddr\":%s}", jt, ja);
+        } else if (strcmp(action, "connect") == 0) {
+            cmd_name = "bthid.connect";
+            if (pin[0]) snprintf(params, sizeof(params), "{\"type\":%s,\"bdaddr\":%s,\"pin\":%s}", jt, ja, jp);
+            else snprintf(params, sizeof(params), "{\"type\":%s,\"bdaddr\":%s}", jt, ja);
+        } else if (strcmp(action, "disconnect") == 0) {
+            cmd_name = "bthid.disconnect";
+            snprintf(params, sizeof(params), "{\"type\":%s,\"bdaddr\":%s}", jt, ja);
+        } else if (strcmp(action, "report") == 0 || strcmp(action, "reportseq") == 0) {
+            cmd_name = "bthid.report";
+            snprintf(params, sizeof(params), "{\"type\":%s,\"bdaddr\":%s}", jt, ja);
+        }
+        free(jt); free(ja); free(jp); free(jc);
+        call_timeout = 8;
+    }
+
+    if (!cmd_name) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"unknown Bluetooth action\"}\n", f);
+        fclose(f);
+        return;
+    }
+
+    reply[0] = 0;
+    if (strcmp(action, "report") == 0 || strcmp(action, "reportseq") == 0) {
+        char *seq = NULL, *line, *save;
+        size_t seq_len = 0, seq_cap = 0;
+        int sent_keys = 0;
+        char report_err[160];
+        if (strcmp(action, "report") == 0) {
+            if (bt_sequence_add_code(code, &seq, &seq_len, &seq_cap, &sent_keys, report_err, sizeof(report_err)) != 0) {
+                free(seq);
+                f = send_json_start(fd, "400 Bad Request");
+                if (!f) return;
+                fputs("{\"ok\":false,\"error\":", f); json_write_string(f, report_err);
+                fputs("}\n", f);
+                fclose(f);
+                return;
+            }
+        } else {
+            line = strtok_r(code, "\n", &save);
+            while (line) {
+                if (bt_sequence_add_code(line, &seq, &seq_len, &seq_cap, &sent_keys, report_err, sizeof(report_err)) != 0) {
+                    free(seq);
+                    f = send_json_start(fd, "400 Bad Request");
+                    if (!f) return;
+                    fputs("{\"ok\":false,\"error\":", f); json_write_string(f, report_err);
+                    fputs("}\n", f);
+                    fclose(f);
+                    return;
+                }
+                line = strtok_r(NULL, "\n", &save);
+            }
+        }
+        if (!seq || sent_keys <= 0) {
+            free(seq);
+            f = send_json_start(fd, "400 Bad Request");
+            if (!f) return;
+            fputs("{\"ok\":false,\"error\":\"no Bluetooth keyboard reports to send\"}\n", f);
+            fclose(f);
+            return;
+        }
+        run_hal_json_binary_sequence(cmd_name, params, seq, call_timeout, gap_ms, reply, sizeof(reply));
+        free(seq);
+        {
+            size_t used = strlen(reply);
+            snprintf(reply + used, sizeof(reply) - used, "\nkeys=%d gapMs=%d", sent_keys, gap_ms);
+        }
+    } else {
+        run_hal_json(cmd_name, params, call_timeout, reply, sizeof(reply));
+    }
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"action\":", f); json_write_string(f, action);
+    fputs(",\"cmd\":", f); json_write_string(f, cmd_name);
+    fputs(",\"params\":", f); json_write_string(f, params);
+    fputs(",\"responseRaw\":", f); json_write_string(f, reply[0] ? reply : "no response");
+    if (auto_detected_addr) {
+        fputs(",\"detectedAddress\":", f); json_write_string(f, detected_addr);
+        fputs(",\"connectionRaw\":", f); json_write_string(f, connection_raw);
+    }
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void render_ir_test_learned_json(int fd, const struct request *req) {
+    char device_id[64], name[128], mode[32], protocol[32], nec[64], keycode[512], raw[2048];
+    char temp_name[128], add_msg[512], cleanup_msg[512], reply[4096], run_id[128];
+    int add_rc, cleanup_rc = -1;
+    FILE *f;
+
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "mode", mode, sizeof(mode));
+    form_value(req->body, "protocol", protocol, sizeof(protocol));
+    form_value(req->body, "nec", nec, sizeof(nec));
+    form_value(req->body, "keycode", keycode, sizeof(keycode));
+    form_value(req->body, "raw", raw, sizeof(raw));
+    if (!mode[0]) strcpy(mode, "auto");
+    if (!protocol[0]) strcpy(protocol, "2");
+    if (!safe_label(device_id)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"choose a device before testing\"}\n", f);
+        fclose(f);
+        return;
+    }
+    if (!raw[0] && !keycode[0] && !nec[0]) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"learn or enter a signal before testing\"}\n", f);
+        fclose(f);
+        return;
+    }
+    snprintf(temp_name, sizeof(temp_name), "Signal Test %ld %d", (long)time(NULL), (int)(getpid() % 10000));
+    add_rc = add_ir_command(device_id, temp_name, mode, protocol, nec, keycode, raw, add_msg, sizeof(add_msg));
+    reply[0] = 0;
+    if (add_rc == 0) {
+        snprintf(run_id, sizeof(run_id), "learn_%ld_%d", (long)time(NULL), (int)(getpid() % 10000));
+        usleep(800000);
+        send_ir_command_action_ex(device_id, temp_name, "api-learn-test", run_id, reply, sizeof(reply));
+        cleanup_rc = delete_ir_command(device_id, temp_name, cleanup_msg, sizeof(cleanup_msg));
+    } else {
+        cleanup_msg[0] = 0;
+    }
+    f = send_json_start(fd, add_rc == 0 ? "200 OK" : "400 Bad Request");
+    if (!f) return;
+    fputs("{\"ok\":", f); fputs(add_rc == 0 ? "true" : "false", f);
+    fputs(",\"deviceId\":", f); json_write_string(f, device_id);
+    fputs(",\"tempCommand\":", f); json_write_string(f, add_rc == 0 ? temp_name : "");
+    fputs(",\"addMessage\":", f); json_write_string(f, add_msg);
+    fputs(",\"reply\":", f); json_write_string(f, reply[0] ? reply : "");
+    fputs(",\"cleanupOk\":", f); fputs(cleanup_rc == 0 ? "true" : "false", f);
+    fputs(",\"cleanupMessage\":", f); json_write_string(f, cleanup_msg);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void handle_ir_device(int fd, const struct request *req) {
+    char device_id[64], name[128], manufacturer[128], model[128], type[80], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "manufacturer", manufacturer, sizeof(manufacturer));
+    form_value(req->body, "model", model, sizeof(model));
+    form_value(req->body, "type", type, sizeof(type));
+    update_ir_device(device_id, name, manufacturer, model, type, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_ir_new_device(int fd, const struct request *req) {
+    char name[128], manufacturer[128], model[128], type[80], msg[512];
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "manufacturer", manufacturer, sizeof(manufacturer));
+    form_value(req->body, "model", model, sizeof(model));
+    form_value(req->body, "type", type, sizeof(type));
+    create_ir_device(name, manufacturer, model, type, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_ir_command(int fd, const struct request *req) {
+    char device_id[64], name[128], mode[32], protocol[32], nec[64], keycode[512], raw[2048], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "mode", mode, sizeof(mode));
+    form_value(req->body, "protocol", protocol, sizeof(protocol));
+    form_value(req->body, "nec", nec, sizeof(nec));
+    form_value(req->body, "keycode", keycode, sizeof(keycode));
+    form_value(req->body, "raw", raw, sizeof(raw));
+    if (!mode[0]) strcpy(mode, "auto");
+    add_ir_command(device_id, name, mode, protocol, nec, keycode, raw, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_irdb_import(int fd, const struct request *req) {
+    char device_id[64], msg[512];
+    char *payload;
+    if (req->body_truncated) {
+        render_page(fd, "IRDB import payload was too large.");
+        return;
+    }
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    payload = (char *)malloc(MAX_REQUEST_BODY);
+    if (!payload) {
+        render_page(fd, "Not enough memory to receive IRDB import.");
+        return;
+    }
+    form_value(req->body, "payload", payload, MAX_REQUEST_BODY);
+    if (bulk_import_irdb_commands(device_id, payload, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+    } else {
+        render_page(fd, msg);
+    }
+    free(payload);
+}
+
+static void render_irdb_import_json(int fd, const struct request *req) {
+    char device_id[64], msg[512];
+    char *payload;
+    FILE *f;
+    if (req->body_truncated) {
+        f = send_json_start(fd, "413 Payload Too Large");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"IRDB import payload was too large\"}\n", f);
+        fclose(f);
+        return;
+    }
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    payload = (char *)malloc(MAX_REQUEST_BODY);
+    if (!payload) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"not enough memory to receive IRDB import\"}\n", f);
+        fclose(f);
+        return;
+    }
+    form_value(req->body, "payload", payload, MAX_REQUEST_BODY);
+    if (bulk_import_irdb_commands(device_id, payload, msg, sizeof(msg)) != 0) {
+        f = send_json_start(fd, "400 Bad Request");
+    } else {
+        f = send_json_start(fd, "200 OK");
+    }
+    if (f) {
+        fputs("{\"ok\":", f); fputs(strncmp(msg, "Imported ", 9) == 0 ? "true" : "false", f);
+        fputs(",\"message\":", f); json_write_string(f, msg);
+        fputs("}\n", f);
+        fclose(f);
+    }
+    free(payload);
+}
+
+static void handle_ir_capture(int fd, const struct request *req) {
+    char reply[4096], msg[4608];
+    (void)req;
+    capture_ir_command_action(reply, sizeof(reply));
+    snprintf(msg, sizeof(msg), "Capture result: %s", reply);
+    render_page(fd, msg);
+}
+
+static void handle_ir_delete_device(int fd, const struct request *req) {
+    char device_id[64], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    delete_ir_device(device_id, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_ir_delete_command(int fd, const struct request *req) {
+    char device_id[64], command[128], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "command", command, sizeof(command));
+    delete_ir_command(device_id, command, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void free_request(struct request *req) {
+    if (!req) return;
+    free(req->body);
+    req->body = NULL;
+    req->body_len = 0;
+}
+
+static int read_request(int fd, struct request *req) {
+    char *buf;
+    char *header_end, *line_end, *p;
+    int n = 0, clen, orig_clen, header_len;
+    memset(req, 0, sizeof(*req));
+    buf = (char *)malloc(MAX_REQUEST_BYTES);
+    if (!buf) return -1;
+    while (n < MAX_REQUEST_BYTES - 1) {
+        int got = recv(fd, buf + n, MAX_REQUEST_BYTES - 1 - n, 0);
+        if (got <= 0) {
+            free(buf);
+            return -1;
+        }
+        n += got;
+        buf[n] = 0;
+        header_end = strstr(buf, "\r\n\r\n");
+        if (header_end) {
+            header_len = (int)(header_end + 4 - buf);
+            orig_clen = content_length(buf);
+            if (orig_clen < 0) orig_clen = 0;
+            clen = orig_clen;
+            while (n < header_len + orig_clen && n < MAX_REQUEST_BYTES - 1) {
+                got = recv(fd, buf + n, MAX_REQUEST_BYTES - 1 - n, 0);
+                if (got <= 0) break;
+                n += got;
+                buf[n] = 0;
+            }
+            line_end = strstr(buf, "\r\n");
+            if (!line_end) {
+                free(buf);
+                return -1;
+            }
+            *line_end = 0;
+            sscanf(buf, "%7s %255s", req->method, req->path);
+            *line_end = '\r';
+            p = line_end + 2;
+            while (p < header_end) {
+                char *e = strstr(p, "\r\n");
+                if (!e) break;
+                if (strncasecmp(p, "Authorization:", 14) == 0) {
+                    char *v = p + 14;
+                    while (*v == ' ' || *v == '\t') v++;
+                    snprintf(req->auth, sizeof(req->auth), "%.*s", (int)(e - v), v);
+                }
+                p = e + 2;
+            }
+            if (orig_clen > 0) {
+                int available = n - header_len;
+                if (available < 0) available = 0;
+                if (available < orig_clen) req->body_truncated = 1;
+                if (orig_clen > MAX_REQUEST_BODY) req->body_truncated = 1;
+                clen = available < orig_clen ? available : orig_clen;
+                if (clen > MAX_REQUEST_BODY) clen = MAX_REQUEST_BODY;
+                req->body = (char *)malloc((size_t)clen + 1);
+                if (!req->body) {
+                    free(buf);
+                    return -1;
+                }
+                memcpy(req->body, buf + header_len, clen);
+                req->body[clen] = 0;
+                req->body_len = (size_t)clen;
+            }
+            free(buf);
+            return 0;
+        }
+    }
+    free(buf);
+    return -1;
+}
+
+static void send_payload_too_large(int fd, const struct request *req) {
+    if (strncmp(req->path, "/api/", 5) == 0) {
+        FILE *f = send_json_start(fd, "413 Payload Too Large");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"request body is too large for this hub\"}\n", f);
+        fclose(f);
+        return;
+    }
+    send_text(fd, "413 Payload Too Large", "request body is too large for this hub\n");
+}
+
+static void handle_client(int client) {
+    struct request req;
+    if (read_request(client, &req) != 0) {
+        free_request(&req);
+        return;
+    }
+    /* Local deployment: web UI is intentionally open on the LAN. */
+    if (req.body_truncated) {
+        send_payload_too_large(client, &req);
+        free_request(&req);
+        return;
+    }
+    if (strcmp(req.method, "GET") == 0 && (strcmp(req.path, "/") == 0 || strcmp(req.path, "/index.html") == 0)) {
+        render_page(client, "");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/inventory") == 0) {
+        render_inventory_json(client);
+    } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) &&
+        strncmp(req.path, "/api/remotecentral-fetch", 24) == 0 &&
+        (req.path[24] == 0 || req.path[24] == '?')) {
+        render_remotecentral_fetch_json(client, &req);
+    } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) && strcmp(req.path, "/api/capture") == 0) {
+        render_capture_json(client);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-send") == 0) {
+        render_ir_send_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-test-learned") == 0) {
+        render_ir_test_learned_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-batch-send") == 0) {
+        render_ir_batch_send_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-cancel") == 0) {
+        render_ir_cancel_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-lab-target") == 0) {
+        render_ir_lab_target_json(client);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/ir-lab-clear") == 0) {
+        render_ir_lab_clear_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-call") == 0) {
+        render_bluetooth_call_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/irdb-import") == 0) {
+        render_irdb_import_json(client, &req);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/bundle") == 0) {
+        send_bundle_download(client);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/devices") == 0) {
+        send_file_download(client, DEVICE_LIST, "DeviceList.json", "application/json");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/functions") == 0) {
+        send_file_download(client, FUNCTION_LIST, "FunctionList.json", "application/json");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/protocols") == 0) {
+        send_file_download(client, PROTOCOL_LIST, "ProtocolList.json", "application/json");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/mqtt") == 0) {
+        send_file_download(client, MQTT_CONFIG, "mqtt-config.json", "application/json");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/wifi") == 0) {
+        send_file_download(client, WPA_CONFIG, "wpa_supplicant.conf", "text/plain");
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/mqtt") == 0) {
+        handle_mqtt(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/wifi") == 0) {
+        handle_wifi(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/system") == 0) {
+        handle_system(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/import") == 0) {
+        handle_import(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/send") == 0) {
+        handle_ir_send(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/device") == 0) {
+        handle_ir_device(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/new-device") == 0) {
+        handle_ir_new_device(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/command") == 0) {
+        handle_ir_command(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/irdb-import") == 0) {
+        handle_irdb_import(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/capture") == 0) {
+        handle_ir_capture(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/delete-device") == 0) {
+        handle_ir_delete_device(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/delete-command") == 0) {
+        handle_ir_delete_command(client, &req);
+    } else {
+        send_text(client, "404 Not Found", "not found\n");
+    }
+    free_request(&req);
+}
+
+static void reap_children(void) {
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    errno = saved_errno;
+}
+
+int main(int argc, char **argv) {
+    int port = argc > 1 ? atoi(argv[1]) : 8080;
+    int fd, one = 1;
+    struct sockaddr_in addr;
+    signal(SIGPIPE, SIG_IGN);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        return 1;
+    }
+    if (listen(fd, 8) != 0) {
+        perror("listen");
+        return 1;
+    }
+    fprintf(stderr, "codex_webui listening on %d\n", port);
+    while (1) {
+        int client;
+        pid_t pid;
+        reap_children();
+        client = accept(fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            continue;
+        }
+        pid = fork();
+        if (pid == 0) {
+            close(fd);
+            handle_client(client);
+            close(client);
+            _exit(0);
+        }
+        if (pid < 0) {
+            handle_client(client);
+        }
+        close(client);
+    }
+}
