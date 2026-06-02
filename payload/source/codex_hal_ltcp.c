@@ -405,10 +405,23 @@ static int run_sequence_file(const char *cmd, const char *data, int timeout, con
     if (gap_ms > 5000) gap_ms = 5000;
     while (fgets(line, sizeof(line), f)) {
         char *hex = trim_in_place(line);
+        char *part, *save = NULL;
+        int parts = 0;
         if (!hex[0] || hex[0] == '#') continue;
-        rc = run_ltcp_once(cmd, data, timeout, hex, last, last_len);
+        part = strtok_r(hex, "|", &save);
+        while (part) {
+            part = trim_in_place(part);
+            if (part[0]) {
+                rc = run_ltcp_once(cmd, data, timeout, part, last, last_len);
+                if (rc != 0) break;
+                if (sent) (*sent)++;
+                parts++;
+                if (save && *save) usleep(5000);
+            }
+            part = strtok_r(NULL, "|", &save);
+        }
         if (rc != 0) break;
-        if (sent) (*sent)++;
+        if (parts <= 0) continue;
         usleep((useconds_t)gap_ms * 1000);
     }
     fclose(f);

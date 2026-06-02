@@ -42,6 +42,7 @@ MQTT credentials, firmware dumps, or personal backups.
     build_harmony_tools_kali.sh
   docs/
     AI_HANDOFF.md
+    API.md
     BUILD.md
     GITHUB_SETUP.md
     SECURITY.md
@@ -91,6 +92,8 @@ Keep changes scoped and reviewable:
 
 Do not commit local secrets, hub backups, firmware dumps, root tooling, or
 credentials. See `docs/SECURITY.md` before sharing the repository.
+
+For script and integration control, see `docs/API.md`.
 
 ## Useful Checks
 

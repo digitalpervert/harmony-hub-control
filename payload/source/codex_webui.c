@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -26,6 +27,7 @@
 #define RESOURCE_BACKUP_DIR "/data/codex/resource-backups"
 #define IR_EVENT_LOG "/data/codex/ir-events.log"
 #define IR_CANCEL_PREFIX "/tmp/codex_ir_cancel_"
+#define BT_TEXT_FIFO "/tmp/bthid_input"
 #define IR_EVENT_MAX_BYTES 65536
 #define MAX_REQUEST_BODY (512 * 1024)
 #define MAX_REQUEST_BYTES (MAX_REQUEST_BODY + 8192)
@@ -2412,11 +2414,11 @@ static void page_end(FILE *f) {
         "function btComboCode(s){const parts=String(s||'').toLowerCase().split(/[+\\s]+/).map(btCleanKey).filter(Boolean);if(!parts.length)return'';let key=parts.pop();const mods=parts.map(m=>m==='control'?'ctrl':((m==='cmd'||m==='meta'||m==='win')?'windows':m)).filter(m=>['ctrl','alt','shift','windows'].includes(m));return mods.join('')+key;}"
         "const btTextMap={' ':'space','\\t':'tab','\\n':'enter','.':'period',',':'comma','-':'minus','_':'shiftminus','/':'slash','?':'shiftslash','=':'equal','+':'shiftequal',';':'semicolon',':':'shiftsemicolon','`':'grave','~':'shiftgrave','[':'leftbracket',']':'rightbracket','\\\\':'backslash','|':'shiftbackslash','!':'shift1','@':'shift2','#':'shift3','$':'shift4','%':'shift5','^':'shift6','&':'shift7','*':'shift8','(':'shift9',')':'shift0'};"
         "function btCharCode(ch){if(/[A-Z]/.test(ch))return'shift'+ch.toLowerCase();if(/[a-z]/.test(ch))return ch;if(/[0-9]/.test(ch))return'number'+ch;return btTextMap[ch]||'';}"
-        "function btAddText(text,steps,notes,lineNo){Array.from(String(text||'')).forEach(ch=>{const c=btCharCode(ch);if(c)steps.push({kind:'key',code:c,line:lineNo});else notes.push('line '+lineNo+': skipped unsupported character '+JSON.stringify(ch));});}"
+        "function btAddText(text,steps,notes,lineNo){text=String(text||'');if(text)steps.push({kind:'text',text:text,line:lineNo});else notes.push('line '+lineNo+': empty text');}"
         "function btParseScript(){const steps=[],notes=[],raw=$('btScript')?.value||'';raw.replace(/\\r/g,'').split('\\n').forEach((line,i)=>{const n=i+1,clean=line.trim();if(!clean||clean.startsWith('#')||clean.startsWith('//'))return;const m=clean.match(/^([^\\s]+)\\s*(.*)$/),op=(m?m[1]:clean).toUpperCase(),arg=m?(m[2]||''):'';if(op==='WAIT'||op==='SLEEP'){let ms=/s$/i.test(arg.trim())?parseFloat(arg)*1000:parseInt(arg,10);if(!Number.isFinite(ms)||ms<0)notes.push('line '+n+': invalid wait');else steps.push({kind:'wait',ms:Math.min(10000,Math.max(0,ms)),line:n});}else if(op==='TEXT'||op==='TYPE'){btAddText(arg,steps,notes,n);}else if(op==='KEY'||op==='SEND'||op==='PRESS'){const c=btCleanKey(arg);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': missing key name');}else if(op==='COMBO'||op==='HOTKEY'){const c=btComboCode(arg);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': missing combo');}else{const c=btCleanKey(clean);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': unsupported line');}});return{steps:steps,notes:notes};}"
-        "function btPreviewScript(){const p=$('btScriptPreview'),r=btParseScript(),shown=r.steps.slice(0,160).map((s,i)=>String(i+1).padStart(3,' ')+'. '+(s.kind==='wait'?'WAIT '+s.ms+' ms':'KEY '+s.code));const more=r.steps.length>shown.length?'\\n... '+(r.steps.length-shown.length)+' more steps':'';if(p)p.textContent=(r.steps.length?shown.join('\\n')+more:'No script steps found.')+(r.notes.length?'\\n\\nNotes:\\n'+r.notes.join('\\n'):'');return r;}"
+        "function btPreviewScript(){const p=$('btScriptPreview'),r=btParseScript(),shown=r.steps.slice(0,160).map((s,i)=>String(i+1).padStart(3,' ')+'. '+(s.kind==='wait'?'WAIT '+s.ms+' ms':(s.kind==='text'?'TEXT '+JSON.stringify(s.text):'KEY '+s.code)));const more=r.steps.length>shown.length?'\\n... '+(r.steps.length-shown.length)+' more steps':'';if(p)p.textContent=(r.steps.length?shown.join('\\n')+more:'No script steps found.')+(r.notes.length?'\\n\\nNotes:\\n'+r.notes.join('\\n'):'');return r;}"
         "let btScriptStop=false,btScriptRunning=false;function btScriptButtons(on){btScriptRunning=on;['btScriptRun','btScriptPreviewBtn'].forEach(id=>{const e=$(id);if(e)e.disabled=on;});}"
-        "async function btRunScript(){if(btScriptRunning)return;const r=btPreviewScript(),gap=btDelay(),chunkSize=24,releaseAll='hex:A101000000000000000000';if(!r.steps.length){btAppend('script has no steps');return;}btScriptStop=false;btScriptButtons(true);let sent=0,buf=[];async function flush(){if(!buf.length)return;const keys=buf.slice();buf=[];const input=$('btCode');if(input)input.value=keys.join('\\n');btAppend('send chunk: '+keys.length+' keys, '+gap+' ms report gap');const j=await btPost('reportseq',{code:keys.join('\\n'),gapMs:String(gap)},true);sent+=keys.length;const tail=String(j.responseRaw||'').trim();btAppend('chunk ok: '+tail.slice(0,180));await btSleep(25);}btAppend('script start: '+r.steps.length+' steps, '+gap+' ms report gap');try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);for(const step of r.steps){if(btScriptStop){await flush();btAppend('script stopped after '+sent+' keys');break;}if(step.kind==='wait'){await flush();btAppend('wait '+step.ms+' ms');await btSleep(step.ms);continue;}buf.push(step.code);if(buf.length>=chunkSize)await flush();}if(!btScriptStop){await flush();btAppend('script complete: '+sent+' keys');}}catch(e){btAppend('script failed: '+(e.message||e));}finally{try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);btAppend('release all sent');}catch(e){}btScriptButtons(false);}}"
+        "async function btRunScript(){if(btScriptRunning)return;const r=btPreviewScript(),gap=btDelay(),chunkSize=24,releaseAll='hex:A101000000000000000000';if(!r.steps.length){btAppend('script has no steps');return;}btScriptStop=false;btScriptButtons(true);let sent=0,buf=[];async function sendKeyChunk(keys,label){if(!keys.length)return;const input=$('btCode');if(input)input.value=keys.join('\\n');btAppend(label+': '+keys.length+' keys, '+gap+' ms after release');const j=await btPost('reportseq',{code:keys.join('\\n'),gapMs:String(gap)},true);sent+=keys.length;const tail=String(j.responseRaw||'').trim();btAppend('key chunk ok: '+tail.slice(0,180));await btSleep(25);}async function flush(){if(!buf.length)return;const keys=buf.slice();buf=[];await sendKeyChunk(keys,'send key chunk');}async function sendTextFallback(text){let keys=[],skipped=0;for(const ch of Array.from(text)){const c=btCharCode(ch);if(c)keys.push(c);else skipped++;if(keys.length>=chunkSize){await sendKeyChunk(keys,'fallback text chunk');keys=[];}}if(keys.length)await sendKeyChunk(keys,'fallback text chunk');if(skipped)btAppend('fallback skipped '+skipped+' unsupported text chars');}async function sendText(text){await flush();btAppend('send text: '+text.length+' chars through keyboard FIFO');try{const j=await postJson('/api/bt-text',{text:text});sent+=text.length;btAppend('text ok: '+(j.bytes||text.length)+' bytes');await btSleep(gap);}catch(e){btAppend('FIFO text unavailable, using paired HID reports: '+(e.message||e));await sendTextFallback(text);}}btAppend('script start: '+r.steps.length+' steps, '+gap+' ms post-step gap');try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);for(const step of r.steps){if(btScriptStop){await flush();btAppend('script stopped after '+sent+' units');break;}if(step.kind==='wait'){await flush();btAppend('wait '+step.ms+' ms');await btSleep(step.ms);continue;}if(step.kind==='text'){await sendText(step.text);continue;}buf.push(step.code);if(buf.length>=chunkSize)await flush();}if(!btScriptStop){await flush();btAppend('script complete: '+sent+' units');}}catch(e){btAppend('script failed: '+(e.message||e));}finally{try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);btAppend('release all sent');}catch(e){}btScriptButtons(false);}}"
         "const btPairOn=$('btPairingOn');if(btPairOn)btPairOn.addEventListener('click',()=>btPost('pairing_on'));const btPairOff=$('btPairingOff');if(btPairOff)btPairOff.addEventListener('click',()=>btPost('pairing_off'));const btAdapter=$('btAdapterStatus');if(btAdapter)btAdapter.addEventListener('click',()=>btPost('adapter_status'));const btClassic=$('btClassicScan');if(btClassic)btClassic.addEventListener('click',()=>btPost('classic_scan'));const btScan=$('btScan');if(btScan)btScan.addEventListener('click',()=>btPost('scan'));const btStatus=$('btStatus');if(btStatus)btStatus.addEventListener('click',()=>btPost('status'));const btConnect=$('btConnect');if(btConnect)btConnect.addEventListener('click',()=>btPost('connect'));const btDisconnect=$('btDisconnect');if(btDisconnect)btDisconnect.addEventListener('click',()=>btPost('disconnect'));const btSend=$('btSend');if(btSend)btSend.addEventListener('click',()=>btPost('report'));const btRelease=$('btReleaseAll');if(btRelease)btRelease.addEventListener('click',()=>btPost('report',{code:'hex:A101000000000000000000',gapMs:String(btDelay())}));const btEnter=$('btEnterTest');if(btEnter)btEnter.addEventListener('click',()=>{const input=$('btCode');if(input)input.value='enter';btPost('report',{code:'enter'});});const btPrev=$('btScriptPreviewBtn');if(btPrev)btPrev.addEventListener('click',btPreviewScript);const btRun=$('btScriptRun');if(btRun)btRun.addEventListener('click',btRunScript);const btStop=$('btScriptStop');if(btStop)btStop.addEventListener('click',()=>{btScriptStop=true;btAppend('stop requested');});document.querySelectorAll('[data-bt-code]').forEach(b=>b.addEventListener('click',()=>{const c=b.dataset.btCode||'';const input=$('btCode');if(input)input.value=c;btPost('report',{code:c});}));"
         "const LAB_AUTO_DEVICE='__auto_lab__';const lab={queue:[],index:[],cursor:0,key:'',running:false,stop:false,imported:false,runId:'',streaming:false};"
         "function labStatus(t){const s=$('labStatus');if(s)s.textContent=t||'';}function labSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
@@ -3574,14 +3576,69 @@ static int bt_sequence_add_code(const char *input, char **seq, size_t *seq_len, 
         return -1;
     }
     if (append_text(seq, seq_len, seq_cap, press, 0) != 0 ||
-        append_text(seq, seq_len, seq_cap, "\n", 0) != 0 ||
-        (release[0] && (append_text(seq, seq_len, seq_cap, release, 0) != 0 ||
-        append_text(seq, seq_len, seq_cap, "\n", 0) != 0))) {
+        (release[0] && (append_text(seq, seq_len, seq_cap, "|", 0) != 0 ||
+        append_text(seq, seq_len, seq_cap, release, 0) != 0)) ||
+        append_text(seq, seq_len, seq_cap, "\n", 0) != 0) {
         snprintf(err, errlen, "not enough memory for Bluetooth report sequence");
         return -1;
     }
     if (keys) (*keys)++;
     return 0;
+}
+
+static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
+    int fd, tries = 0;
+    size_t len, off = 0;
+    if (!text || !text[0]) {
+        snprintf(err, errlen, "missing Bluetooth text");
+        return -1;
+    }
+    len = strlen(text);
+    if (len > MAX_BT_SEQUENCE_BODY) {
+        snprintf(err, errlen, "Bluetooth text is too large");
+        return -1;
+    }
+    fd = open(BT_TEXT_FIFO, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        snprintf(err, errlen, "Bluetooth text FIFO is not available; start bthid_keyboard first");
+        return -1;
+    }
+    while (off < len) {
+        ssize_t n = write(fd, text + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && tries++ < 100) {
+            usleep(10000);
+            continue;
+        }
+        snprintf(err, errlen, "Bluetooth FIFO write failed at byte %lu: %s", (unsigned long)off, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static void render_bluetooth_text_json(int fd, const struct request *req) {
+    char text[MAX_BT_SEQUENCE_BODY], err[256];
+    FILE *f;
+    form_value(req->body, "text", text, sizeof(text));
+    if (write_bt_text_fifo(text, err, sizeof(err)) != 0) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":", f); json_write_string(f, err);
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    }
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"path\":\"/api/bt-text\",\"bytes\":", f);
+    fprintf(f, "%lu", (unsigned long)strlen(text));
+    fputs("}\n", f);
+    fclose(f);
 }
 
 static void render_bluetooth_call_json(int fd, const struct request *req) {
@@ -4109,6 +4166,8 @@ static void handle_client(int client) {
         render_ir_lab_clear_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-call") == 0) {
         render_bluetooth_call_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-text") == 0) {
+        render_bluetooth_text_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/irdb-import") == 0) {
         render_irdb_import_json(client, &req);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/bundle") == 0) {
