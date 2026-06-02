@@ -36,6 +36,8 @@ MQTT credentials, firmware dumps, or personal backups.
     scripts/               Init, recovery, Dropbear wrappers, cloud suppression
     mqtt/                  MQTT bridge Lua plugin
     source/                C sources for the native helper binaries
+  tools/
+    ir_database_smoke_test.mjs
   build/
     build_harmony_tools_kali.sh
   docs/
@@ -108,4 +110,16 @@ Logs:
 
 ```powershell
 ssh -i "$env:USERPROFILE\.ssh\<root-key-file>" root@<hub-ip> "tail -80 /cache/codex-init.log; tail -80 /data/codex/ir-events.log 2>/dev/null"
+```
+
+IR database parser smoke test:
+
+```powershell
+node .\tools\ir_database_smoke_test.mjs --sample=24 --per-device=10 --source=all --dry-run
+```
+
+To create test devices and import supported commands without sending IR:
+
+```powershell
+node .\tools\ir_database_smoke_test.mjs --sample=8 --per-device=8 --source=all --configure --hub=http://<hub-ip>:8080
 ```
