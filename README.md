@@ -106,7 +106,7 @@ Invoke-WebRequest -Uri "http://<hub-ip>:8080/" -UseBasicParsing
 Process and checksum check:
 
 ```powershell
-ssh -i "$env:USERPROFILE\.ssh\<root-key-file>" root@<hub-ip> "ps | grep -E '[c]odex_webui|[d]ropbear'; md5sum /data/codex/bin/codex_webui"
+ssh -i "$env:USERPROFILE\.ssh\<root-key-file>" root@<hub-ip> "ps | grep '[c]odex_webui'; ps | grep '[c]odex_bthid_keyboard'; ps | grep '[d]ropbear'; md5sum /data/codex/bin/codex_webui"
 ```
 
 Logs:

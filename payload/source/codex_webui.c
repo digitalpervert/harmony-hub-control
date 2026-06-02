@@ -2409,7 +2409,7 @@ static void page_end(FILE *f) {
         "function btPairStatus(t){const el=$('btPairStatus');if(el)el.textContent=t||'';}"
         "function btMaybeFillAddr(raw){raw=String(raw||'');let m=raw.match(/ACL\\s+([0-9A-F]{2}(?::[0-9A-F]{2}){5})/i)||raw.match(/dev_([0-9A-F]{2}(?:_[0-9A-F]{2}){5})/i);if(m){const addr=m[1].replace(/_/g,':').toUpperCase(),el=$('btAddr');if(el&&!el.value.trim()){el.value=addr;btAppend('target address detected: '+addr);}}}"
         "function btSummarizeAdapter(raw){raw=String(raw||'');const addr=(raw.match(/BD Address:\\s*([0-9A-F:]{17})/i)||[])[1]||'',name=(raw.match(/Name:\\s*'([^']+)'/i)||[])[1]||'',mode=(raw.match(/UP RUNNING[^\\n]*/)||[])[0]||'',disc=/\"Discoverable\"[\\s\\S]{0,80}boolean true/.test(raw),pair=/\"Pairable\"[\\s\\S]{0,80}boolean true/.test(raw);return [name?('Name: '+name):'',addr?('Address: '+addr):'',mode?('Mode: '+mode.trim()):'',('Discoverable: '+(disc?'yes':'no')),('Pairable: '+(pair?'yes':'no'))].filter(Boolean).join('\\n')+'\\n\\n'+raw;}"
-        "async function btRuntimeStatus(){try{const j=await (await fetch('/api/bt-text-status')).json(),s=$('btRuntimeStatus');const lines=['Runtime: '+(j.runtime?'running':'missing'),'State: '+(j.state||'unknown'),j.target?('Target: '+j.target):'Target: none','Sent: '+(j.sent||0)+'  Skipped: '+(j.skipped||0),j.error?('Note: '+j.error):''];if(s)s.textContent=lines.filter(Boolean).join('\\n');btAppend('FIFO runtime '+(j.runtime?j.state:'missing'));return j;}catch(e){const s=$('btRuntimeStatus');if(s)s.textContent='Runtime status failed: '+(e.message||e);btAppend('runtime status failed: '+(e.message||e));}}"
+        "async function btRuntimeStatus(){try{const j=await (await fetch('/api/bt-text-status')).json(),s=$('btRuntimeStatus');const age=j.updated?Math.max(0,Math.round(Date.now()/1000-j.updated)):null;const lines=['Runtime: '+(j.runtime?'running':'missing'),'State: '+(j.state||'unknown'),j.pid?('PID: '+j.pid):'',j.target?('Target: '+j.target):'Target: none',age!==null?('Updated: '+age+'s ago'):'','Sent: '+(j.sent||0)+'  Skipped: '+(j.skipped||0),j.error?('Note: '+j.error):''];if(s)s.textContent=lines.filter(Boolean).join('\\n');btAppend('FIFO runtime '+(j.runtime?j.state:(j.state||'missing')));return j;}catch(e){const s=$('btRuntimeStatus');if(s)s.textContent='Runtime status failed: '+(e.message||e);btAppend('runtime status failed: '+(e.message||e));}}"
         "async function btPost(action,extra,quiet){const data=Object.assign(btFields(),extra||{},{action:action});if(!quiet)btLog(action+'...');try{const j=await postJson('/api/bt-call',data);if(j.detectedAddress){const el=$('btAddr');if(el&&!el.value.trim())el.value=j.detectedAddress;btAppend('target address detected: '+j.detectedAddress);}if(['pairing_on','pairing_off','adapter_status'].includes(action)){btPairStatus(btSummarizeAdapter(j.responseRaw||''));btMaybeFillAddr(j.responseRaw||'');}if(j.connectionRaw)btMaybeFillAddr(j.connectionRaw);if(!quiet)btLog(JSON.stringify(j,null,2));return j;}catch(e){if(quiet)throw e;btLog(action+' failed: '+(e.message||e));}}"
         "function btSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
         "function btDelay(){let v=parseInt($('btScriptDelay')?.value||'35',10);if(!Number.isFinite(v))v=35;v=Math.max(15,Math.min(5000,v));const e=$('btScriptDelay');if(e)e.value=String(v);return v;}"
@@ -3598,6 +3598,30 @@ static int bt_sequence_add_code(const char *input, char **seq, size_t *seq_len, 
     return 0;
 }
 
+static int bthid_status_runtime_alive(const char *raw) {
+    int pid;
+    if (!raw || !json_bool(raw, "runtime", 0)) return 0;
+    pid = json_int(raw, "pid", 0);
+    if (pid <= 0) {
+        char ps[256];
+        return run_cmd("ps | grep '[c]odex_bthid_keyboard'", ps, sizeof(ps)) == 0 && ps[0] != 0;
+    }
+    if (kill((pid_t)pid, 0) == 0) return 1;
+    return errno == EPERM;
+}
+
+static void write_bthid_missing_status(FILE *f, const char *state, const char *message, int sent, int skipped) {
+    fputs("{\"ok\":true,\"runtime\":false,\"state\":", f);
+    json_write_string(f, state ? state : "missing");
+    fputs(",\"target\":\"\",\"sent\":", f);
+    fprintf(f, "%d", sent);
+    fputs(",\"skipped\":", f);
+    fprintf(f, "%d", skipped);
+    fputs(",\"error\":", f);
+    json_write_string(f, message ? message : "Bluetooth FIFO runtime is not running");
+    fputs("}\n", f);
+}
+
 static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
     int fd, tries = 0;
     size_t len, off = 0;
@@ -3614,7 +3638,9 @@ static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
     if (fd < 0) {
         char status[512];
         if (read_text(BT_TEXT_STATUS, status, sizeof(status)) > 0 && strstr(status, "\"runtime\":true")) {
-            if (strstr(status, "\"state\":\"no_target\"")) {
+            if (!bthid_status_runtime_alive(status)) {
+                snprintf(err, errlen, "Bluetooth text runtime status is stale; restart bthid_keyboard");
+            } else if (strstr(status, "\"state\":\"no_target\"")) {
                 snprintf(err, errlen, "Bluetooth text runtime is waiting for a paired target");
             } else {
                 snprintf(err, errlen, "Bluetooth text runtime is not ready for FIFO writes");
@@ -3667,10 +3693,15 @@ static void render_bluetooth_text_status_json(int fd) {
     FILE *f = send_json_start(fd, "200 OK");
     if (!f) return;
     if (read_text(BT_TEXT_STATUS, raw, sizeof(raw)) > 0 && raw[0] == '{') {
-        fputs(raw, f);
-        if (raw[strlen(raw) - 1] != '\n') fputc('\n', f);
+        if (bthid_status_runtime_alive(raw)) {
+            fputs(raw, f);
+            if (raw[strlen(raw) - 1] != '\n') fputc('\n', f);
+        } else {
+            write_bthid_missing_status(f, "stale", "Bluetooth FIFO runtime status is stale; restart bthid_keyboard",
+                json_int(raw, "sent", 0), json_int(raw, "skipped", 0));
+        }
     } else {
-        fputs("{\"ok\":true,\"runtime\":false,\"state\":\"missing\",\"target\":\"\",\"sent\":0,\"skipped\":0,\"error\":\"Bluetooth FIFO runtime is not running\"}\n", f);
+        write_bthid_missing_status(f, "missing", "Bluetooth FIFO runtime is not running", 0, 0);
     }
     fclose(f);
 }

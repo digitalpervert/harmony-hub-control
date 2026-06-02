@@ -257,7 +257,7 @@ $start = "killall codex_webui 2>/dev/null || true; killall codex_bthid_keyboard 
          "/data/codex/bin/codex_bthid_keyboard >> /cache/codex-init.log 2>&1 & " +
          "sleep 1; " +
          "/data/codex/bin/codex_hbus $(Remote-Quote $HubId) harmony.automation?discover '{""gatewayType"":""codexmqtt""}' >> /cache/codex-init.log 2>&1 || true; " +
-         "ps | grep -E '[c]odex_webui|[c]odex_bthid_keyboard|[d]ropbear' || true"
+         "ps | grep '[c]odex_webui' || true; ps | grep '[c]odex_bthid_keyboard' || true; ps | grep '[d]ropbear' || true"
 $running = Invoke-Remote $start $null 90000
 Write-Host $running.Trim()
 

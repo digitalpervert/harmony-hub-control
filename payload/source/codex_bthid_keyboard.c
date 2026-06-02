@@ -23,6 +23,7 @@
 #define DEFAULT_STATUS "/tmp/bthid_status"
 #define DEFAULT_LOG "/cache/codex-bthid-keyboard.log"
 #define TARGET_FILE "/data/codex/bthid_target"
+#define LOG_MAX_BYTES 32768
 
 static const unsigned char RELEASE_REPORT[10] = {0xa1, 0x01, 0, 0, 0, 0, 0, 0, 0, 0};
 
@@ -147,10 +148,20 @@ static int send_report(const char *type, const char *bdaddr, const unsigned char
     return rc;
 }
 
+static void rotate_log_if_needed(void) {
+    struct stat st;
+    if (stat(DEFAULT_LOG, &st) == 0 && st.st_size > LOG_MAX_BYTES) {
+        unlink(DEFAULT_LOG ".1");
+        rename(DEFAULT_LOG, DEFAULT_LOG ".1");
+    }
+}
+
 static void log_line(const char *fmt, ...) {
-    FILE *f = fopen(DEFAULT_LOG, "a");
+    FILE *f;
     va_list ap;
     time_t now = time(NULL);
+    rotate_log_if_needed();
+    f = fopen(DEFAULT_LOG, "a");
     if (!f) return;
     fprintf(f, "%ld ", (long)now);
     va_start(ap, fmt);
@@ -160,16 +171,41 @@ static void log_line(const char *fmt, ...) {
     fclose(f);
 }
 
+static void status_json_string(FILE *f, const char *s) {
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+    fputc('"', f);
+    while (*p) {
+        if (*p == '"' || *p == '\\') {
+            fputc('\\', f);
+            fputc(*p, f);
+        } else if (*p == '\n') {
+            fputs("\\n", f);
+        } else if (*p == '\r') {
+            fputs("\\r", f);
+        } else if (*p == '\t') {
+            fputs("\\t", f);
+        } else if (*p < 32) {
+            fprintf(f, "\\u%04x", (unsigned int)*p);
+        } else {
+            fputc(*p, f);
+        }
+        p++;
+    }
+    fputc('"', f);
+}
+
 static void write_status(const char *state, const char *target, unsigned long sent, unsigned long skipped, const char *error) {
     FILE *f = fopen(DEFAULT_STATUS ".new", "w");
+    time_t now = time(NULL);
     if (!f) return;
-    fprintf(f,
-        "{\"ok\":true,\"runtime\":true,\"state\":\"%s\",\"target\":\"%s\",\"sent\":%lu,\"skipped\":%lu,\"error\":\"%s\"}\n",
-        state ? state : "unknown",
-        target ? target : "",
-        sent,
-        skipped,
-        error ? error : "");
+    fprintf(f, "{\"ok\":true,\"runtime\":true,\"pid\":%ld,\"updated\":%ld,\"state\":",
+        (long)getpid(), (long)now);
+    status_json_string(f, state ? state : "unknown");
+    fputs(",\"target\":", f);
+    status_json_string(f, target ? target : "");
+    fprintf(f, ",\"sent\":%lu,\"skipped\":%lu,\"error\":", sent, skipped);
+    status_json_string(f, error ? error : "");
+    fputs("}\n", f);
     fclose(f);
     rename(DEFAULT_STATUS ".new", DEFAULT_STATUS);
 }
