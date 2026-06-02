@@ -39,6 +39,19 @@ function Prompt-IfMissing([string]$Value, [string]$Label, [switch]$Required) {
     return $v
 }
 
+function Resolve-DefaultKeyPath() {
+    $home = $env:USERPROFILE
+    if (-not $home) { $home = [Environment]::GetFolderPath("UserProfile") }
+    if (-not $home) { return "" }
+    $sshDir = Join-Path $home ".ssh"
+    if (-not (Test-Path -LiteralPath $sshDir)) { return "" }
+    $keys = @(Get-ChildItem -LiteralPath $sshDir -File -Filter "harmony_owner_*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike "*.pub" } |
+        Sort-Object LastWriteTime -Descending)
+    if ($keys.Count -lt 1) { return "" }
+    return $keys[0].FullName
+}
+
 function Quote-ProcessArg([string]$Arg) {
     if ($null -eq $Arg) { return '""' }
     if ($Arg.Length -eq 0) { return '""' }
@@ -166,6 +179,11 @@ $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Payload = Join-Path $ScriptRoot "payload"
 
 $HubHost = Prompt-IfMissing $HubHost "Harmony hub IP address" -Required
+$defaultKeyPath = Resolve-DefaultKeyPath
+if (-not $KeyPath -and $defaultKeyPath -and (Test-Path -LiteralPath $defaultKeyPath)) {
+    $KeyPath = $defaultKeyPath
+    Info "using SSH key $KeyPath"
+}
 $KeyPath = Prompt-IfMissing $KeyPath "SSH private key path for root login" -Required
 $KeyPath = (Resolve-Path -LiteralPath $KeyPath).Path
 if (-not (Test-Path -LiteralPath $KeyPath)) { throw "SSH key not found: $KeyPath" }

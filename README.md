@@ -29,6 +29,8 @@ MQTT credentials, firmware dumps, or personal backups.
 
 ```text
 .
+  Install_Harmony_Control.cmd
+                           Double-click post-root installer for Windows
   install_webui.ps1        Windows installer for rooted hubs with SSH
   restore_backup.ps1       Restores the installer's hub-side backup
   payload/
@@ -55,10 +57,32 @@ No build server is required to install the current payload.
 
 ## Quick Install
 
-Run from Windows PowerShell after the hub already has working root SSH:
+Run after the hub has just been rooted with the LAN root tool. The installer
+uses the current Windows user's Harmony SSH key. It looks in `.ssh` for a
+private key whose filename starts with `harmony_owner_`:
+
+```text
+%USERPROFILE%\.ssh\harmony_owner_*
+```
+
+Double-click:
+
+```text
+Install_Harmony_Control.cmd
+```
+
+Enter the hub IP address when prompted. The installer also prompts for MQTT
+broker settings; leave the broker blank to install the UI with MQTT disabled for
+now.
+
+The installer uses only plain `ssh` and remote `cat` over stdin to copy files.
+It does not require `scp`, `sftp`, or `tftp`, which are not available in the
+minimal Dropbear SSH environment installed by the root tool.
+
+PowerShell can also be run directly:
 
 ```powershell
-.\install_webui.ps1 -HubHost <hub-ip> -KeyPath "$env:USERPROFILE\.ssh\<root-key-file>"
+.\install_webui.ps1 -HubHost <hub-ip>
 ```
 
 The installer will prompt for missing values, create a backup on the hub, upload
