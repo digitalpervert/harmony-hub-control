@@ -193,9 +193,7 @@ POST /api/update-chunk
 POST /api/update-apply
 ```
 
-For a private GitHub repo, paste a GitHub token into the System page update
-field. It is used only by the browser to read GitHub and is not sent to or
-stored on the hub. Without a token, GitHub raw URLs for private repositories
-usually return `404`; the web UI now stops that default private-repo request
-early and asks for a token. Use the raw base URL only when pointing at a public
-mirror.
+The default public GitHub raw URL works without a token. For a private GitHub
+repo or fork, paste a GitHub token into the System page update field. It is used
+only by the browser to read GitHub and is not sent to or stored on the hub.
+Without a token, GitHub raw URLs for private repositories usually return `404`.
