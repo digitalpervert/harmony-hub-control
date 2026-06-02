@@ -28,6 +28,8 @@
 #define IR_EVENT_LOG "/data/codex/ir-events.log"
 #define IR_CANCEL_PREFIX "/tmp/codex_ir_cancel_"
 #define BT_TEXT_FIFO "/tmp/bthid_input"
+#define BT_TEXT_STATUS "/tmp/bthid_status"
+#define BT_TARGET_FILE "/data/codex/bthid_target"
 #define IR_EVENT_MAX_BYTES 65536
 #define MAX_REQUEST_BODY (512 * 1024)
 #define MAX_REQUEST_BYTES (MAX_REQUEST_BODY + 8192)
@@ -2407,6 +2409,7 @@ static void page_end(FILE *f) {
         "function btPairStatus(t){const el=$('btPairStatus');if(el)el.textContent=t||'';}"
         "function btMaybeFillAddr(raw){raw=String(raw||'');let m=raw.match(/ACL\\s+([0-9A-F]{2}(?::[0-9A-F]{2}){5})/i)||raw.match(/dev_([0-9A-F]{2}(?:_[0-9A-F]{2}){5})/i);if(m){const addr=m[1].replace(/_/g,':').toUpperCase(),el=$('btAddr');if(el&&!el.value.trim()){el.value=addr;btAppend('target address detected: '+addr);}}}"
         "function btSummarizeAdapter(raw){raw=String(raw||'');const addr=(raw.match(/BD Address:\\s*([0-9A-F:]{17})/i)||[])[1]||'',name=(raw.match(/Name:\\s*'([^']+)'/i)||[])[1]||'',mode=(raw.match(/UP RUNNING[^\\n]*/)||[])[0]||'',disc=/\"Discoverable\"[\\s\\S]{0,80}boolean true/.test(raw),pair=/\"Pairable\"[\\s\\S]{0,80}boolean true/.test(raw);return [name?('Name: '+name):'',addr?('Address: '+addr):'',mode?('Mode: '+mode.trim()):'',('Discoverable: '+(disc?'yes':'no')),('Pairable: '+(pair?'yes':'no'))].filter(Boolean).join('\\n')+'\\n\\n'+raw;}"
+        "async function btRuntimeStatus(){try{const j=await (await fetch('/api/bt-text-status')).json(),s=$('btRuntimeStatus');const lines=['Runtime: '+(j.runtime?'running':'missing'),'State: '+(j.state||'unknown'),j.target?('Target: '+j.target):'Target: none','Sent: '+(j.sent||0)+'  Skipped: '+(j.skipped||0),j.error?('Note: '+j.error):''];if(s)s.textContent=lines.filter(Boolean).join('\\n');btAppend('FIFO runtime '+(j.runtime?j.state:'missing'));return j;}catch(e){const s=$('btRuntimeStatus');if(s)s.textContent='Runtime status failed: '+(e.message||e);btAppend('runtime status failed: '+(e.message||e));}}"
         "async function btPost(action,extra,quiet){const data=Object.assign(btFields(),extra||{},{action:action});if(!quiet)btLog(action+'...');try{const j=await postJson('/api/bt-call',data);if(j.detectedAddress){const el=$('btAddr');if(el&&!el.value.trim())el.value=j.detectedAddress;btAppend('target address detected: '+j.detectedAddress);}if(['pairing_on','pairing_off','adapter_status'].includes(action)){btPairStatus(btSummarizeAdapter(j.responseRaw||''));btMaybeFillAddr(j.responseRaw||'');}if(j.connectionRaw)btMaybeFillAddr(j.connectionRaw);if(!quiet)btLog(JSON.stringify(j,null,2));return j;}catch(e){if(quiet)throw e;btLog(action+' failed: '+(e.message||e));}}"
         "function btSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
         "function btDelay(){let v=parseInt($('btScriptDelay')?.value||'35',10);if(!Number.isFinite(v))v=35;v=Math.max(15,Math.min(5000,v));const e=$('btScriptDelay');if(e)e.value=String(v);return v;}"
@@ -2418,8 +2421,8 @@ static void page_end(FILE *f) {
         "function btParseScript(){const steps=[],notes=[],raw=$('btScript')?.value||'';raw.replace(/\\r/g,'').split('\\n').forEach((line,i)=>{const n=i+1,clean=line.trim();if(!clean||clean.startsWith('#')||clean.startsWith('//'))return;const m=clean.match(/^([^\\s]+)\\s*(.*)$/),op=(m?m[1]:clean).toUpperCase(),arg=m?(m[2]||''):'';if(op==='WAIT'||op==='SLEEP'){let ms=/s$/i.test(arg.trim())?parseFloat(arg)*1000:parseInt(arg,10);if(!Number.isFinite(ms)||ms<0)notes.push('line '+n+': invalid wait');else steps.push({kind:'wait',ms:Math.min(10000,Math.max(0,ms)),line:n});}else if(op==='TEXT'||op==='TYPE'){btAddText(arg,steps,notes,n);}else if(op==='KEY'||op==='SEND'||op==='PRESS'){const c=btCleanKey(arg);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': missing key name');}else if(op==='COMBO'||op==='HOTKEY'){const c=btComboCode(arg);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': missing combo');}else{const c=btCleanKey(clean);if(c)steps.push({kind:'key',code:c,line:n});else notes.push('line '+n+': unsupported line');}});return{steps:steps,notes:notes};}"
         "function btPreviewScript(){const p=$('btScriptPreview'),r=btParseScript(),shown=r.steps.slice(0,160).map((s,i)=>String(i+1).padStart(3,' ')+'. '+(s.kind==='wait'?'WAIT '+s.ms+' ms':(s.kind==='text'?'TEXT '+JSON.stringify(s.text):'KEY '+s.code)));const more=r.steps.length>shown.length?'\\n... '+(r.steps.length-shown.length)+' more steps':'';if(p)p.textContent=(r.steps.length?shown.join('\\n')+more:'No script steps found.')+(r.notes.length?'\\n\\nNotes:\\n'+r.notes.join('\\n'):'');return r;}"
         "let btScriptStop=false,btScriptRunning=false;function btScriptButtons(on){btScriptRunning=on;['btScriptRun','btScriptPreviewBtn'].forEach(id=>{const e=$(id);if(e)e.disabled=on;});}"
-        "async function btRunScript(){if(btScriptRunning)return;const r=btPreviewScript(),gap=btDelay(),chunkSize=24,releaseAll='hex:A101000000000000000000';if(!r.steps.length){btAppend('script has no steps');return;}btScriptStop=false;btScriptButtons(true);let sent=0,buf=[];async function sendKeyChunk(keys,label){if(!keys.length)return;const input=$('btCode');if(input)input.value=keys.join('\\n');btAppend(label+': '+keys.length+' keys, '+gap+' ms after release');const j=await btPost('reportseq',{code:keys.join('\\n'),gapMs:String(gap)},true);sent+=keys.length;const tail=String(j.responseRaw||'').trim();btAppend('key chunk ok: '+tail.slice(0,180));await btSleep(25);}async function flush(){if(!buf.length)return;const keys=buf.slice();buf=[];await sendKeyChunk(keys,'send key chunk');}async function sendTextFallback(text){let keys=[],skipped=0;for(const ch of Array.from(text)){const c=btCharCode(ch);if(c)keys.push(c);else skipped++;if(keys.length>=chunkSize){await sendKeyChunk(keys,'fallback text chunk');keys=[];}}if(keys.length)await sendKeyChunk(keys,'fallback text chunk');if(skipped)btAppend('fallback skipped '+skipped+' unsupported text chars');}async function sendText(text){await flush();btAppend('send text: '+text.length+' chars through keyboard FIFO');try{const j=await postJson('/api/bt-text',{text:text});sent+=text.length;btAppend('text ok: '+(j.bytes||text.length)+' bytes');await btSleep(gap);}catch(e){btAppend('FIFO text unavailable, using paired HID reports: '+(e.message||e));await sendTextFallback(text);}}btAppend('script start: '+r.steps.length+' steps, '+gap+' ms post-step gap');try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);for(const step of r.steps){if(btScriptStop){await flush();btAppend('script stopped after '+sent+' units');break;}if(step.kind==='wait'){await flush();btAppend('wait '+step.ms+' ms');await btSleep(step.ms);continue;}if(step.kind==='text'){await sendText(step.text);continue;}buf.push(step.code);if(buf.length>=chunkSize)await flush();}if(!btScriptStop){await flush();btAppend('script complete: '+sent+' units');}}catch(e){btAppend('script failed: '+(e.message||e));}finally{try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);btAppend('release all sent');}catch(e){}btScriptButtons(false);}}"
-        "const btPairOn=$('btPairingOn');if(btPairOn)btPairOn.addEventListener('click',()=>btPost('pairing_on'));const btPairOff=$('btPairingOff');if(btPairOff)btPairOff.addEventListener('click',()=>btPost('pairing_off'));const btAdapter=$('btAdapterStatus');if(btAdapter)btAdapter.addEventListener('click',()=>btPost('adapter_status'));const btClassic=$('btClassicScan');if(btClassic)btClassic.addEventListener('click',()=>btPost('classic_scan'));const btScan=$('btScan');if(btScan)btScan.addEventListener('click',()=>btPost('scan'));const btStatus=$('btStatus');if(btStatus)btStatus.addEventListener('click',()=>btPost('status'));const btConnect=$('btConnect');if(btConnect)btConnect.addEventListener('click',()=>btPost('connect'));const btDisconnect=$('btDisconnect');if(btDisconnect)btDisconnect.addEventListener('click',()=>btPost('disconnect'));const btSend=$('btSend');if(btSend)btSend.addEventListener('click',()=>btPost('report'));const btRelease=$('btReleaseAll');if(btRelease)btRelease.addEventListener('click',()=>btPost('report',{code:'hex:A101000000000000000000',gapMs:String(btDelay())}));const btEnter=$('btEnterTest');if(btEnter)btEnter.addEventListener('click',()=>{const input=$('btCode');if(input)input.value='enter';btPost('report',{code:'enter'});});const btPrev=$('btScriptPreviewBtn');if(btPrev)btPrev.addEventListener('click',btPreviewScript);const btRun=$('btScriptRun');if(btRun)btRun.addEventListener('click',btRunScript);const btStop=$('btScriptStop');if(btStop)btStop.addEventListener('click',()=>{btScriptStop=true;btAppend('stop requested');});document.querySelectorAll('[data-bt-code]').forEach(b=>b.addEventListener('click',()=>{const c=b.dataset.btCode||'';const input=$('btCode');if(input)input.value=c;btPost('report',{code:c});}));"
+        "async function btRunScript(){if(btScriptRunning)return;const r=btPreviewScript(),gap=btDelay(),chunkSize=24,releaseAll='hex:A101000000000000000000';if(!r.steps.length){btAppend('script has no steps');return;}btScriptStop=false;btScriptButtons(true);let sent=0,buf=[];await btRuntimeStatus();async function sendKeyChunk(keys,label){if(!keys.length)return;const input=$('btCode');if(input)input.value=keys.join('\\n');btAppend(label+': '+keys.length+' keys, '+gap+' ms after release');const j=await btPost('reportseq',{code:keys.join('\\n'),gapMs:String(gap)},true);sent+=keys.length;const tail=String(j.responseRaw||'').trim();btAppend('key chunk ok: '+tail.slice(0,180));await btSleep(25);}async function flush(){if(!buf.length)return;const keys=buf.slice();buf=[];await sendKeyChunk(keys,'send key chunk');}async function sendTextFallback(text){let keys=[],skipped=0;for(const ch of Array.from(text)){const c=btCharCode(ch);if(c)keys.push(c);else skipped++;if(keys.length>=chunkSize){await sendKeyChunk(keys,'fallback text chunk');keys=[];}}if(keys.length)await sendKeyChunk(keys,'fallback text chunk');if(skipped)btAppend('fallback skipped '+skipped+' unsupported text chars');}async function sendText(text){await flush();btAppend('send text: '+text.length+' chars through keyboard FIFO');try{const j=await postJson('/api/bt-text',{text:text});sent+=text.length;btAppend('text ok: '+(j.bytes||text.length)+' bytes');await btSleep(gap);}catch(e){btAppend('FIFO text unavailable, using paired HID reports: '+(e.message||e));await sendTextFallback(text);}}btAppend('script start: '+r.steps.length+' steps, '+gap+' ms post-step gap');try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);for(const step of r.steps){if(btScriptStop){await flush();btAppend('script stopped after '+sent+' units');break;}if(step.kind==='wait'){await flush();btAppend('wait '+step.ms+' ms');await btSleep(step.ms);continue;}if(step.kind==='text'){await sendText(step.text);continue;}buf.push(step.code);if(buf.length>=chunkSize)await flush();}if(!btScriptStop){await flush();btAppend('script complete: '+sent+' units');}}catch(e){btAppend('script failed: '+(e.message||e));}finally{try{await btPost('report',{code:releaseAll,gapMs:String(gap)},true);btAppend('release all sent');}catch(e){}btScriptButtons(false);btRuntimeStatus();}}"
+        "const btPairOn=$('btPairingOn');if(btPairOn)btPairOn.addEventListener('click',()=>btPost('pairing_on'));const btPairOff=$('btPairingOff');if(btPairOff)btPairOff.addEventListener('click',()=>btPost('pairing_off'));const btAdapter=$('btAdapterStatus');if(btAdapter)btAdapter.addEventListener('click',()=>btPost('adapter_status'));const btRuntime=$('btRuntimeRefresh');if(btRuntime)btRuntime.addEventListener('click',btRuntimeStatus);const btClassic=$('btClassicScan');if(btClassic)btClassic.addEventListener('click',()=>btPost('classic_scan'));const btScan=$('btScan');if(btScan)btScan.addEventListener('click',()=>btPost('scan'));const btStatus=$('btStatus');if(btStatus)btStatus.addEventListener('click',()=>btPost('status'));const btConnect=$('btConnect');if(btConnect)btConnect.addEventListener('click',()=>btPost('connect'));const btDisconnect=$('btDisconnect');if(btDisconnect)btDisconnect.addEventListener('click',()=>btPost('disconnect'));const btSend=$('btSend');if(btSend)btSend.addEventListener('click',()=>btPost('report'));const btRelease=$('btReleaseAll');if(btRelease)btRelease.addEventListener('click',()=>btPost('report',{code:'hex:A101000000000000000000',gapMs:String(btDelay())}));const btEnter=$('btEnterTest');if(btEnter)btEnter.addEventListener('click',()=>{const input=$('btCode');if(input)input.value='enter';btPost('report',{code:'enter'});});const btPrev=$('btScriptPreviewBtn');if(btPrev)btPrev.addEventListener('click',btPreviewScript);const btRun=$('btScriptRun');if(btRun)btRun.addEventListener('click',btRunScript);const btStop=$('btScriptStop');if(btStop)btStop.addEventListener('click',()=>{btScriptStop=true;btAppend('stop requested');});document.querySelectorAll('[data-bt-code]').forEach(b=>b.addEventListener('click',()=>{const c=b.dataset.btCode||'';const input=$('btCode');if(input)input.value=c;btPost('report',{code:c});}));btRuntimeStatus();"
         "const LAB_AUTO_DEVICE='__auto_lab__';const lab={queue:[],index:[],cursor:0,key:'',running:false,stop:false,imported:false,runId:'',streaming:false};"
         "function labStatus(t){const s=$('labStatus');if(s)s.textContent=t||'';}function labSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
         "function labNum(id,def,min,max){let v=parseInt($(id)?.value||def,10);if(!Number.isFinite(v))v=def;v=Math.max(min,Math.min(max,v));const e=$(id);if(e)e.value=String(v);return v;}"
@@ -2774,7 +2777,8 @@ static void bluetooth_panel(FILE *f) {
         fprintf(f, "</button>");
     }
     fprintf(f, "</div><div class='actions'><button id='btSend' type='button'>Send Key</button><button id='btEnterTest' type='button' class='secondary'>Test Enter</button><button id='btReleaseAll' type='button' class='danger'>Release All</button></div>");
-    fprintf(f, "<h3 style='margin-top:18px'>Keyboard Script</h3><div class='bt-script-layout'><div><label>Script</label><textarea id='btScript' class='textarea-tall' spellcheck='false' placeholder='TEXT hello from harmony&#10;WAIT 300&#10;KEY enter&#10;COMBO ctrl+l&#10;TEXT https://home-assistant.io&#10;KEY enter'></textarea></div><div class='bt-script-tools'><div class='callout'><strong>Syntax</strong>TEXT words, KEY enter, COMBO ctrl+l, WAIT 500. Bare key names are sent as KEY lines. Text is sent in small press-release chunks for accuracy.</div><label>Gap between reports (ms)</label><input id='btScriptDelay' inputmode='numeric' value='35'><div class='actions'><button id='btScriptPreviewBtn' type='button' class='secondary'>Preview</button><button id='btScriptRun' type='button'>Run Script</button><button id='btScriptStop' type='button' class='danger'>Stop</button></div></div></div><pre id='btScriptPreview' class='mini' style='margin-top:12px'>Paste a script to preview or run.</pre></div></div>");
+    fprintf(f, "<div class='callout' style='margin-top:14px'><strong>Text runtime</strong> The FIFO keyboard runtime sends TEXT script lines as exact press-release pairs through /tmp/bthid_input. It falls back to report chunks only when the runtime is unavailable.</div><div class='actions'><button id='btRuntimeRefresh' type='button' class='secondary'>Refresh Runtime</button></div><pre id='btRuntimeStatus' class='mini'>Runtime status has not loaded yet.</pre>");
+    fprintf(f, "<h3 style='margin-top:18px'>Keyboard Script</h3><div class='bt-script-layout'><div><label>Script</label><textarea id='btScript' class='textarea-tall' spellcheck='false' placeholder='TEXT hello from harmony&#10;WAIT 300&#10;KEY enter&#10;COMBO ctrl+l&#10;TEXT https://home-assistant.io&#10;KEY enter'></textarea></div><div class='bt-script-tools'><div class='callout'><strong>Syntax</strong>TEXT words, KEY enter, COMBO ctrl+l, WAIT 500. Bare key names are sent as KEY lines. Text uses the FIFO runtime for accuracy, with report chunks as a fallback.</div><label>Gap between reports (ms)</label><input id='btScriptDelay' inputmode='numeric' value='35'><div class='actions'><button id='btScriptPreviewBtn' type='button' class='secondary'>Preview</button><button id='btScriptRun' type='button'>Run Script</button><button id='btScriptStop' type='button' class='danger'>Stop</button></div></div></div><pre id='btScriptPreview' class='mini' style='margin-top:12px'>Paste a script to preview or run.</pre></div></div>");
     fprintf(f, "<div class='panel'><h3>Bluetooth Log</h3><pre id='btLog' class='mini'>Ready. Start Pairing Mode, then pair from the target device.</pre></div></section>");
 }
 
@@ -3381,6 +3385,14 @@ static int bt_type_allowed(const char *type) {
         strcmp(type, "wii") == 0;
 }
 
+static void save_bthid_target(const char *type, const char *bdaddr) {
+    char buf[128];
+    if (!bt_type_allowed(type) || !safe_bt_addr(bdaddr) || strcmp(bdaddr, "00:00:00:00:00:00") == 0) return;
+    snprintf(buf, sizeof(buf), "type=%s\nbdaddr=%s\n", type, bdaddr);
+    write_file_atomic(BT_TARGET_FILE, buf, strlen(buf));
+    chmod(BT_TARGET_FILE, 0644);
+}
+
 static int run_hal_json(const char *cmd_name, const char *params_json, int timeout, char *out, size_t outlen) {
     char esc_cmd[128], esc_params[2048], cmd[2400];
     if (timeout < 1) timeout = 1;
@@ -3600,7 +3612,16 @@ static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
     }
     fd = open(BT_TEXT_FIFO, O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
-        snprintf(err, errlen, "Bluetooth text FIFO is not available; start bthid_keyboard first");
+        char status[512];
+        if (read_text(BT_TEXT_STATUS, status, sizeof(status)) > 0 && strstr(status, "\"runtime\":true")) {
+            if (strstr(status, "\"state\":\"no_target\"")) {
+                snprintf(err, errlen, "Bluetooth text runtime is waiting for a paired target");
+            } else {
+                snprintf(err, errlen, "Bluetooth text runtime is not ready for FIFO writes");
+            }
+        } else {
+            snprintf(err, errlen, "Bluetooth text FIFO is not available; start bthid_keyboard first");
+        }
         return -1;
     }
     while (off < len) {
@@ -3638,6 +3659,19 @@ static void render_bluetooth_text_json(int fd, const struct request *req) {
     fputs("{\"ok\":true,\"path\":\"/api/bt-text\",\"bytes\":", f);
     fprintf(f, "%lu", (unsigned long)strlen(text));
     fputs("}\n", f);
+    fclose(f);
+}
+
+static void render_bluetooth_text_status_json(int fd) {
+    char raw[1024];
+    FILE *f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    if (read_text(BT_TEXT_STATUS, raw, sizeof(raw)) > 0 && raw[0] == '{') {
+        fputs(raw, f);
+        if (raw[strlen(raw) - 1] != '\n') fputc('\n', f);
+    } else {
+        fputs("{\"ok\":true,\"runtime\":false,\"state\":\"missing\",\"target\":\"\",\"sent\":0,\"skipped\":0,\"error\":\"Bluetooth FIFO runtime is not running\"}\n", f);
+    }
     fclose(f);
 }
 
@@ -3773,6 +3807,12 @@ static void render_bluetooth_call_json(int fd, const struct request *req) {
             fputs("{\"ok\":false,\"error\":\"invalid Bluetooth address or PIN\"}\n", f);
             fclose(f);
             return;
+        }
+        if (strcmp(action, "disconnect") == 0) {
+            unlink(BT_TARGET_FILE);
+        } else if (strcmp(action, "connect") == 0 || strcmp(action, "status") == 0 ||
+            strcmp(action, "report") == 0 || strcmp(action, "reportseq") == 0) {
+            save_bthid_target(type, bdaddr);
         }
         jt = json_escape_alloc(type);
         ja = json_escape_alloc(bdaddr);
@@ -4166,6 +4206,8 @@ static void handle_client(int client) {
         render_ir_lab_clear_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-call") == 0) {
         render_bluetooth_call_json(client, &req);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/bt-text-status") == 0) {
+        render_bluetooth_text_status_json(client);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-text") == 0) {
         render_bluetooth_text_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/irdb-import") == 0) {

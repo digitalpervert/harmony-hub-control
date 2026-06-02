@@ -24,6 +24,14 @@ if [ -x /data/codex/bin/codex_webui ]; then
   fi
 fi
 
+if [ -x /data/codex/bin/codex_bthid_keyboard ]; then
+  mkdir -p /cache/bin
+  ln -sf /data/codex/bin/codex_bthid_keyboard /cache/bin/bthid_keyboard
+  if ! ps | grep '[c]odex_bthid_keyboard' >/dev/null 2>&1; then
+    /data/codex/bin/codex_bthid_keyboard >> "$LOG" 2>&1 &
+  fi
+fi
+
 if [ -x /data/codex/recovery_ap.sh ]; then
   if [ ! -f /var/run/codex-recovery-monitor.pid ]; then
     /data/codex/recovery_ap.sh monitor >> "$LOG" 2>&1 &

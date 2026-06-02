@@ -57,8 +57,10 @@ already rooted Logitech Harmony Hub.
 - Learned IR signals should be testable before saving.
 - The IR sweep page should favor fast staging in browser memory and hub-side
   batch sends that can be stopped.
-- Bluetooth HID keystroke accuracy matters. Prefer FIFO writes that emit
-  complete press/release frames per key and avoid long key-held repeats.
+- Bluetooth HID keystroke accuracy matters. Prefer the included FIFO runtime
+  (`/data/codex/bin/codex_bthid_keyboard`, symlinked as
+  `/cache/bin/bthid_keyboard`) for text; it emits complete press/release frames
+  per key and avoids long key-held repeats.
 - MQTT should publish enough state for Home Assistant debugging, including IP
   address and bridge health.
 

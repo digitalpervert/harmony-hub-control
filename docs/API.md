@@ -108,6 +108,12 @@ Invoke-RestMethod "http://<hub-ip>:8080/api/bt-call" -Method Post -Body @{
 }
 ```
 
+Check the FIFO keyboard runtime:
+
+```powershell
+Invoke-RestMethod "http://<hub-ip>:8080/api/bt-text-status"
+```
+
 Send exact text through the keyboard FIFO runtime:
 
 ```powershell
@@ -116,8 +122,10 @@ Invoke-RestMethod "http://<hub-ip>:8080/api/bt-text" -Method Post -Body @{
 }
 ```
 
-This requires `/cache/bin/bthid_keyboard` to be running and reading
-`/tmp/bthid_input`. It is the preferred path for accurate plain text.
+The installer starts `/data/codex/bin/codex_bthid_keyboard` automatically and
+creates `/cache/bin/bthid_keyboard` as a friendly symlink. The runtime reads
+`/tmp/bthid_input`, sends exact press/release reports for ASCII text, and uses
+the paired target saved by the Bluetooth controls.
 
 Send a named key or shortcut through the low-level HID report path:
 

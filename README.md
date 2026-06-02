@@ -21,7 +21,7 @@ MQTT credentials, firmware dumps, or personal backups.
 - The IR sweep page can stage large command sets in browser memory, import
   selected commands to the hub, and send them in cancellable batches.
 - Bluetooth HID mode can expose the hub as a keyboard-class device and send
-  keystroke scripts through the hub-side FIFO runtime.
+  keystroke scripts through the auto-started hub-side FIFO runtime.
 - MQTT bridge publishes Home Assistant discovery and exposes hub/device state.
 - Recovery helpers can start a local AP workflow from the reset button path.
 
