@@ -983,6 +983,7 @@ static int find_ir_device_by_name(const char *name, char *device_id, size_t devi
 }
 
 static void capture_ir_command_action(char *out, size_t outlen);
+static int find_device_command_array(const char *raw, const char *device_id, const char **arr, const char **arr_end);
 
 static void render_inventory_json(int fd) {
     char *raw;
@@ -1062,6 +1063,69 @@ static void render_inventory_json(int fd) {
         p = dev_end + 1;
     }
     fputs("]}\n", f);
+    fclose(f);
+    free(raw);
+}
+
+static void render_device_commands_json(int fd, const struct request *req) {
+    char device_id[64];
+    char *raw;
+    size_t len = 0;
+    const char *arr, *arr_end, *cpos;
+    int emitted = 0;
+    FILE *f;
+    if (strcmp(req->method, "POST") == 0) {
+        form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    } else {
+        query_value(req->path, "deviceId", device_id, sizeof(device_id));
+    }
+    if (!safe_label(device_id)) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"invalid IR device id\"}\n", f);
+        fclose(f);
+        return;
+    }
+    repair_known_protocols_for_current_commands();
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw || find_device_command_array(raw, device_id, &arr, &arr_end) != 0) {
+        free(raw);
+        f = send_json_start(fd, "404 Not Found");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"device not found\"}\n", f);
+        fclose(f);
+        return;
+    }
+    f = send_json_start(fd, "200 OK");
+    if (!f) {
+        free(raw);
+        return;
+    }
+    fputs("{\"ok\":true,\"deviceId\":", f); json_write_string(f, device_id);
+    fputs(",\"commands\":[", f);
+    cpos = arr + 1;
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end) {
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        char cid[32], cmd_name[128], keycode[256];
+        long cid_num;
+        int has_raw;
+        if (!obj_end || obj_end > arr_end) break;
+        cid_num = json_long_range(cpos, obj_end, "Id-", 0);
+        snprintf(cid, sizeof(cid), "%ld", cid_num);
+        json_string_range(cpos, obj_end, "Name", cmd_name, sizeof(cmd_name));
+        json_string_range(cpos, obj_end, "KeyCode", keycode, sizeof(keycode));
+        has_raw = json_has_nonnull_value(cpos, obj_end, "Raw") && !keycode[0];
+        if (emitted++) fputc(',', f);
+        fputs("{\"id\":", f); json_write_string(f, cid);
+        fputs(",\"name\":", f); json_write_string(f, cmd_name);
+        fputs(",\"keycode\":", f); json_write_string(f, keycode);
+        fprintf(f, ",\"protocolId\":%ld,\"learned\":%s,\"raw\":%s}",
+            json_long_range(cpos, obj_end, "ProtocolId", 0),
+            json_bool_range(cpos, obj_end, "IsLearned", 0) ? "true" : "false",
+            has_raw ? "true" : "false");
+        cpos = obj_end + 1;
+    }
+    fprintf(f, "],\"count\":%d}\n", emitted);
     fclose(f);
     free(raw);
 }
@@ -2326,6 +2390,7 @@ static void page_end(FILE *f) {
         "async function loadWizardInventory(){try{const r=await fetch('/api/inventory');wizardInventory=await r.json();}catch(e){wizardInventory=null;}populateVerifyCommands();}"
         "function selectedDeviceId(id){const el=$(id);return el?el.value:'';}"
         "function currentCommandsFor(id){const dev=(wizardInventory&&wizardInventory.devices||[]).find(d=>d.id===id);return dev&&dev.commands?dev.commands:[];}"
+        "async function loadDeviceCommands(id){if(!id)return[];try{const j=await(await fetch('/api/device-commands?deviceId='+encodeURIComponent(id))).json();if(j.ok&&Array.isArray(j.commands))return j.commands;}catch(e){}return currentCommandsFor(id);}"
         "function populateVerifyCommands(){const dev=selectedDeviceId('verifyDevice')||selectedDeviceId('wizardDevice'),sel=$('verifyCommand');if(!sel)return;sel.replaceChildren();currentCommandsFor(dev).forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name;sel.append(o);});const typed=($('wizardCommandName')?.value||'').trim();if(typed&&!Array.from(sel.options).some(o=>o.value===typed)){const o=document.createElement('option');o.value=typed;o.textContent=typed;sel.prepend(o);sel.value=typed;}}"
         "function syncWizardDevice(from,to){const a=$(from),b=$(to);if(a&&b)b.value=a.value;populateVerifyCommands();}"
         "const wizDevice=$('wizardDevice');if(wizDevice)wizDevice.addEventListener('change',()=>{syncWizardDevice('wizardDevice','verifyDevice');const imp=$('irdbDevice');if(imp)imp.value=wizDevice.value;});"
@@ -2364,7 +2429,7 @@ static void page_end(FILE *f) {
         "function panasonicRaw(d,s,f){d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?0:Number(s);f=Number(f);if(![d,s,f].every(x=>Number.isFinite(x)&&x>=0&&x<=255))return'';const seq=[],bytes=[2,32,d&255,s&255,f&255,(d^s^f)&255];pulse(seq,1,3456);pulse(seq,0,1728);bytes.flatMap(b=>lsbBits(b,8)).forEach(b=>{pulse(seq,1,432);pulse(seq,0,b?1296:432);});pulse(seq,1,432);pulse(seq,0,74400);return seqRaw(37000,seq);}"
         "function csvProtocolRaw(proto,d,s,f){proto=String(proto||'');const D=Number(d),F=Number(f),S=String(s===undefined?'':s).trim();if(!Number.isFinite(D)||!Number.isFinite(F)||D<0||F<0)return'';if(/^RC5X?/i.test(proto))return rc5Raw({address:D.toString(16),command:F.toString(16),toggle:'0'});if(/^RC6/i.test(proto))return rc6Raw({address:D.toString(16),command:F.toString(16),toggle:'0'});if(/^JVC$/i.test(proto))return jvcRaw(D,F);if(/^Panasonic$/i.test(proto))return panasonicRaw(D,S,F);if(/^RCA(?:-38)?$/i.test(proto))return rcaRaw(proto,D,F);if(/^Sony(12|15|20)?/i.test(proto)){const bits=(proto.match(/Sony(\\d+)/i)||[])[1]||'12';let addr=D;if(bits==='20'&&S&&S!=='-1'){const sub=Number(S);if(Number.isFinite(sub)&&sub>=0)addr=(D&31)|((sub&255)<<5);}return sircRaw({address:addr.toString(16),command:F.toString(16)},'SIRC'+bits);}return'';}"
         "function prontoToHarmonyRaw(hex){const words=String(hex||'').trim().split(/\\s+/).filter(Boolean).map(x=>parseInt(x,16));if(words.length<8||words.some(x=>!Number.isFinite(x)))return'';if(words[0]!==0)return'';const unit=(words[1]||1)*0.241246,freq=Math.round(1000000/unit),pairs=(words[2]||0)+(words[3]||0),vals=words.slice(4,4+pairs*2).map(w=>Math.round(w*unit));return harmonyRawFromTimings(freq,vals);}"
-        "function flipperEntries(t){const out=[];let cur={};function push(){if(!cur.name){cur={};return;}let key='',raw='',meta=(cur.protocol||cur.type||'raw');if(cur.type==='parsed'){const a=hexBytes(cur.address),c=hexBytes(cur.command),p=cur.protocol||'';if(/^Samsung32/i.test(p))key=keyFromParts(p,a[0],a[0],c[0]);else if(/^NECext/i.test(p))key=keyFromParts(p,a[0],a[1],c[0]);else if(/^NEC/i.test(p))key=keyFromParts(p,a[0],a[0]^255,c[0]);else if(/^RC5/i.test(p)){raw=rc5Raw(cur);meta=raw?'RC5 converted timing':'RC5 unsupported';}else if(/^RC6/i.test(p)){raw=rc6Raw(cur);meta=raw?'RC6 converted timing':'RC6 unsupported';}else if(/^SIRC/i.test(p)){raw=sircRaw(cur,p);meta=raw?p+' converted timing':p+' unsupported';}}else if(cur.type==='raw'){const vals=String(cur.data||'').trim().split(/\\s+/).filter(Boolean).map(Number);raw=harmonyRawFromTimings(cur.frequency||38000,vals);meta='raw timings '+(cur.frequency||38000)+' Hz ('+vals.length+' durations)';}out.push({name:cur.name,meta:meta,keycode:key,raw:raw});cur={};}t.replace(/\\r/g,'').split('\\n').forEach(line=>{line=line.trim();if(!line)return;if(line[0]==='#'){push();return;}const i=line.indexOf(':');if(i<0)return;const k=line.slice(0,i).trim(),v=line.slice(i+1).trim();if(k==='name'&&cur.name)push();cur[k]=cur[k]&&k==='data'?cur[k]+' '+v:v;});push();return out;}"
+        "function flipperEntries(t){const out=[];let cur={};function push(){if(!cur.name){cur={};return;}let key='',raw='',meta=(cur.protocol||cur.type||'raw');if(String(cur.type||'').toLowerCase()==='parsed'){const a=hexBytes(cur.address),c=hexBytes(cur.command),p=cur.protocol||'';if(/^Samsung32/i.test(p))key=keyFromParts(p,a[0],a[0],c[0]);else if(/^NECext/i.test(p))key=keyFromParts(p,a[0],a[1],c[0]);else if(/^NEC/i.test(p))key=keyFromParts(p,a[0],a[0]^255,c[0]);else if(/^RC5/i.test(p)){raw=rc5Raw(cur);meta=raw?'RC5 converted timing':'RC5 unsupported';}else if(/^RC6/i.test(p)){raw=rc6Raw(cur);meta=raw?'RC6 converted timing':'RC6 unsupported';}else if(/^SIRC/i.test(p)){raw=sircRaw(cur,p);meta=raw?p+' converted timing':p+' unsupported';}}else if(String(cur.type||'').toLowerCase()==='raw'){const vals=String(cur.data||'').trim().split(/\\s+/).filter(Boolean).map(Number);raw=harmonyRawFromTimings(cur.frequency||38000,vals);meta='raw timings '+(cur.frequency||38000)+' Hz ('+vals.length+' durations)';}out.push({name:cur.name,meta:meta,keycode:key,raw:raw});cur={};}t.replace(/\\r/g,'').split('\\n').forEach(line=>{line=line.trim();if(!line)return;if(line[0]==='#'){push();return;}const i=line.indexOf(':');if(i<0)return;const k=line.slice(0,i).trim().toLowerCase(),v=line.slice(i+1).trim();if(k==='name'&&cur.name)push();cur[k]=cur[k]&&k==='data'?cur[k]+' '+v:v;});push();return out;}"
         "function irdbStatus(t){const s=$('irdbStatus');if(s)s.textContent=t;}"
         "function irdbLog(t){const l=$('irdbLog');if(!l)return;let p=l.textContent||'';if(/^Ready\\./.test(p))p='';l.textContent=(t?new Date().toLocaleTimeString()+'  '+t+'\\n':'')+p.slice(0,6000);}"
         "function clearIrdPreview(){const p=$('irdbPayload'),box=$('irdbPreview');if(p)p.value='';if(box){box.replaceChildren();box.classList.add('hidden');}}"
@@ -2441,13 +2506,13 @@ static void page_end(FILE *f) {
         "function labUniqueName(base){base=safeImportName(base);let name=base,n=2,seen=new Set(lab.queue.map(x=>x.name));while(seen.has(name)){name=(base+' '+n++).slice(0,96);}return name;}"
         "function labSelected(){return Array.from(document.querySelectorAll('#labQueue input.labPick:checked')).map(cb=>lab.queue[Number(cb.dataset.i)]).filter(Boolean);}"
         "function labPayloadLines(rows){return (rows||labSelected()).filter(r=>!r.stored&&(r.keycode||r.raw)).map(r=>r.raw?r.name+'|raw|'+r.raw:r.name+'|'+r.keycode);}function labPayload(rows){return labPayloadLines(rows).join('\\n');}"
-        "function labRender(){const box=$('labQueue');if(!box)return;box.replaceChildren();if(!lab.queue.length){const d=document.createElement('div');d.className='muted mini';d.textContent='No commands queued.';box.append(d);labMeter(0,1);labSummaryText();return;}lab.queue.forEach((r,i)=>{const row=document.createElement('label'),cb=document.createElement('input'),main=document.createElement('div'),tag=document.createElement('span');row.className='queue-row';cb.className='labPick';cb.type='checkbox';cb.checked=r.checked!==false;cb.dataset.i=i;cb.addEventListener('change',()=>{r.checked=cb.checked;labSummaryText();});const strong=document.createElement('strong'),meta=document.createElement('div');strong.textContent=r.name;meta.className='queue-meta';meta.textContent=(r.stored?'Saved':'Queued')+' / '+sourceLabel(r.source||'irdb')+' / '+(r.meta||r.path||'');tag.className='badge';tag.textContent=r.raw?'timing':(r.stored?'saved':'code');main.append(strong,meta);row.append(cb,main,tag);box.append(row);});labMeter(lab.queue.length,labNum('labMaxCommands',900,1,2000));labSummaryText();}"
-        "function labAddRows(rows,source,path){const max=labNum('labMaxCommands',900,1,2000);let added=0;for(const r of rows){if(lab.queue.length>=max)break;if(!(r.keycode||r.raw)||!labMatchName(r.name))continue;const src=r.source||source,pth=r.path||path,fp=(r.keycode||r.raw||'')+'|'+safeImportName(r.name);if(lab.queue.some(x=>((x.keycode||x.raw||'')+'|'+x.name)===fp))continue;lab.queue.push({source:src,path:pth,name:labUniqueName(r.name),meta:r.meta||'',keycode:r.keycode||'',raw:r.raw||'',stored:false,checked:true});added++;}lab.imported=false;labRender();return added;}"
+        "function labRender(){const box=$('labQueue');if(!box)return;box.replaceChildren();if(!lab.queue.length){const d=document.createElement('div');d.className='muted mini';d.textContent='No commands queued.';box.append(d);labMeter(0,1);labSummaryText();return;}lab.queue.forEach((r,i)=>{const row=document.createElement('label'),cb=document.createElement('input'),main=document.createElement('div'),tag=document.createElement('span');row.className='queue-row';cb.className='labPick';cb.type='checkbox';cb.checked=r.checked!==false;cb.dataset.i=i;cb.addEventListener('change',()=>{r.checked=cb.checked;labSummaryText();});const strong=document.createElement('strong'),meta=document.createElement('div');strong.textContent=r.name;meta.className='queue-meta';meta.textContent=(r.stored?'Saved':'Queued')+' / '+sourceLabel(r.source||'irdb')+' / '+(r.meta||r.path||'');tag.className='badge';tag.textContent=r.raw?'timing':(r.stored?'saved':'code');main.append(strong,meta);row.append(cb,main,tag);box.append(row);});labMeter(lab.queue.length,labNum('labMaxCommands',900,1,2048));labSummaryText();}"
+        "function labAddRows(rows,source,path){const max=labNum('labMaxCommands',900,1,2048);let added=0;for(const r of rows){if(lab.queue.length>=max)break;if(!(r.keycode||r.raw)||!labMatchName(r.name))continue;const src=r.source||source,pth=r.path||path,fp=(r.keycode||r.raw||'')+'|'+safeImportName(r.name);if(lab.queue.some(x=>((x.keycode||x.raw||'')+'|'+x.name)===fp))continue;lab.queue.push({source:src,path:pth,name:labUniqueName(r.name),meta:r.meta||'',keycode:r.keycode||'',raw:r.raw||'',stored:false,checked:true});added++;}lab.imported=false;labRender();return added;}"
         "async function labFetchEntry(e){if(e.source==='remotecentral'){const html=await rcFetch(e.path);return remoteCentralCommandEntries(html).map(r=>({...r,source:'remotecentral',path:e.path}));}let url=e.path.replace(/^codes\\//,'').replace(/^\\//,'');url=(e.source==='flipper'?FLIPPER_BASE:IRDB_BASE)+url;const r=await fetch(url);if(!r.ok)throw new Error('http '+r.status);const text=await r.text();return (e.source==='flipper'?flipperEntries(text):csvEntries(text)).map(r=>({...r,source:e.source,path:e.path}));}"
         "async function labEnsureIndex(){const key=labKey();if(key===lab.key&&lab.index.length)return;lab.key=key;lab.cursor=0;lab.index=[];const src=$('labSource')?.value||'all',q=($('labPathFilter')?.value||'').trim(),rc=($('labRcPath')?.value||'').trim();let rows=[];if(src==='remotecentral'&&rc){lab.index=[{source:'remotecentral',path:rc,score:1}];return;}const sourceNames=labSourceList();if(sourceNames.length){const lists=await Promise.all(sourceNames.map(loadIrdSource));rows=rows.concat(lists.flat().map(r=>q?{...r,score:scoreIrdPath(r,q)}:{...r,score:1}).filter(r=>r.score>=0));}if(q&&(src==='all'||src==='remotecentral')){try{rows=rows.concat(await remoteCentralEntries(q));}catch(e){labLog('RemoteCentral search skipped: '+(e.message||e));}}lab.index=rows.sort((a,b)=>(b.score||0)-(a.score||0)||String(a.path).length-String(b.path).length);}"
-        "async function labScanBatch(){try{const maxFiles=labNum('labMaxFiles',600,1,5000),pause=labNum('labFetchDelay',0,0,3000),maxCmd=labNum('labMaxCommands',900,1,2000),workers=labNum('labWorkers',14,1,24),before=lab.queue.length;labStatus('loading library index...');await labEnsureIndex();if(lab.cursor>=lab.index.length){labStatus('end of matching library files');return;}const state={files:0};async function worker(){while(lab.cursor<lab.index.length&&state.files<maxFiles&&lab.queue.length<maxCmd){const e=lab.index[lab.cursor++],n=++state.files;labStatus('fetching '+n+' / '+maxFiles+' with '+workers+' workers - '+e.path);try{labAddRows(await labFetchEntry(e),e.source,e.path);}catch(err){labLog('skip '+e.path+': '+(err.message||err));}labMeter(lab.cursor,lab.index.length);if(pause)await labSleep(pause);}}await Promise.all(Array.from({length:workers},worker));labStatus('queued '+(lab.queue.length-before)+' new commands from '+state.files+' files; cursor '+lab.cursor+' / '+lab.index.length);}catch(e){labStatus(e.message||String(e));}}"
-        "async function labUseStored(){if(!wizardInventory)await loadWizardInventory();const devId=await labResolveDevice(),dev=(wizardInventory&&wizardInventory.devices||[]).find(d=>d.id===devId);lab.queue=[];if(dev){dev.commands.forEach(c=>{if(labMatchName(c.name))lab.queue.push({source:'stored',stored:true,name:c.name,meta:'saved on '+(dev.name||devId),keycode:c.keycode||'',raw:''});});}lab.imported=true;labRender();labStatus('loaded '+lab.queue.length+' saved matching commands');}"
-        "async function labImportQueue(rowsArg){const rows=rowsArg||labSelected(),lines=labPayloadLines(rows),dev=await labResolveDevice();if(!lines.length){lab.imported=true;labStatus('selected commands are already saved');return true;}labStatus('saving '+lines.length+' commands...');const limit=420000;let part=[],size=0,done=0,last='';async function flush(){if(!part.length)return;let j;try{j=await postJson('/api/irdb-import',{deviceId:dev,payload:part.join('\\n')});}catch(e){if(!/No supported new/i.test(e.message||''))throw e;j={message:'No new commands were saved; using existing saved names.'};}done+=part.length;last=j.message||last;labLog((j.message||'saved')+' ('+done+' / '+lines.length+')');part=[];size=0;}for(const line of lines){const n=line.length+1;if(part.length&&size+n>limit)await flush();part.push(line);size+=n;}await flush();lab.imported=true;labStatus(last||'save complete');await labSleep(1000);await loadWizardInventory();const names=new Set(currentCommandsFor(dev).map(c=>c.name));rows.forEach(r=>{if(names.has(r.name))r.stored=true;});labRender();return true;}"
+        "async function labScanBatch(){try{const maxFiles=labNum('labMaxFiles',600,1,5000),pause=labNum('labFetchDelay',0,0,3000),maxCmd=labNum('labMaxCommands',900,1,2048),workers=labNum('labWorkers',14,1,24),before=lab.queue.length;labStatus('loading library index...');await labEnsureIndex();if(lab.cursor>=lab.index.length){labStatus('end of matching library files');return;}const state={files:0};async function worker(){while(lab.cursor<lab.index.length&&state.files<maxFiles&&lab.queue.length<maxCmd){const e=lab.index[lab.cursor++],n=++state.files;labStatus('fetching '+n+' / '+maxFiles+' with '+workers+' workers - '+e.path);try{labAddRows(await labFetchEntry(e),e.source,e.path);}catch(err){labLog('skip '+e.path+': '+(err.message||err));}labMeter(lab.cursor,lab.index.length);if(pause)await labSleep(pause);}}await Promise.all(Array.from({length:workers},worker));labStatus('queued '+(lab.queue.length-before)+' new commands from '+state.files+' files; cursor '+lab.cursor+' / '+lab.index.length);}catch(e){labStatus(e.message||String(e));}}"
+        "async function labUseStored(){if(!wizardInventory)await loadWizardInventory();const devId=await labResolveDevice(),dev=(wizardInventory&&wizardInventory.devices||[]).find(d=>d.id===devId),cmds=await loadDeviceCommands(devId);lab.queue=[];cmds.forEach(c=>{if(labMatchName(c.name))lab.queue.push({source:'stored',stored:true,name:c.name,meta:'saved on '+((dev&&dev.name)||devId),keycode:c.keycode||'',raw:''});});lab.imported=true;labRender();labStatus('loaded '+lab.queue.length+' saved matching commands');}"
+        "async function labImportQueue(rowsArg){const rows=rowsArg||labSelected(),lines=labPayloadLines(rows),dev=await labResolveDevice();if(!lines.length){lab.imported=true;labStatus('selected commands are already saved');return true;}labStatus('saving '+lines.length+' commands...');const limit=420000;let part=[],size=0,done=0,last='';async function flush(){if(!part.length)return;let j;try{j=await postJson('/api/irdb-import',{deviceId:dev,payload:part.join('\\n')});}catch(e){if(!/No supported new/i.test(e.message||''))throw e;j={message:'No new commands were saved; using existing saved names.'};}done+=part.length;last=j.message||last;labLog((j.message||'saved')+' ('+done+' / '+lines.length+')');part=[];size=0;}for(const line of lines){const n=line.length+1;if(part.length&&size+n>limit)await flush();part.push(line);size+=n;}await flush();lab.imported=true;labStatus(last||'save complete');await labSleep(1000);await loadWizardInventory();const saved=await loadDeviceCommands(dev),names=new Set(saved.map(c=>c.name));rows.forEach(r=>{if(names.has(r.name))r.stored=true;});labLog('verified '+names.size+' saved commands on '+dev);labRender();return true;}"
         "async function labClearLabTarget(dev){try{const j=await postJson('/api/ir-lab-clear',{deviceId:dev});labLog(j.message||'temporary device cleared');await labSleep(700);await loadWizardInventory();lab.queue.forEach(r=>{r.stored=false;});lab.imported=false;labRender();return true;}catch(e){labLog('temporary device clear failed: '+(e.message||e));return false;}}"
         "async function labCancelRun(){const id=lab.runId;if(!id)return;try{await postJson('/api/ir-cancel',{runId:id});labLog('cancel sent for '+id);}catch(e){labLog('cancel failed: '+(e.message||e));}}"
         "function labServerChunk(requested,delay){const maxHold=4000,byTime=Math.max(1,Math.floor(maxHold/Math.max(40,delay)));return Math.max(1,Math.min(requested,byTime,1024));}"
@@ -4059,6 +4124,7 @@ static void render_irdb_import_json(int fd, const struct request *req) {
     char device_id[64], msg[512];
     char *payload;
     FILE *f;
+    int rc;
     if (req->body_truncated) {
         f = send_json_start(fd, "413 Payload Too Large");
         if (!f) return;
@@ -4076,13 +4142,14 @@ static void render_irdb_import_json(int fd, const struct request *req) {
         return;
     }
     form_value(req->body, "payload", payload, MAX_REQUEST_BODY);
-    if (bulk_import_irdb_commands(device_id, payload, msg, sizeof(msg)) != 0) {
+    rc = bulk_import_irdb_commands(device_id, payload, msg, sizeof(msg));
+    if (rc != 0) {
         f = send_json_start(fd, "400 Bad Request");
     } else {
         f = send_json_start(fd, "200 OK");
     }
     if (f) {
-        fputs("{\"ok\":", f); fputs(strncmp(msg, "Imported ", 9) == 0 ? "true" : "false", f);
+        fputs("{\"ok\":", f); fputs(rc == 0 ? "true" : "false", f);
         fputs(",\"message\":", f); json_write_string(f, msg);
         fputs("}\n", f);
         fclose(f);
@@ -4218,6 +4285,10 @@ static void handle_client(int client) {
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/inventory") == 0) {
         render_inventory_json(client);
     } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) &&
+        strncmp(req.path, "/api/device-commands", 20) == 0 &&
+        (req.path[20] == 0 || req.path[20] == '?')) {
+        render_device_commands_json(client, &req);
+    } else if ((strcmp(req.method, "GET") == 0 || strcmp(req.method, "POST") == 0) &&
         strncmp(req.path, "/api/remotecentral-fetch", 24) == 0 &&
         (req.path[24] == 0 || req.path[24] == '?')) {
         render_remotecentral_fetch_json(client, &req);
@@ -4291,11 +4362,22 @@ static void reap_children(void) {
     errno = saved_errno;
 }
 
+static void handle_sigchld(int signo) {
+    (void)signo;
+    reap_children();
+}
+
 int main(int argc, char **argv) {
     int port = argc > 1 ? atoi(argv[1]) : 8080;
     int fd, one = 1;
+    struct sigaction sa;
     struct sockaddr_in addr;
     signal(SIGPIPE, SIG_IGN);
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigchld;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
