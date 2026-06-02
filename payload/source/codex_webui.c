@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -2412,7 +2413,7 @@ static void page_end(FILE *f) {
         "function rev8(v){v=((v&240)>>4)|((v&15)<<4);v=((v&204)>>2)|((v&51)<<2);v=((v&170)>>1)|((v&85)<<1);return v&255;}"
         "function keyFromParts(proto,d,s,f){if(!/^(NEC|Samsung32|Pioneer)/i.test(proto))return '';d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?(d^255):Number(s);f=Number(f);if([d,s,f].some(x=>!Number.isFinite(x)||x<0||x>255))return '';if(/^Samsung32/i.test(proto))s=d;const val=((rev8(d)<<24)|(rev8(s)<<16)|(rev8(f)<<8)|rev8((~f)&255))>>>0;return 'G:Toshiba 32 Bit:(0x'+val.toString(16).toUpperCase().padStart(8,'0')+')(Repeat)():3';}"
         "function csvCells(line){const out=[];let cur='',q=false;for(let i=0;i<line.length;i++){const ch=line[i];if(ch==='\"'){if(q&&line[i+1]==='\"'){cur+='\"';i++;}else q=!q;}else if(ch===','&&!q){out.push(cur);cur='';}else cur+=ch;}out.push(cur);return out.map(x=>x.trim());}"
-        "function csvEntries(t){return t.replace(/\\r/g,'').split('\\n').map(x=>x.trim()).filter(Boolean).map(line=>{const p=csvCells(line),proto=p[1]||'',key=p[0]==='functionname'?'':keyFromParts(proto,p[2]||'',p[3]||'',p[4]||''),raw=p[0]==='functionname'?'':csvProtocolRaw(proto,p[2]||'',p[3]||'',p[4]||'');return{name:p[0]||'',meta:proto+' '+(p[2]||'')+','+(p[3]||'')+','+(p[4]||''),protocol:proto,keycode:key,raw:raw};}).filter(r=>r.name&&r.name!=='functionname');}"
+        "function csvEntries(t){return t.replace(/\\r/g,'').split('\\n').map(x=>x.trim()).filter(Boolean).map(line=>{const p=csvCells(line),proto=p[1]||'',key=p[0]==='functionname'?'':keyFromParts(proto,p[2]||'',p[3]||'',p[4]||''),raw=p[0]==='functionname'?'':csvProtocolRaw(proto,p[2]||'',p[3]||'',p[4]||'',p[0]||'');return{name:p[0]||'',meta:proto+' '+(p[2]||'')+','+(p[3]||'')+','+(p[4]||''),protocol:proto,keycode:key,raw:raw};}).filter(r=>r.name&&r.name!=='functionname');}"
         "function hexBytes(v){return String(v||'').trim().split(/\\s+/).filter(Boolean).map(x=>parseInt(x,16)||0);}"
         "function hexValue(v){return hexBytes(v).slice(0,4).reduce((a,b,i)=>a|((b&255)<<(8*i)),0)>>>0;}"
         "function harmonyRawFromTimings(freq,vals){freq=Math.max(10000,Math.min(60000,Math.round(Number(freq)||38000)));vals=(vals||[]).map(v=>Math.max(1,Math.min(0xfffff,Math.round(Math.abs(Number(v)||0))))).filter(Boolean);if(vals.length<4)return'';let raw='F'+freq.toString(16).toUpperCase();vals.forEach((v,i)=>{raw+=(i%2?'S':'P')+v.toString(16).toUpperCase();});return raw.length<=4096?raw:'';}"
@@ -2423,13 +2424,21 @@ static void page_end(FILE *f) {
         "function lsbBits(v,n){const a=[];for(let i=0;i<n;i++)a.push((v>>i)&1);return a;}"
         "function rc5Raw(cur){const addr=hexValue(cur.address)&31,cmd=hexValue(cur.command)&127,tog=hexValue(cur.toggle)&1,seq=[];const bits=[1,cmd<64?1:0,tog].concat(msbBits(addr,5),msbBits(cmd&63,6));manchester(seq,bits,889,-1);return seqRaw(36000,seq);}"
         "function rc6Raw(cur){const addr=hexValue(cur.address)&255,cmd=hexValue(cur.command)&255,tog=hexValue(cur.toggle)&1,seq=[];pulse(seq,1,2666);pulse(seq,0,889);const bits=[1,0,0,0,tog].concat(msbBits(addr,8),msbBits(cmd,8));manchester(seq,bits,444,4);return seqRaw(36000,seq);}"
+        "function mceRaw(d,s,f){d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?15:Number(s);f=Number(f);if(!Number.isFinite(d)||!Number.isFinite(s)||!Number.isFinite(f)||d<0||d>127||s<0||s>255||f<0||f>255)return'';const seq=[],bits=[1,1,1,0,0].concat(msbBits(128,8),msbBits(s,8),[0],msbBits(d,7),msbBits(f,8));pulse(seq,1,2664);pulse(seq,0,888);manchester(seq,bits,444,4);pulse(seq,0,100000);return seqRaw(36000,seq);}"
+        "function recs80Raw(d,s,f,name=''){d=Number(d);f=Number(f);const t=/\\bT1\\b/i.test(String(name||''))?1:0;if(!Number.isFinite(d)||!Number.isFinite(f)||d<0||d>7||f<0||f>63)return'';const seq=[];pulse(seq,1,158);pulse(seq,0,7432);[t].concat(msbBits(d,3),msbBits(f,6)).forEach(b=>{pulse(seq,1,158);pulse(seq,0,b?7432:4902);});pulse(seq,1,158);pulse(seq,0,45000);return seqRaw(38000,seq);}"
         "function sircRaw(cur,proto){const cmd=hexValue(cur.command)&127,addr=hexValue(cur.address),bits=/20/.test(proto)?20:(/15/.test(proto)?15:12),addrBits=bits-7,seq=[];pulse(seq,1,2400);pulse(seq,0,600);lsbBits(cmd,7).concat(lsbBits(addr,addrBits)).forEach(b=>{pulse(seq,1,b?1200:600);pulse(seq,0,600);});return seqRaw(40000,seq);}"
         "function jvcRaw(d,f){d=Number(d);f=Number(f);if(![d,f].every(x=>Number.isFinite(x)&&x>=0&&x<=255))return'';const seq=[];pulse(seq,1,8400);pulse(seq,0,4200);lsbBits(d,8).concat(lsbBits(f,8)).forEach(b=>{pulse(seq,1,525);pulse(seq,0,b?1575:525);});pulse(seq,1,525);pulse(seq,0,23625);return seqRaw(38000,seq);}"
         "function rcaRaw(proto,d,f){if(/old/i.test(proto||''))return'';d=Number(d);f=Number(f);if(!Number.isFinite(d)||!Number.isFinite(f)||d<0||d>15||f<0||f>255)return'';const freq=/38/.test(proto||'')?38000:58000,seq=[];pulse(seq,1,3680);pulse(seq,0,3680);msbBits(d,4).concat(msbBits(f,8),msbBits((~d)&15,4),msbBits((~f)&255,8)).forEach(b=>{pulse(seq,1,460);pulse(seq,0,b?1840:920);});pulse(seq,1,460);pulse(seq,0,7360);return seqRaw(freq,seq);}"
         "function panasonicRaw(d,s,f){d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?0:Number(s);f=Number(f);if(![d,s,f].every(x=>Number.isFinite(x)&&x>=0&&x<=255))return'';const seq=[],bytes=[2,32,d&255,s&255,f&255,(d^s^f)&255];pulse(seq,1,3456);pulse(seq,0,1728);bytes.flatMap(b=>lsbBits(b,8)).forEach(b=>{pulse(seq,1,432);pulse(seq,0,b?1296:432);});pulse(seq,1,432);pulse(seq,0,74400);return seqRaw(37000,seq);}"
-        "function csvProtocolRaw(proto,d,s,f){proto=String(proto||'');const D=Number(d),F=Number(f),S=String(s===undefined?'':s).trim();if(!Number.isFinite(D)||!Number.isFinite(F)||D<0||F<0)return'';if(/^RC5X?/i.test(proto))return rc5Raw({address:D.toString(16),command:F.toString(16),toggle:'0'});if(/^RC6/i.test(proto))return rc6Raw({address:D.toString(16),command:F.toString(16),toggle:'0'});if(/^JVC$/i.test(proto))return jvcRaw(D,F);if(/^Panasonic$/i.test(proto))return panasonicRaw(D,S,F);if(/^RCA(?:-38)?$/i.test(proto))return rcaRaw(proto,D,F);if(/^Sony(12|15|20)?/i.test(proto)){const bits=(proto.match(/Sony(\\d+)/i)||[])[1]||'12';let addr=D;if(bits==='20'&&S&&S!=='-1'){const sub=Number(S);if(Number.isFinite(sub)&&sub>=0)addr=(D&31)|((sub&255)<<5);}return sircRaw({address:addr.toString(16),command:F.toString(16)},'SIRC'+bits);}return'';}"
+        "function aiwaRaw(d,s,f){d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?0:Number(s);f=Number(f);if(!Number.isFinite(d)||!Number.isFinite(s)||!Number.isFinite(f)||d<0||d>255||s<0||s>31||f<0||f>255)return'';const seq=[];pulse(seq,1,8800);pulse(seq,0,4400);lsbBits(d,8).concat(lsbBits(s,5),lsbBits((~d)&255,8),lsbBits((~s)&31,5),lsbBits(f,8),lsbBits((~f)&255,8)).forEach(b=>{pulse(seq,1,550);pulse(seq,0,b?1650:550);});pulse(seq,1,550);pulse(seq,0,23100);pulse(seq,1,8800);pulse(seq,0,4400);pulse(seq,1,550);pulse(seq,0,90750);return seqRaw(38000,seq);}"
+        "function panasonicOldRaw(d,s,f){d=Number(d);f=Number(f);if(!Number.isFinite(d)||!Number.isFinite(f)||d<0||d>31||f<0||f>63)return'';const seq=[];pulse(seq,1,3332);pulse(seq,0,3332);lsbBits(d,5).concat(lsbBits(f,6),lsbBits((~d)&31,5),lsbBits((~f)&63,6)).forEach(b=>{pulse(seq,1,833);pulse(seq,0,b?2499:833);});pulse(seq,1,833);pulse(seq,0,100000);return seqRaw(57600,seq);}"
+        "function nec48Raw(d,s,f,e=0){d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?(d^255):Number(s);f=Number(f);e=Number(e);if(![d,s,f,e].every(x=>Number.isFinite(x)&&x>=0&&x<=255))return'';const seq=[];pulse(seq,1,9024);pulse(seq,0,4512);lsbBits(d,8).concat(lsbBits(s,8),lsbBits(f,8),lsbBits((~f)&255,8),lsbBits(e,8),lsbBits((~e)&255,8)).forEach(b=>{pulse(seq,1,564);pulse(seq,0,b?1692:564);});pulse(seq,1,564);pulse(seq,0,108000);pulse(seq,1,9024);pulse(seq,0,2256);pulse(seq,1,564);pulse(seq,0,108000);return seqRaw(38000,seq);}"
+        "function blaupunktRaw(d,s,f){d=Number(d);f=Number(f);if(!Number.isFinite(d)||!Number.isFinite(f)||d<0||d>7||f<0||f>63)return'';const seq=[];pulse(seq,1,528);pulse(seq,0,2640);manchester(seq,Array(10).fill(1),528,-1);pulse(seq,0,20592);pulse(seq,1,528);pulse(seq,0,2640);manchester(seq,[1].concat(lsbBits(f,6),lsbBits(d,3)),528,-1);pulse(seq,0,121440);return seqRaw(30300,seq);}"
+        "function dishRaw(d,s,f){d=Number(d);const ss=String(s===undefined?'':s).trim();s=(ss===''||ss==='-1')?0:Number(s);f=Number(f);if(!Number.isFinite(d)||!Number.isFinite(s)||!Number.isFinite(f)||d<0||d>31||s<0||s>31||f<0||f>63)return'';const bits=msbBits(f,6).concat(msbBits(s,5),msbBits(d,5)),seq=[];pulse(seq,1,400);pulse(seq,0,6100);for(let r=0;r<4;r++){bits.forEach(b=>{pulse(seq,1,400);pulse(seq,0,b?1700:2800);});pulse(seq,1,400);pulse(seq,0,6100);}return seqRaw(57600,seq);}"
+        "function csvProtocolRaw(proto,d,s,f,name=''){proto=String(proto||'');const D=Number(d),F=Number(f),S=String(s===undefined?'':s).trim();if(!Number.isFinite(D)||!Number.isFinite(F)||D<0||F<0)return'';if(/^RC5X?/i.test(proto))return rc5Raw({address:D.toString(16),command:F.toString(16),toggle:'0'});if(/^RC6/i.test(proto))return rc6Raw({address:D.toString(16),command:F.toString(16),toggle:'0'});if(/^MCE$/i.test(proto))return mceRaw(D,S,F);if(/^RECS80$/i.test(proto))return recs80Raw(D,S,F,name);if(/^JVC$/i.test(proto))return jvcRaw(D,F);if(/^Panasonic$/i.test(proto))return panasonicRaw(D,S,F);if(/^Aiwa$/i.test(proto))return aiwaRaw(D,S,F);if(/^Panasonic_Old$/i.test(proto))return panasonicOldRaw(D,S,F);if(/^Dish_Network$/i.test(proto))return dishRaw(D,S,F);if(/^48-NEC1$/i.test(proto))return nec48Raw(D,S,F,0);if(/^Blaupunkt$/i.test(proto))return blaupunktRaw(D,S,F);if(/^RCA(?:-38)?$/i.test(proto))return rcaRaw(proto,D,F);if(/^Sony(12|15|20)?/i.test(proto)){const bits=(proto.match(/Sony(\\d+)/i)||[])[1]||'12';let addr=D;if(bits==='20'&&S&&S!=='-1'){const sub=Number(S);if(Number.isFinite(sub)&&sub>=0)addr=(D&31)|((sub&255)<<5);}return sircRaw({address:addr.toString(16),command:F.toString(16)},'SIRC'+bits);}return'';}"
         "function prontoToHarmonyRaw(hex){const words=String(hex||'').trim().split(/\\s+/).filter(Boolean).map(x=>parseInt(x,16));if(words.length<8||words.some(x=>!Number.isFinite(x)))return'';if(words[0]!==0)return'';const unit=(words[1]||1)*0.241246,freq=Math.round(1000000/unit),pairs=(words[2]||0)+(words[3]||0),vals=words.slice(4,4+pairs*2).map(w=>Math.round(w*unit));return harmonyRawFromTimings(freq,vals);}"
-        "function flipperEntries(t){const out=[];let cur={};function push(){if(!cur.name){cur={};return;}let key='',raw='',meta=(cur.protocol||cur.type||'raw');if(String(cur.type||'').toLowerCase()==='parsed'){const a=hexBytes(cur.address),c=hexBytes(cur.command),p=cur.protocol||'';if(/^Samsung32/i.test(p))key=keyFromParts(p,a[0],a[0],c[0]);else if(/^NECext/i.test(p))key=keyFromParts(p,a[0],a[1],c[0]);else if(/^NEC/i.test(p))key=keyFromParts(p,a[0],a[0]^255,c[0]);else if(/^RC5/i.test(p)){raw=rc5Raw(cur);meta=raw?'RC5 converted timing':'RC5 unsupported';}else if(/^RC6/i.test(p)){raw=rc6Raw(cur);meta=raw?'RC6 converted timing':'RC6 unsupported';}else if(/^SIRC/i.test(p)){raw=sircRaw(cur,p);meta=raw?p+' converted timing':p+' unsupported';}}else if(String(cur.type||'').toLowerCase()==='raw'){const vals=String(cur.data||'').trim().split(/\\s+/).filter(Boolean).map(Number);raw=harmonyRawFromTimings(cur.frequency||38000,vals);meta='raw timings '+(cur.frequency||38000)+' Hz ('+vals.length+' durations)';}out.push({name:cur.name,meta:meta,keycode:key,raw:raw});cur={};}t.replace(/\\r/g,'').split('\\n').forEach(line=>{line=line.trim();if(!line)return;if(line[0]==='#'){push();return;}const i=line.indexOf(':');if(i<0)return;const k=line.slice(0,i).trim().toLowerCase(),v=line.slice(i+1).trim();if(k==='name'&&cur.name)push();cur[k]=cur[k]&&k==='data'?cur[k]+' '+v:v;});push();return out;}"
+        "function kaseikyoRaw(cur){const a=hexBytes(cur.address),c=hexBytes(cur.command);if(a.length<4||c.length<1)return'';const bytes=[a[1],a[2],a[0],a[3],c[0],(a[0]^a[3]^c[0])&255],seq=[];pulse(seq,1,3456);pulse(seq,0,1728);bytes.flatMap(b=>lsbBits(b,8)).forEach(b=>{pulse(seq,1,432);pulse(seq,0,b?1296:432);});pulse(seq,1,432);pulse(seq,0,74736);return seqRaw(38000,seq);}"
+        "function flipperEntries(t){const out=[];let cur={};function push(){if(!cur.name){cur={};return;}let key='',raw='',meta=(cur.protocol||cur.type||'raw');if(String(cur.type||'').toLowerCase()==='parsed'){const a=hexBytes(cur.address),c=hexBytes(cur.command),p=cur.protocol||'';if(/^Samsung32/i.test(p))key=keyFromParts(p,a[0],a[0],c[0]);else if(/^NECext/i.test(p))key=keyFromParts(p,a[0],a[1],c[0]);else if(/^NEC/i.test(p))key=keyFromParts(p,a[0],a[0]^255,c[0]);else if(/^Pioneer/i.test(p))key=keyFromParts(p,a[0],a[0]^255,c[0]);else if(/^RC5/i.test(p)){raw=rc5Raw(cur);meta=raw?'RC5 converted timing':'RC5 unsupported';}else if(/^RC6/i.test(p)){raw=rc6Raw(cur);meta=raw?'RC6 converted timing':'RC6 unsupported';}else if(/^SIRC/i.test(p)){raw=sircRaw(cur,p);meta=raw?p+' converted timing':p+' unsupported';}else if(/^Kaseikyo/i.test(p)){raw=kaseikyoRaw(cur);meta=raw?'Kaseikyo converted timing':'Kaseikyo unsupported';}}else if(String(cur.type||'').toLowerCase()==='raw'){const vals=String(cur.data||'').trim().split(/\\s+/).filter(Boolean).map(Number);raw=harmonyRawFromTimings(cur.frequency||38000,vals);meta='raw timings '+(cur.frequency||38000)+' Hz ('+vals.length+' durations)';}out.push({name:cur.name,meta:meta,keycode:key,raw:raw});cur={};}t.replace(/\\r/g,'').split('\\n').forEach(line=>{line=line.trim();if(!line)return;if(line[0]==='#'){push();return;}const i=line.indexOf(':');if(i<0)return;const k=line.slice(0,i).trim().toLowerCase(),v=line.slice(i+1).trim();if(k==='name'&&cur.name)push();cur[k]=cur[k]&&k==='data'?cur[k]+' '+v:v;});push();return out;}"
         "function irdbStatus(t){const s=$('irdbStatus');if(s)s.textContent=t;}"
         "function irdbLog(t){const l=$('irdbLog');if(!l)return;let p=l.textContent||'';if(/^Ready\\./.test(p))p='';l.textContent=(t?new Date().toLocaleTimeString()+'  '+t+'\\n':'')+p.slice(0,6000);}"
         "function clearIrdPreview(){const p=$('irdbPayload'),box=$('irdbPreview');if(p)p.value='';if(box){box.replaceChildren();box.classList.add('hidden');}}"
@@ -2516,7 +2525,7 @@ static void page_end(FILE *f) {
         "async function labClearLabTarget(dev){try{const j=await postJson('/api/ir-lab-clear',{deviceId:dev});labLog(j.message||'temporary device cleared');await labSleep(700);await loadWizardInventory();lab.queue.forEach(r=>{r.stored=false;});lab.imported=false;labRender();return true;}catch(e){labLog('temporary device clear failed: '+(e.message||e));return false;}}"
         "async function labCancelRun(){const id=lab.runId;if(!id)return;try{await postJson('/api/ir-cancel',{runId:id});labLog('cancel sent for '+id);}catch(e){labLog('cancel failed: '+(e.message||e));}}"
         "function labServerChunk(requested,delay){const maxHold=4000,byTime=Math.max(1,Math.floor(maxHold/Math.max(40,delay)));return Math.max(1,Math.min(requested,byTime,1024));}"
-        "async function labRunRows(rows,dev,dry,delay,requestedChunk,offset,total){const chunk=labServerChunk(requestedChunk,delay);let done=0;labLog('run '+lab.runId+' using hub chunk '+chunk+' (requested '+requestedChunk+')');for(let i=0;i<rows.length;i+=chunk){if(lab.stop){labStatus('stopped after '+(offset+done)+' commands');break;}const slice=rows.slice(i,i+chunk),label=(dry?'dry-running ':'sending ')+(i+1)+'-'+(i+slice.length)+' / '+rows.length;labStatus((total&&total>rows.length?('stream '+(offset+done)+' sent, '+label):label));const j=await postJson('/api/ir-batch-send',{deviceId:dev,commands:slice.map(r=>r.name).join('\\n'),delayMs:delay,dryRun:dry?'1':'0',runId:lab.runId});done+=j.sent||0;labMeter(total?Math.min(offset+done,total):done,total||rows.length);labLog((dry?'dry run ':'batch sent ')+(j.sent||0)+' commands in '+(j.elapsedMs||0)+' ms; last '+String(j.lastReply||'').slice(0,120));if(j.canceled){lab.stop=true;labStatus('stopped after '+(offset+done)+' commands');break;}}return done;}"
+        "async function labRunRows(rows,dev,dry,delay,requestedChunk,offset,total){const chunk=labServerChunk(requestedChunk,delay);let done=0;labLog('run '+lab.runId+' using hub chunk '+chunk+' (requested '+requestedChunk+')');for(let i=0;i<rows.length;i+=chunk){if(lab.stop){labStatus('stopped after '+(offset+done)+' commands');break;}const slice=rows.slice(i,i+chunk),label=(dry?'dry-running ':'sending ')+(i+1)+'-'+(i+slice.length)+' / '+rows.length;labStatus((total&&total>rows.length?('stream '+(offset+done)+' sent, '+label):label));const j=await postJson('/api/ir-batch-send',{deviceId:dev,commands:slice.map(r=>r.name).join('\\n'),delayMs:delay,dryRun:dry?'1':'0',runId:lab.runId});done+=j.sent||0;labMeter(total?Math.min(offset+done,total):done,total||rows.length);const failText=j.failed?(', '+j.failed+' failed'):'';labLog((dry?'dry run ':'batch sent ')+(j.sent||0)+' commands'+failText+' in '+(j.elapsedMs||0)+' ms; last '+String(j.lastReply||'').slice(0,120));if(j.canceled){lab.stop=true;labStatus('stopped after '+(offset+done)+' commands');break;}}return done;}"
         "async function labRunQueue(){if(lab.running)return;const rows=labSelected(),dry=$('labDryRun')?.checked,delay=labNum('labSendDelay',80,40,10000),requestedChunk=labNum('labBatchSize',100,1,1024);if(!rows.length){labStatus('select at least one command');return;}try{const dev=await labResolveDevice();if(!dry&&rows.some(r=>!r.stored))await labImportQueue(rows);lab.running=true;lab.stop=false;lab.runId='run_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);const ready=dry?rows:rows.filter(r=>r.stored);const done=await labRunRows(ready,dev,dry,delay,requestedChunk,0,ready.length);if(!lab.stop)labStatus((dry?'dry run complete: ':'send complete: ')+done+' commands');labMeter(done,ready.length);}catch(e){labStatus('send failed: '+(e.message||e));}finally{lab.running=false;lab.runId='';}}"
         "function labSetFilter(text,msg){const e=$('labCommandFilter');if(e)e.value=text;lab.index=[];lab.cursor=0;lab.key='';labStatus(msg||'filter updated');}"
         "async function labQuick(kind){lab.queue=[];lab.index=[];lab.cursor=0;lab.key='';setLabValue('labSource','all');setLabValue('labMaxFiles',kind==='broad'?1200:900);setLabValue('labWorkers',18);setLabValue('labMaxCommands',kind==='broad'?1400:900);setLabValue('labSendDelay',60);setLabValue('labBatchSize',120);if(kind==='broad'){const p=$('labPathFilter');if(p)p.value='';}if(kind==='off'){const f=$('labCommandFilter');if(f)f.value='off, power off, poweroff, standby, shutdown';}else{const f=$('labCommandFilter');if(f)f.value='';}labRender();await labScanBatch();}"
@@ -3203,7 +3212,7 @@ static void render_ir_send_json(int fd, const struct request *req) {
 static void render_ir_batch_send_json(int fd, const struct request *req) {
     char device_id[64], delay_text[32], dry_text[16], run_id[128], reply[1024], last_reply[1024];
     char *commands, *line, *save;
-    int delay_ms, dry_run, sent = 0, skipped = 0, attempted = 0, canceled = 0;
+    int delay_ms, dry_run, sent = 0, skipped = 0, attempted = 0, failed = 0, canceled = 0;
     struct timeval start, end;
     FILE *f;
     form_value(req->body, "deviceId", device_id, sizeof(device_id));
@@ -3258,6 +3267,7 @@ static void render_ir_batch_send_json(int fd, const struct request *req) {
         if (!dry_run) {
             send_ir_command_action_ex(device_id, cmd_name, "api-batch", run_id, reply, sizeof(reply));
             copy_text(last_reply, sizeof(last_reply), reply[0] ? reply : "no response");
+            if (strstr(reply, "\"code\":500") || strstr(reply, "Invalid command")) failed++;
             if (delay_ms > 0 && cancelable_sleep_ms(delay_ms, run_id)) {
                 canceled = 1;
                 sent++;
@@ -3284,8 +3294,8 @@ static void render_ir_batch_send_json(int fd, const struct request *req) {
     if (!f) return;
     fputs("{\"ok\":true,\"deviceId\":", f); json_write_string(f, device_id);
     fputs(",\"runId\":", f); json_write_string(f, run_id);
-    fprintf(f, ",\"dryRun\":%s,\"canceled\":%s,\"sent\":%d,\"skipped\":%d,\"attempted\":%d,\"delayMs\":%d,\"elapsedMs\":%ld,\"lastReply\":",
-        dry_run ? "true" : "false", canceled ? "true" : "false", sent, skipped, attempted, delay_ms,
+    fprintf(f, ",\"dryRun\":%s,\"canceled\":%s,\"sent\":%d,\"skipped\":%d,\"attempted\":%d,\"failed\":%d,\"delayMs\":%d,\"elapsedMs\":%ld,\"lastReply\":",
+        dry_run ? "true" : "false", canceled ? "true" : "false", sent, skipped, attempted, failed, delay_ms,
         (long)((end.tv_sec - start.tv_sec) * 1000L + (end.tv_usec - start.tv_usec) / 1000L));
     json_write_string(f, last_reply);
     fputs("}\n", f);
@@ -3494,7 +3504,7 @@ static int run_hal_json_binary_sequence(const char *cmd_name, const char *params
     shell_escape_single(cmd_name, esc_cmd, sizeof(esc_cmd));
     shell_escape_single(params_json, esc_params, sizeof(esc_params));
     shell_escape_single(path, esc_path, sizeof(esc_path));
-    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hal_ltcp '%s' '%s' %d --gap-ms=%d --seq-file='%s' 2>&1; rm -f '%s'",
+    snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hal_ltcp '%s' '%s' %d --gap-ms=%d --seq-file='%s' 2>&1; rc=$?; rm -f '%s'; exit $rc",
         esc_cmd, esc_params, timeout, gap_ms, esc_path, esc_path);
     return run_cmd(cmd, out, outlen);
 }
@@ -3688,7 +3698,7 @@ static void write_bthid_missing_status(FILE *f, const char *state, const char *m
 }
 
 static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
-    int fd, tries = 0;
+    int fd, idle_waits = 0, max_idle_waits;
     size_t len, off = 0;
     if (!text || !text[0]) {
         snprintf(err, errlen, "missing Bluetooth text");
@@ -3715,14 +3725,29 @@ static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
         }
         return -1;
     }
+    max_idle_waits = 600 + (int)(len / 16);
+    if (max_idle_waits > 6000) max_idle_waits = 6000;
     while (off < len) {
         ssize_t n = write(fd, text + off, len - off);
         if (n > 0) {
             off += (size_t)n;
+            idle_waits = 0;
             continue;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && tries++ < 100) {
-            usleep(10000);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set wfds;
+            struct timeval tv;
+            if (idle_waits++ >= max_idle_waits) {
+                snprintf(err, errlen, "Bluetooth FIFO write timed out after %lu/%lu bytes; target may be disconnected or busy",
+                    (unsigned long)off, (unsigned long)len);
+                close(fd);
+                return -1;
+            }
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 10000;
+            select(fd + 1, NULL, &wfds, NULL, &tv);
             continue;
         }
         snprintf(err, errlen, "Bluetooth FIFO write failed at byte %lu: %s", (unsigned long)off, strerror(errno));
@@ -3776,7 +3801,7 @@ static void render_bluetooth_call_json(int fd, const struct request *req) {
     char params[768], reply[8192], cmd[2048], esc_name[128], *jt = NULL, *ja = NULL, *jp = NULL, *jc = NULL;
     char detected_addr[32], connection_raw[2048];
     const char *cmd_name = NULL;
-    int timeout, call_timeout, gap_ms, auto_detected_addr = 0;
+    int timeout, call_timeout, gap_ms, auto_detected_addr = 0, command_rc = 0;
     FILE *f;
 
     form_value(req->body, "action", action, sizeof(action));
@@ -3987,20 +4012,22 @@ static void render_bluetooth_call_json(int fd, const struct request *req) {
             fclose(f);
             return;
         }
-        run_hal_json_binary_sequence(cmd_name, params, seq, call_timeout, gap_ms, reply, sizeof(reply));
+        command_rc = run_hal_json_binary_sequence(cmd_name, params, seq, call_timeout, gap_ms, reply, sizeof(reply));
         free(seq);
         {
             size_t used = strlen(reply);
             snprintf(reply + used, sizeof(reply) - used, "\nkeys=%d gapMs=%d", sent_keys, gap_ms);
         }
     } else {
-        run_hal_json(cmd_name, params, call_timeout, reply, sizeof(reply));
+        command_rc = run_hal_json(cmd_name, params, call_timeout, reply, sizeof(reply));
     }
-    f = send_json_start(fd, "200 OK");
+    f = send_json_start(fd, command_rc == 0 ? "200 OK" : "502 Bad Gateway");
     if (!f) return;
-    fputs("{\"ok\":true,\"action\":", f); json_write_string(f, action);
+    fputs("{\"ok\":", f); fputs(command_rc == 0 ? "true" : "false", f);
+    fputs(",\"action\":", f); json_write_string(f, action);
     fputs(",\"cmd\":", f); json_write_string(f, cmd_name);
     fputs(",\"params\":", f); json_write_string(f, params);
+    fputs(",\"exitCode\":", f); fprintf(f, "%d", command_rc);
     fputs(",\"responseRaw\":", f); json_write_string(f, reply[0] ? reply : "no response");
     if (auto_detected_addr) {
         fputs(",\"detectedAddress\":", f); json_write_string(f, detected_addr);

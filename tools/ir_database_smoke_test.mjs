@@ -94,7 +94,7 @@ function csvEntries(text) {
     const name = p[0] || '';
     const proto = p[1] || '';
     const keycode = name === 'functionname' ? '' : keyFromParts(proto, p[2] || '', p[3] || '', p[4] || '');
-    const raw = name === 'functionname' ? '' : csvProtocolRaw(proto, p[2] || '', p[3] || '', p[4] || '');
+    const raw = name === 'functionname' ? '' : csvProtocolRaw(proto, p[2] || '', p[3] || '', p[4] || '', name);
     return { name, meta: `${proto} ${p[2] || ''},${p[3] || ''},${p[4] || ''}`, protocol: proto, keycode, raw };
   }).filter((r) => r.name && r.name !== 'functionname');
 }
@@ -177,6 +177,39 @@ function rc6Raw(cur) {
   return seqRaw(36000, seq);
 }
 
+function mceRaw(d, s, f) {
+  d = Number(d);
+  const ss = String(s === undefined ? '' : s).trim();
+  s = ss === '' || ss === '-1' ? 15 : Number(s);
+  f = Number(f);
+  if (!Number.isFinite(d) || !Number.isFinite(s) || !Number.isFinite(f)) return '';
+  if (d < 0 || d > 127 || s < 0 || s > 255 || f < 0 || f > 255) return '';
+  const seq = [];
+  pulse(seq, 1, 2664);
+  pulse(seq, 0, 888);
+  const bits = [1, 1, 1, 0, 0].concat(msbBits(128, 8), msbBits(s, 8), [0], msbBits(d, 7), msbBits(f, 8));
+  manchester(seq, bits, 444, 4);
+  pulse(seq, 0, 100000);
+  return seqRaw(36000, seq);
+}
+
+function recs80Raw(d, s, f, name = '') {
+  d = Number(d);
+  f = Number(f);
+  const t = /\bT1\b/i.test(String(name || '')) ? 1 : 0;
+  if (!Number.isFinite(d) || !Number.isFinite(f) || d < 0 || d > 7 || f < 0 || f > 63) return '';
+  const seq = [];
+  pulse(seq, 1, 158);
+  pulse(seq, 0, 7432);
+  [t].concat(msbBits(d, 3), msbBits(f, 6)).forEach((b) => {
+    pulse(seq, 1, 158);
+    pulse(seq, 0, b ? 7432 : 4902);
+  });
+  pulse(seq, 1, 158);
+  pulse(seq, 0, 45000);
+  return seqRaw(38000, seq);
+}
+
 function sircRaw(cur, proto) {
   const cmd = hexValue(cur.command) & 127;
   const addr = hexValue(cur.address);
@@ -245,7 +278,107 @@ function panasonicRaw(d, s, f) {
   return seqRaw(37000, seq);
 }
 
-function csvProtocolRaw(proto, d, s, f) {
+function aiwaRaw(d, s, f) {
+  d = Number(d);
+  const ss = String(s === undefined ? '' : s).trim();
+  s = ss === '' || ss === '-1' ? 0 : Number(s);
+  f = Number(f);
+  if (!Number.isFinite(d) || !Number.isFinite(s) || !Number.isFinite(f)) return '';
+  if (d < 0 || d > 255 || s < 0 || s > 31 || f < 0 || f > 255) return '';
+  const seq = [];
+  pulse(seq, 1, 8800);
+  pulse(seq, 0, 4400);
+  lsbBits(d, 8).concat(lsbBits(s, 5), lsbBits((~d) & 255, 8), lsbBits((~s) & 31, 5), lsbBits(f, 8), lsbBits((~f) & 255, 8)).forEach((b) => {
+    pulse(seq, 1, 550);
+    pulse(seq, 0, b ? 1650 : 550);
+  });
+  pulse(seq, 1, 550);
+  pulse(seq, 0, 23100);
+  pulse(seq, 1, 8800);
+  pulse(seq, 0, 4400);
+  pulse(seq, 1, 550);
+  pulse(seq, 0, 90750);
+  return seqRaw(38000, seq);
+}
+
+function panasonicOldRaw(d, s, f) {
+  d = Number(d);
+  f = Number(f);
+  if (!Number.isFinite(d) || !Number.isFinite(f) || d < 0 || d > 31 || f < 0 || f > 63) return '';
+  const seq = [];
+  pulse(seq, 1, 3332);
+  pulse(seq, 0, 3332);
+  lsbBits(d, 5).concat(lsbBits(f, 6), lsbBits((~d) & 31, 5), lsbBits((~f) & 63, 6)).forEach((b) => {
+    pulse(seq, 1, 833);
+    pulse(seq, 0, b ? 2499 : 833);
+  });
+  pulse(seq, 1, 833);
+  pulse(seq, 0, 100000);
+  return seqRaw(57600, seq);
+}
+
+function nec48Raw(d, s, f, e = 0) {
+  d = Number(d);
+  const ss = String(s === undefined ? '' : s).trim();
+  s = ss === '' || ss === '-1' ? (d ^ 255) : Number(s);
+  f = Number(f);
+  e = Number(e);
+  if (![d, s, f, e].every((x) => Number.isFinite(x) && x >= 0 && x <= 255)) return '';
+  const seq = [];
+  pulse(seq, 1, 9024);
+  pulse(seq, 0, 4512);
+  lsbBits(d, 8).concat(lsbBits(s, 8), lsbBits(f, 8), lsbBits((~f) & 255, 8), lsbBits(e, 8), lsbBits((~e) & 255, 8)).forEach((b) => {
+    pulse(seq, 1, 564);
+    pulse(seq, 0, b ? 1692 : 564);
+  });
+  pulse(seq, 1, 564);
+  pulse(seq, 0, 108000);
+  pulse(seq, 1, 9024);
+  pulse(seq, 0, 2256);
+  pulse(seq, 1, 564);
+  pulse(seq, 0, 108000);
+  return seqRaw(38000, seq);
+}
+
+function blaupunktRaw(d, s, f) {
+  d = Number(d);
+  f = Number(f);
+  if (!Number.isFinite(d) || !Number.isFinite(f) || d < 0 || d > 7 || f < 0 || f > 63) return '';
+  const seq = [];
+  pulse(seq, 1, 528);
+  pulse(seq, 0, 2640);
+  manchester(seq, Array(10).fill(1), 528, -1);
+  pulse(seq, 0, 20592);
+  pulse(seq, 1, 528);
+  pulse(seq, 0, 2640);
+  manchester(seq, [1].concat(lsbBits(f, 6), lsbBits(d, 3)), 528, -1);
+  pulse(seq, 0, 121440);
+  return seqRaw(30300, seq);
+}
+
+function dishRaw(d, s, f) {
+  d = Number(d);
+  const ss = String(s === undefined ? '' : s).trim();
+  s = ss === '' || ss === '-1' ? 0 : Number(s);
+  f = Number(f);
+  if (!Number.isFinite(d) || !Number.isFinite(s) || !Number.isFinite(f)) return '';
+  if (d < 0 || d > 31 || s < 0 || s > 31 || f < 0 || f > 63) return '';
+  const bits = msbBits(f, 6).concat(msbBits(s, 5), msbBits(d, 5));
+  const seq = [];
+  pulse(seq, 1, 400);
+  pulse(seq, 0, 6100);
+  for (let r = 0; r < 4; r++) {
+    bits.forEach((b) => {
+      pulse(seq, 1, 400);
+      pulse(seq, 0, b ? 1700 : 2800);
+    });
+    pulse(seq, 1, 400);
+    pulse(seq, 0, 6100);
+  }
+  return seqRaw(57600, seq);
+}
+
+function csvProtocolRaw(proto, d, s, f, name = '') {
   proto = String(proto || '');
   const D = Number(d);
   const F = Number(f);
@@ -257,11 +390,32 @@ function csvProtocolRaw(proto, d, s, f) {
   if (/^RC6/i.test(proto)) {
     return rc6Raw({ address: D.toString(16), command: F.toString(16), toggle: '0' });
   }
+  if (/^MCE$/i.test(proto)) {
+    return mceRaw(D, S, F);
+  }
+  if (/^RECS80$/i.test(proto)) {
+    return recs80Raw(D, S, F, name);
+  }
   if (/^JVC$/i.test(proto)) {
     return jvcRaw(D, F);
   }
   if (/^Panasonic$/i.test(proto)) {
     return panasonicRaw(D, S, F);
+  }
+  if (/^Aiwa$/i.test(proto)) {
+    return aiwaRaw(D, S, F);
+  }
+  if (/^Panasonic_Old$/i.test(proto)) {
+    return panasonicOldRaw(D, S, F);
+  }
+  if (/^Dish_Network$/i.test(proto)) {
+    return dishRaw(D, S, F);
+  }
+  if (/^48-NEC1$/i.test(proto)) {
+    return nec48Raw(D, S, F, 0);
+  }
+  if (/^Blaupunkt$/i.test(proto)) {
+    return blaupunktRaw(D, S, F);
   }
   if (/^RCA(?:-38)?$/i.test(proto)) {
     return rcaRaw(proto, D, F);
@@ -296,6 +450,7 @@ function flipperEntries(text) {
       if (/^Samsung32/i.test(protocol)) keycode = keyFromParts(protocol, a[0], a[0], c[0]);
       else if (/^NECext/i.test(protocol)) keycode = keyFromParts(protocol, a[0], a[1], c[0]);
       else if (/^NEC/i.test(protocol)) keycode = keyFromParts(protocol, a[0], a[0] ^ 255, c[0]);
+      else if (/^Pioneer/i.test(protocol)) keycode = keyFromParts(protocol, a[0], a[0] ^ 255, c[0]);
       else if (/^RC5/i.test(protocol)) {
         raw = rc5Raw(cur);
         meta = raw ? 'RC5 converted timing' : 'RC5 unsupported';
@@ -305,6 +460,9 @@ function flipperEntries(text) {
       } else if (/^SIRC/i.test(protocol)) {
         raw = sircRaw(cur, protocol);
         meta = raw ? `${protocol} converted timing` : `${protocol} unsupported`;
+      } else if (/^Kaseikyo/i.test(protocol)) {
+        raw = kaseikyoRaw(cur);
+        meta = raw ? 'Kaseikyo converted timing' : 'Kaseikyo unsupported';
       }
     } else if (cur.type === 'raw') {
       const vals = String(cur.data || '').trim().split(/\s+/).filter(Boolean).map(Number);
@@ -330,6 +488,23 @@ function flipperEntries(text) {
   });
   push();
   return out;
+}
+
+function kaseikyoRaw(cur) {
+  const a = hexBytes(cur.address);
+  const c = hexBytes(cur.command);
+  if (a.length < 4 || c.length < 1) return '';
+  const bytes = [a[1], a[2], a[0], a[3], c[0], (a[0] ^ a[3] ^ c[0]) & 255];
+  const seq = [];
+  pulse(seq, 1, 3456);
+  pulse(seq, 0, 1728);
+  bytes.flatMap((b) => lsbBits(b, 8)).forEach((b) => {
+    pulse(seq, 1, 432);
+    pulse(seq, 0, b ? 1296 : 432);
+  });
+  pulse(seq, 1, 432);
+  pulse(seq, 0, 74736);
+  return seqRaw(38000, seq);
 }
 
 async function text(url) {

@@ -15,6 +15,12 @@ Invoke-RestMethod "http://<hub-ip>:8080/api/inventory"
 Returns hub limits, configured devices, command names, keycode/raw flags, and
 local command counts.
 
+List runnable commands for one device:
+
+```powershell
+Invoke-RestMethod "http://<hub-ip>:8080/api/device-commands?deviceId=<device-id>"
+```
+
 ## IR Control
 
 Send one saved command:
@@ -37,6 +43,10 @@ Invoke-RestMethod "http://<hub-ip>:8080/api/ir-batch-send" -Method Post -Body @{
   runId    = "example-run-1"
 }
 ```
+
+The response includes `sent`, `attempted`, `skipped`, `failed`, `elapsedMs`, and
+`lastReply`. `failed` is incremented when the hub rejects a stored command, so
+large sweeps can keep going while still showing unsupported names clearly.
 
 Cancel a running batch:
 

@@ -404,6 +404,7 @@ int main(int argc, char **argv) {
                     close(fd);
                     break;
                 }
+                write_status("listening", addr, sent, skipped, "");
                 continue;
             }
             n = read(fd, buf, sizeof(buf));
