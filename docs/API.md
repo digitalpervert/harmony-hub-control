@@ -171,3 +171,28 @@ GET /export/wifi
 
 Exports are for backups and debugging. Do not share files containing local
 network or credential material.
+
+## Software Updates
+
+The System page can update the local control stack from this repository. The
+browser fetches `payload/bin/MANIFEST.txt` and selected `codex_*` binaries,
+uploads them to the hub in chunks, then the hub verifies MD5 hashes from the
+manifest before installing.
+
+Low-level SSH/dropbear files are intentionally not updated by the web UI.
+
+```powershell
+Invoke-RestMethod "http://<hub-ip>:8080/api/update-status"
+```
+
+The chunked update endpoints are:
+
+```text
+POST /api/update-begin
+POST /api/update-chunk
+POST /api/update-apply
+```
+
+For a private GitHub repo, paste a GitHub token into the System page update
+field. It is used only by the browser to read GitHub and is not sent to or
+stored on the hub.

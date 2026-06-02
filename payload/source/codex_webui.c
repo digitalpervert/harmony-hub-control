@@ -31,6 +31,9 @@
 #define BT_TEXT_FIFO "/tmp/bthid_input"
 #define BT_TEXT_STATUS "/tmp/bthid_status"
 #define BT_TARGET_FILE "/data/codex/bthid_target"
+#define CODEX_BIN_DIR "/data/codex/bin"
+#define UPDATE_STAGE_DIR "/tmp/codex_update"
+#define UPDATE_BACKUP_DIR "/data/codex/update-backups"
 #define IR_EVENT_MAX_BYTES 65536
 #define MAX_REQUEST_BODY (512 * 1024)
 #define MAX_REQUEST_BYTES (MAX_REQUEST_BODY + 8192)
@@ -40,6 +43,15 @@
 #define MAX_IR_STORED_COMMANDS 2048
 #define MAX_IR_BATCH_COMMANDS 1024
 #define MAX_BT_SEQUENCE_BODY 32768
+
+static const char *UPDATE_FILES[] = {
+    "codex_webui",
+    "codex_bthid_keyboard",
+    "codex_hal_ltcp",
+    "codex_hbus",
+    "codex_portal",
+    "codex_dhcpd"
+};
 
 static const char *BUILTIN_PROTOCOL_TOSHIBA_32 =
     "{\"IRSegments\":[{\"Header\":[{\"Value\":8990,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":4490,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Payload\":{\"NumberOfBits\":32,\"Encodings\":[{\"Atoms\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":552,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"BitType\":0},{\"Atoms\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":1662,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"BitType\":1}],\"ToggleBit\":null,\"EncodingType\":0},\"Trailer\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null}],\"TotalLength\":107870,\"Name\":\"Toshiba 32 Bit\"}],\"Attributes\":[],\"IsPadded\":true,\"IsFullSequence\":true,\"Rating\":null,\"NumberOfLinkedLanguage\":0,\"Status\":null,\"IsPublic\":true,\"HoldDelay\":null,\"PressMinimumRepeats\":1,\"SendingType\":0,\"Name\":\"Toshiba 32 Bit\",\"ControlSection\":null,\"Flags\":[],\"__type\":\"IrProtocol\",\"CarrierFrequency\":38000,\"Id-\":2,\"CodeSegments\":[{\"Header\":[{\"Value\":8990,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":2230,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Payload\":null,\"TotalLength\":0,\"Trailer\":[{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":96077,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Atoms\":[{\"Value\":8990,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":2230,\"Type\":0,\"MinValue\":null,\"MaxValue\":null},{\"Value\":568,\"Type\":1,\"MinValue\":null,\"MaxValue\":null},{\"Value\":96077,\"Type\":0,\"MinValue\":null,\"MaxValue\":null}],\"Name\":\"Toshiba 32 Bit KeyCodeRepeat\"}],\"KeyCode\":{\"Start\":[{\"SegmentType\":1,\"SegmentName\":\"Toshiba 32 Bit\"}],\"Repeat\":[{\"SegmentType\":0,\"SegmentName\":\"Toshiba 32 Bit KeyCodeRepeat\"}],\"Finish\":null},\"HoldMinimumRepeats\":null,\"RelatedProtocols\":[]}";
@@ -176,6 +188,30 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
         return -1;
     }
     sync();
+    return 0;
+}
+
+static int copy_file_raw(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    FILE *out;
+    char buf[4096];
+    size_t n;
+    if (!in) return -1;
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in);
+            fclose(out);
+            unlink(dst);
+            return -1;
+        }
+    }
+    fclose(in);
+    fclose(out);
     return 0;
 }
 
@@ -2477,6 +2513,15 @@ static void page_end(FILE *f) {
         "const pathBox=$('irdbPath');if(pathBox)pathBox.addEventListener('input',()=>{delete pathBox.dataset.source;});"
         "const fetchBtn=$('irdbFetch');if(fetchBtn){fetchBtn.addEventListener('click',fetchIrdPath);}"
         "async function postJson(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data||{})});const t=await r.text();let j;try{j=JSON.parse(t);}catch(e){throw new Error(t||('http '+r.status));}if(!r.ok||j.ok===false)throw new Error(j.message||j.error||('http '+r.status));return j;}"
+        "const UPDATE_NAMES=['codex_webui','codex_bthid_keyboard','codex_hal_ltcp','codex_hbus','codex_portal','codex_dhcpd'];const UPDATE_API='https://api.github.com/repos/Ripthulhu/harmony-hub-control/contents/payload/bin/';const HEX=Array.from({length:256},(_,i)=>i.toString(16).padStart(2,'0'));"
+        "function updateLog(t){const el=$('updateLog');if(el)el.textContent=t||'';}function updateAppend(t){const el=$('updateLog');if(!el)return;let p=el.textContent||'';if(/^Ready\\./.test(p))p='';el.textContent=(p?p+'\\n':'')+String(t||'');el.scrollTop=el.scrollHeight;}"
+        "function updateBase(){let b=($('updateRepo')?.value||'').trim()||'https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/';return b.endsWith('/')?b:b+'/';}function updateToken(){return($('updateToken')?.value||'').trim();}"
+        "function parseUpdateManifest(t){return String(t||'').replace(/\\r/g,'').split('\\n').map(line=>{const m=line.match(/^([0-9a-fA-F]{32})\\s+(\\S+)$/);return m?{md5:m[1].toLowerCase(),name:m[2]}:null;}).filter(x=>x&&UPDATE_NAMES.includes(x.name));}"
+        "async function updateFetch(name,token){if(token){const r=await fetch(UPDATE_API+encodeURIComponent(name)+'?ref=main',{headers:{'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'}});if(!r.ok)throw new Error('GitHub API '+name+' http '+r.status);const j=await r.json(),bin=atob(String(j.content||'').replace(/\\s/g,'')),u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return name==='MANIFEST.txt'?new TextDecoder().decode(u):u.buffer;}const r=await fetch(updateBase()+encodeURIComponent(name)+'?t='+Date.now());if(!r.ok)throw new Error('repo fetch '+name+' http '+r.status);return name==='MANIFEST.txt'?await r.text():await r.arrayBuffer();}"
+        "function chunkHex(bytes,start,end){let s='';for(let i=start;i<end;i++)s+=HEX[bytes[i]];return s;}async function updateLocalStatus(){const j=await(await fetch('/api/update-status')).json();const lines=['Local control binaries:'];(j.files||[]).forEach(f=>lines.push((f.present?'ok ':'missing ')+f.name+' '+(f.md5||'')+' '+(f.size||0)+' bytes'));updateLog(lines.join('\\n'));return j;}"
+        "async function updateCheckRepo(){try{updateLog('checking repository...');const token=updateToken(),manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest),local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);let changes=0;const lines=['Repository files:'];entries.forEach(e=>{const cur=byName[e.name]||{},same=cur.md5&&cur.md5.toLowerCase()===e.md5;changes+=same?0:1;lines.push((same?'current ':'update  ')+e.name+' repo '+e.md5+' local '+(cur.md5||'missing'));});lines.push(changes?changes+' file(s) need update.':'Already current.');updateLog(lines.join('\\n'));}catch(e){updateLog('update check failed: '+(e.message||e));}}"
+        "async function updateInstallRepo(){try{const token=updateToken();updateLog('loading manifest...');const manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest);if(!entries.length)throw new Error('manifest has no updateable codex binaries');const local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);const todo=entries.filter(e=>!(byName[e.name]&&String(byName[e.name].md5||'').toLowerCase()===e.md5));if(!todo.length){updateLog('Already current.');return;}await postJson('/api/update-begin',{manifest:manifest});updateLog('staging '+todo.length+' file(s)...');for(const e of todo){updateAppend('fetch '+e.name);const buf=await updateFetch(e.name,token),bytes=new Uint8Array(buf);let off=0;while(off<bytes.length){const end=Math.min(off+24576,bytes.length),hex=chunkHex(bytes,off,end);await postJson('/api/update-chunk',{file:e.name,offset:String(off),hex:hex});off=end;updateAppend('  '+e.name+' '+off+' / '+bytes.length);} }const j=await postJson('/api/update-apply',{restart:'1'});updateAppend('installed: '+j.updated);updateAppend('backup: '+j.backupDir);updateAppend('services are restarting; refresh in about 5 seconds.');setTimeout(updateLocalStatus,6000);}catch(e){updateAppend('update failed: '+(e.message||e));}}"
+        "const updateRefresh=$('updateRefresh');if(updateRefresh)updateRefresh.addEventListener('click',updateLocalStatus);const updateCheck=$('updateCheck');if(updateCheck)updateCheck.addEventListener('click',updateCheckRepo);const updateInstall=$('updateInstall');if(updateInstall)updateInstall.addEventListener('click',updateInstallRepo);if($('updateLog'))updateLocalStatus();"
         "function btFields(){return{type:$('btType')?.value||'btkeyboard',name:($('btName')?.value||'Harmony Keyboard').trim(),bdaddr:($('btAddr')?.value||'').trim(),pin:($('btPin')?.value||'').trim(),code:($('btCode')?.value||'').trim(),timeout:$('btTimeout')?.value||'8'};}"
         "function btLog(t){const el=$('btLog');if(el)el.textContent=t||'';}"
         "function btAppend(t){const el=$('btLog');if(!el)return;let p=el.textContent||'';if(/^Ready\\./.test(p))p='';if(p.length>6000)p=p.slice(-5000);el.textContent=(p?p+'\\n':'')+String(t||'');el.scrollTop=el.scrollHeight;}"
@@ -2865,7 +2910,7 @@ static void system_panel(FILE *f) {
     html(f, info);
     fprintf(f, "</pre></details><details><summary>Logs</summary><pre>");
     html(f, logs[0] ? logs : "no matching logs");
-    fprintf(f, "</pre></details></div><div class='panel' style='margin-top:12px'><div class='help'>Reload discovery if Home Assistant does not show new entities after device or command changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Reload MQTT Discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot Hub</button></div></form></div></section>");
+    fprintf(f, "</pre></details></div><div class='panel' style='margin-top:12px'><h3>Software Update</h3><div class='help'>Pull the latest control binaries from the GitHub repository, stage them on the hub, verify them against MANIFEST.txt, then restart the local services. Dropbear/SSH is left untouched.</div><div class='grid two'><div><label>Repository raw base URL</label><input id='updateRepo' value='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/'></div><div><label>GitHub token for private repo</label><input id='updateToken' type='password' autocomplete='off' placeholder='optional, used only by this browser'></div></div><div class='actions'><button id='updateCheck' type='button' class='secondary'>Check Repo</button><button id='updateInstall' type='button'>Install Update</button><button id='updateRefresh' type='button' class='secondary'>Refresh Local Status</button></div><pre id='updateLog' class='mini'>Ready. Check the repo before installing.</pre></div><div class='panel' style='margin-top:12px'><div class='help'>Reload discovery if Home Assistant does not show new entities after device or command changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Reload MQTT Discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot Hub</button></div></form></div></section>");
 }
 
 static void render_page(int fd, const char *message) {
@@ -3796,6 +3841,361 @@ static void render_bluetooth_text_status_json(int fd) {
     fclose(f);
 }
 
+static int update_file_allowed(const char *name) {
+    size_t i;
+    if (!name || !name[0]) return 0;
+    for (i = 0; i < sizeof(UPDATE_FILES) / sizeof(UPDATE_FILES[0]); i++) {
+        if (strcmp(name, UPDATE_FILES[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static void update_stage_path(const char *name, char *out, size_t outlen) {
+    snprintf(out, outlen, UPDATE_STAGE_DIR "/%s", name);
+}
+
+static void update_dest_path(const char *name, char *out, size_t outlen) {
+    snprintf(out, outlen, CODEX_BIN_DIR "/%s", name);
+}
+
+static int is_hex32(const char *s) {
+    int i;
+    if (!s) return 0;
+    for (i = 0; i < 32; i++) {
+        if (!isxdigit((unsigned char)s[i])) return 0;
+    }
+    return s[32] == 0;
+}
+
+static int manifest_expected_md5(const char *manifest, const char *name, char *out, size_t outlen) {
+    const char *p = manifest;
+    if (!manifest || !name || !out || outlen < 33) return 0;
+    out[0] = 0;
+    while (p && *p) {
+        const char *end = strchr(p, '\n');
+        const char *q;
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len > 34) {
+            char hash[33], file[96];
+            size_t n = 0;
+            memcpy(hash, p, 32);
+            hash[32] = 0;
+            q = p + 32;
+            while (q < p + len && isspace((unsigned char)*q)) q++;
+            while (q < p + len && *q != '\r' && !isspace((unsigned char)*q) && n + 1 < sizeof(file)) {
+                file[n++] = *q++;
+            }
+            file[n] = 0;
+            if (is_hex32(hash) && strcmp(file, name) == 0) {
+                snprintf(out, outlen, "%s", hash);
+                return 1;
+            }
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+static int parse_md5_text(const char *reply, char *out, size_t outlen) {
+    char hash[33];
+    int i;
+    if (!reply || !out || outlen < 33 || strlen(reply) < 32) return -1;
+    for (i = 0; i < 32; i++) {
+        if (!isxdigit((unsigned char)reply[i])) return -1;
+        hash[i] = (char)tolower((unsigned char)reply[i]);
+    }
+    hash[32] = 0;
+    snprintf(out, outlen, "%s", hash);
+    return 0;
+}
+
+static int file_md5(const char *path, char *out, size_t outlen) {
+    char cmd[768], reply[256], tmp[96], esc_path[384], esc_tmp[160];
+    FILE *f;
+    size_t n = 0;
+    int rc;
+    if (!path || !out || outlen < 33) return -1;
+    shell_escape_single(path, esc_path, sizeof(esc_path));
+    snprintf(cmd, sizeof(cmd), "/bin/busybox md5sum '%s' 2>/dev/null", esc_path);
+    reply[0] = 0;
+    if (run_cmd(cmd, reply, sizeof(reply)) == 0 && parse_md5_text(reply, out, outlen) == 0) return 0;
+    snprintf(tmp, sizeof(tmp), "/tmp/codex-md5-%ld.txt", (long)getpid());
+    shell_escape_single(tmp, esc_tmp, sizeof(esc_tmp));
+    snprintf(cmd, sizeof(cmd), "/bin/busybox md5sum '%s' > '%s' 2>/dev/null", esc_path, esc_tmp);
+    rc = system(cmd);
+    if (rc != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    f = fopen(tmp, "rb");
+    if (f) {
+        n = fread(reply, 1, sizeof(reply) - 1, f);
+        fclose(f);
+    }
+    unlink(tmp);
+    reply[n] = 0;
+    return parse_md5_text(reply, out, outlen);
+}
+
+static int write_update_hex_chunk(const char *name, long offset, const char *hex, char *err, size_t errlen, long *bytes_out) {
+    char path[256];
+    struct stat st;
+    FILE *f;
+    size_t len, i;
+    long current = 0, wrote = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (!update_file_allowed(name)) {
+        snprintf(err, errlen, "file is not part of the update allow-list");
+        return -1;
+    }
+    if (!hex || !hex[0]) {
+        snprintf(err, errlen, "missing update chunk");
+        return -1;
+    }
+    len = strlen(hex);
+    if ((len & 1) != 0) {
+        snprintf(err, errlen, "chunk hex length is odd");
+        return -1;
+    }
+    for (i = 0; i < len; i++) {
+        if (!isxdigit((unsigned char)hex[i])) {
+            snprintf(err, errlen, "chunk contains non-hex data");
+            return -1;
+        }
+    }
+    mkdir(UPDATE_STAGE_DIR, 0755);
+    update_stage_path(name, path, sizeof(path));
+    if (stat(path, &st) == 0) current = (long)st.st_size;
+    if (offset != current) {
+        snprintf(err, errlen, "chunk offset mismatch for %s: got %ld expected %ld", name, offset, current);
+        return -1;
+    }
+    f = fopen(path, offset == 0 ? "wb" : "ab");
+    if (!f) {
+        snprintf(err, errlen, "cannot open staged update file");
+        return -1;
+    }
+    for (i = 0; i < len; i += 2) {
+        int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+        unsigned char b = (unsigned char)((hi << 4) | lo);
+        if (hi < 0 || lo < 0 || fwrite(&b, 1, 1, f) != 1) {
+            fclose(f);
+            snprintf(err, errlen, "failed writing staged update chunk");
+            return -1;
+        }
+        wrote++;
+    }
+    fclose(f);
+    if (bytes_out) *bytes_out = wrote;
+    return 0;
+}
+
+static void render_update_status_json(int fd) {
+    FILE *f = send_json_start(fd, "200 OK");
+    size_t i;
+    struct stat st;
+    char path[256], md5[40];
+    if (!f) return;
+    fputs("{\"ok\":true,\"repo\":\"https://github.com/Ripthulhu/harmony-hub-control\",\"rawBase\":\"https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/\",\"files\":[", f);
+    for (i = 0; i < sizeof(UPDATE_FILES) / sizeof(UPDATE_FILES[0]); i++) {
+        if (i) fputc(',', f);
+        update_dest_path(UPDATE_FILES[i], path, sizeof(path));
+        fputs("{\"name\":", f); json_write_string(f, UPDATE_FILES[i]);
+        if (stat(path, &st) == 0) {
+            fputs(",\"present\":true,\"size\":", f); fprintf(f, "%ld", (long)st.st_size);
+            if (file_md5(path, md5, sizeof(md5)) == 0) {
+                fputs(",\"md5\":", f); json_write_string(f, md5);
+            }
+        } else {
+            fputs(",\"present\":false,\"size\":0", f);
+        }
+        fputc('}', f);
+    }
+    fputs("]}\n", f);
+    fclose(f);
+}
+
+static void render_update_begin_json(int fd, const struct request *req) {
+    char *manifest;
+    size_t i;
+    FILE *f;
+    if (req->body_truncated) {
+        f = send_json_start(fd, "413 Payload Too Large");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"update manifest request is too large\"}\n", f);
+        fclose(f);
+        return;
+    }
+    manifest = (char *)malloc(MAX_REQUEST_BODY);
+    if (!manifest) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"not enough memory for update manifest\"}\n", f);
+        fclose(f);
+        return;
+    }
+    form_value(req->body, "manifest", manifest, MAX_REQUEST_BODY);
+    if (!strstr(manifest, "codex_webui")) {
+        free(manifest);
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"manifest does not look like a Harmony control build\"}\n", f);
+        fclose(f);
+        return;
+    }
+    mkdir(UPDATE_STAGE_DIR, 0755);
+    for (i = 0; i < sizeof(UPDATE_FILES) / sizeof(UPDATE_FILES[0]); i++) {
+        char path[256];
+        update_stage_path(UPDATE_FILES[i], path, sizeof(path));
+        unlink(path);
+    }
+    if (write_file_atomic(UPDATE_STAGE_DIR "/MANIFEST.txt", manifest, strlen(manifest)) != 0) {
+        free(manifest);
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"failed to stage update manifest\"}\n", f);
+        fclose(f);
+        return;
+    }
+    free(manifest);
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"message\":\"update staging started\"}\n", f);
+    fclose(f);
+}
+
+static void render_update_chunk_json(int fd, const struct request *req) {
+    char name[64], offset_text[32], err[256];
+    char *hex;
+    long offset, wrote = 0;
+    FILE *f;
+    if (req->body_truncated) {
+        f = send_json_start(fd, "413 Payload Too Large");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"update chunk is too large\"}\n", f);
+        fclose(f);
+        return;
+    }
+    form_value(req->body, "file", name, sizeof(name));
+    form_value(req->body, "offset", offset_text, sizeof(offset_text));
+    offset = atol(offset_text);
+    hex = (char *)malloc(MAX_REQUEST_BODY);
+    if (!hex) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"not enough memory for update chunk\"}\n", f);
+        fclose(f);
+        return;
+    }
+    form_value(req->body, "hex", hex, MAX_REQUEST_BODY);
+    if (write_update_hex_chunk(name, offset, hex, err, sizeof(err), &wrote) != 0) {
+        free(hex);
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":", f); json_write_string(f, err);
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    }
+    free(hex);
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"file\":", f); json_write_string(f, name);
+    fprintf(f, ",\"offset\":%ld,\"bytes\":%ld}\n", offset, wrote);
+    fclose(f);
+}
+
+static void render_update_apply_json(int fd, const struct request *req) {
+    char *manifest;
+    char restart_text[16], backup_dir[256], updated[512];
+    char stage[256], dest[256], dest_tmp[288], backup[256], expected[40], actual[40];
+    int restart, count = 0, rc = 0;
+    size_t i;
+    struct stat st;
+    FILE *f;
+    form_value(req->body, "restart", restart_text, sizeof(restart_text));
+    restart = strcmp(restart_text, "0") != 0;
+    manifest = read_file_alloc(UPDATE_STAGE_DIR "/MANIFEST.txt", MAX_REQUEST_BODY, NULL);
+    if (!manifest) {
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"no staged update manifest found\"}\n", f);
+        fclose(f);
+        return;
+    }
+    for (i = 0; i < sizeof(UPDATE_FILES) / sizeof(UPDATE_FILES[0]); i++) {
+        update_stage_path(UPDATE_FILES[i], stage, sizeof(stage));
+        if (stat(stage, &st) != 0) continue;
+        count++;
+        if (!manifest_expected_md5(manifest, UPDATE_FILES[i], expected, sizeof(expected))) {
+            rc = -1;
+            snprintf(updated, sizeof(updated), "manifest has no md5 for %s", UPDATE_FILES[i]);
+            break;
+        }
+        if (file_md5(stage, actual, sizeof(actual)) != 0 || strcasecmp(expected, actual) != 0) {
+            rc = -1;
+            snprintf(updated, sizeof(updated), "md5 mismatch for %s", UPDATE_FILES[i]);
+            break;
+        }
+    }
+    if (rc == 0 && count <= 0) {
+        rc = -1;
+        snprintf(updated, sizeof(updated), "no staged binaries found");
+    }
+    if (rc != 0) {
+        free(manifest);
+        f = send_json_start(fd, "400 Bad Request");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":", f); json_write_string(f, updated);
+        fputs("}\n", f);
+        fclose(f);
+        return;
+    }
+    mkdir(UPDATE_BACKUP_DIR, 0755);
+    snprintf(backup_dir, sizeof(backup_dir), UPDATE_BACKUP_DIR "/%ld", (long)time(NULL));
+    mkdir(backup_dir, 0755);
+    updated[0] = 0;
+    for (i = 0; i < sizeof(UPDATE_FILES) / sizeof(UPDATE_FILES[0]); i++) {
+        update_stage_path(UPDATE_FILES[i], stage, sizeof(stage));
+        if (stat(stage, &st) != 0) continue;
+        update_dest_path(UPDATE_FILES[i], dest, sizeof(dest));
+        snprintf(dest_tmp, sizeof(dest_tmp), "%s.update", dest);
+        snprintf(backup, sizeof(backup), "%s/%s", backup_dir, UPDATE_FILES[i]);
+        if (stat(dest, &st) == 0) copy_file_raw(dest, backup);
+        unlink(dest_tmp);
+        if (copy_file_raw(stage, dest_tmp) != 0 || chmod(dest_tmp, 0755) != 0 || rename(dest_tmp, dest) != 0) {
+            char msg[160];
+            unlink(dest_tmp);
+            free(manifest);
+            f = send_json_start(fd, "500 Internal Server Error");
+            if (!f) return;
+            snprintf(msg, sizeof(msg), "failed to install %s", UPDATE_FILES[i]);
+            fputs("{\"ok\":false,\"error\":", f); json_write_string(f, msg);
+            fputs("}\n", f);
+            fclose(f);
+            return;
+        }
+        unlink(stage);
+        if (updated[0]) strncat(updated, ", ", sizeof(updated) - strlen(updated) - 1);
+        strncat(updated, UPDATE_FILES[i], sizeof(updated) - strlen(updated) - 1);
+    }
+    copy_file_raw(UPDATE_STAGE_DIR "/MANIFEST.txt", CODEX_BIN_DIR "/MANIFEST.txt");
+    chmod(CODEX_BIN_DIR "/MANIFEST.txt", 0644);
+    unlink(UPDATE_STAGE_DIR "/MANIFEST.txt");
+    sync();
+    free(manifest);
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"updated\":", f); json_write_string(f, updated);
+    fputs(",\"backupDir\":", f); json_write_string(f, backup_dir);
+    fputs(",\"restart\":", f); fputs(restart ? "true" : "false", f);
+    fputs("}\n", f);
+    fclose(f);
+    if (restart) {
+        system("(sleep 2; killall codex_bthid_keyboard 2>/dev/null; /data/codex/bin/codex_bthid_keyboard >> /cache/codex-bthid-keyboard.log 2>&1 & killall codex_webui 2>/dev/null; /data/codex/bin/codex_webui 8080 >> /cache/codex-init.log 2>&1 &) >/dev/null 2>&1 &");
+    }
+}
+
 static void render_bluetooth_call_json(int fd, const struct request *req) {
     char action[32], type[40], bdaddr[32], pin[24], code[MAX_BT_SEQUENCE_BODY], name[64], timeout_text[24], gap_text[24];
     char params[768], reply[8192], cmd[2048], esc_name[128], *jt = NULL, *ja = NULL, *jp = NULL, *jc = NULL;
@@ -4339,6 +4739,14 @@ static void handle_client(int client) {
         render_bluetooth_text_status_json(client);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-text") == 0) {
         render_bluetooth_text_json(client, &req);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/update-status") == 0) {
+        render_update_status_json(client);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-begin") == 0) {
+        render_update_begin_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-chunk") == 0) {
+        render_update_chunk_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-apply") == 0) {
+        render_update_apply_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/irdb-import") == 0) {
         render_irdb_import_json(client, &req);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/bundle") == 0) {
