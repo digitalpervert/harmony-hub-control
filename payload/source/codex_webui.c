@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -204,15 +205,102 @@ static int copy_file_raw(const char *src, const char *dst) {
     }
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (fwrite(buf, 1, n, out) != n) {
+            int saved_errno = errno;
             fclose(in);
             fclose(out);
             unlink(dst);
+            errno = saved_errno;
             return -1;
         }
     }
+    if (ferror(in)) {
+        int saved_errno = errno;
+        fclose(in);
+        fclose(out);
+        unlink(dst);
+        errno = saved_errno;
+        return -1;
+    }
     fclose(in);
-    fclose(out);
+    if (fclose(out) != 0) {
+        unlink(dst);
+        return -1;
+    }
     return 0;
+}
+
+static void remove_tree_simple(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        struct dirent *de;
+        if (d) {
+            while ((de = readdir(d)) != NULL) {
+                char child[512];
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+                snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+                remove_tree_simple(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+static void remove_dir_entries_with_prefix(const char *dir, const char *prefix) {
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    size_t prefix_len = strlen(prefix);
+    if (!d) return;
+    while ((de = readdir(d)) != NULL) {
+        char path[512];
+        if (strncmp(de->d_name, prefix, prefix_len) != 0) continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        remove_tree_simple(path);
+    }
+    closedir(d);
+}
+
+static int is_digit_name(const char *s) {
+    if (!s || !*s) return 0;
+    while (*s) {
+        if (!isdigit((unsigned char)*s)) return 0;
+        s++;
+    }
+    return 1;
+}
+
+static void prune_update_backups(int keep) {
+    struct backup_entry { long stamp; char name[64]; } entries[32], tmp;
+    DIR *d = opendir(UPDATE_BACKUP_DIR);
+    struct dirent *de;
+    int count = 0, i, j;
+    if (!d) return;
+    while ((de = readdir(d)) != NULL) {
+        if (!is_digit_name(de->d_name)) continue;
+        if (count >= (int)(sizeof(entries) / sizeof(entries[0]))) break;
+        entries[count].stamp = atol(de->d_name);
+        snprintf(entries[count].name, sizeof(entries[count].name), "%s", de->d_name);
+        count++;
+    }
+    closedir(d);
+    for (i = 0; i < count; i++) {
+        for (j = i + 1; j < count; j++) {
+            if (entries[j].stamp > entries[i].stamp) {
+                tmp = entries[i];
+                entries[i] = entries[j];
+                entries[j] = tmp;
+            }
+        }
+    }
+    for (i = keep; i < count; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", UPDATE_BACKUP_DIR, entries[i].name);
+        remove_tree_simple(path);
+    }
 }
 
 static char *json_escape_alloc(const char *s) {
@@ -2517,7 +2605,7 @@ static void page_end(FILE *f) {
         "function updateLog(t){const el=$('updateLog');if(el)el.textContent=t||'';}function updateAppend(t){const el=$('updateLog');if(!el)return;let p=el.textContent||'';if(/^Ready\\./.test(p))p='';el.textContent=(p?p+'\\n':'')+String(t||'');el.scrollTop=el.scrollHeight;}"
         "function updateBase(){let b=($('updateRepo')?.value||'').trim()||'https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/';return b.endsWith('/')?b:b+'/';}function updateToken(){return($('updateToken')?.value||'').trim();}"
         "function parseUpdateManifest(t){return String(t||'').replace(/\\r/g,'').split('\\n').map(line=>{const m=line.match(/^([0-9a-fA-F]{32})\\s+(\\S+)$/);return m?{md5:m[1].toLowerCase(),name:m[2]}:null;}).filter(x=>x&&UPDATE_NAMES.includes(x.name));}"
-        "async function updateFetch(name,token){if(token){const r=await fetch(UPDATE_API+encodeURIComponent(name)+'?ref=main',{headers:{'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'}});if(!r.ok)throw new Error('GitHub API '+name+' http '+r.status);const j=await r.json(),bin=atob(String(j.content||'').replace(/\\s/g,'')),u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return name==='MANIFEST.txt'?new TextDecoder().decode(u):u.buffer;}const r=await fetch(updateBase()+encodeURIComponent(name)+'?t='+Date.now());if(!r.ok)throw new Error('repo fetch '+name+' http '+r.status);return name==='MANIFEST.txt'?await r.text():await r.arrayBuffer();}"
+        "async function updateFetch(name,token){if(token){const r=await fetch(UPDATE_API+encodeURIComponent(name)+'?ref=main',{headers:{'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'}});if(!r.ok)throw new Error('GitHub API '+name+' http '+r.status+([401,403,404].includes(r.status)?' - check token access to the private repo':''));const j=await r.json(),bin=atob(String(j.content||'').replace(/\\s/g,'')),u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return name==='MANIFEST.txt'?new TextDecoder().decode(u):u.buffer;}const r=await fetch(updateBase()+encodeURIComponent(name)+'?t='+Date.now());if(!r.ok)throw new Error('repo fetch '+name+' http '+r.status+([401,403,404].includes(r.status)?' - private repos need the GitHub token field or a public raw mirror':''));return name==='MANIFEST.txt'?await r.text():await r.arrayBuffer();}"
         "function chunkHex(bytes,start,end){let s='';for(let i=start;i<end;i++)s+=HEX[bytes[i]];return s;}async function updateLocalStatus(){const j=await(await fetch('/api/update-status')).json();const lines=['Local control binaries:'];(j.files||[]).forEach(f=>lines.push((f.present?'ok ':'missing ')+f.name+' '+(f.md5||'')+' '+(f.size||0)+' bytes'));updateLog(lines.join('\\n'));return j;}"
         "async function updateCheckRepo(){try{updateLog('checking repository...');const token=updateToken(),manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest),local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);let changes=0;const lines=['Repository files:'];entries.forEach(e=>{const cur=byName[e.name]||{},same=cur.md5&&cur.md5.toLowerCase()===e.md5;changes+=same?0:1;lines.push((same?'current ':'update  ')+e.name+' repo '+e.md5+' local '+(cur.md5||'missing'));});lines.push(changes?changes+' file(s) need update.':'Already current.');updateLog(lines.join('\\n'));}catch(e){updateLog('update check failed: '+(e.message||e));}}"
         "async function updateInstallRepo(){try{const token=updateToken();updateLog('loading manifest...');const manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest);if(!entries.length)throw new Error('manifest has no updateable codex binaries');const local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);const todo=entries.filter(e=>!(byName[e.name]&&String(byName[e.name].md5||'').toLowerCase()===e.md5));if(!todo.length){updateLog('Already current.');return;}await postJson('/api/update-begin',{manifest:manifest});updateLog('staging '+todo.length+' file(s)...');for(const e of todo){updateAppend('fetch '+e.name);const buf=await updateFetch(e.name,token),bytes=new Uint8Array(buf);let off=0;while(off<bytes.length){const end=Math.min(off+24576,bytes.length),hex=chunkHex(bytes,off,end);await postJson('/api/update-chunk',{file:e.name,offset:String(off),hex:hex});off=end;updateAppend('  '+e.name+' '+off+' / '+bytes.length);} }const j=await postJson('/api/update-apply',{restart:'1'});updateAppend('installed: '+j.updated);updateAppend('backup: '+j.backupDir);updateAppend('services are restarting; refresh in about 5 seconds.');setTimeout(updateLocalStatus,6000);}catch(e){updateAppend('update failed: '+(e.message||e));}}"
@@ -2910,7 +2998,7 @@ static void system_panel(FILE *f) {
     html(f, info);
     fprintf(f, "</pre></details><details><summary>Logs</summary><pre>");
     html(f, logs[0] ? logs : "no matching logs");
-    fprintf(f, "</pre></details></div><div class='panel' style='margin-top:12px'><h3>Software Update</h3><div class='help'>Pull the latest control binaries from the GitHub repository, stage them on the hub, verify them against MANIFEST.txt, then restart the local services. Dropbear/SSH is left untouched.</div><div class='grid two'><div><label>Repository raw base URL</label><input id='updateRepo' value='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/'></div><div><label>GitHub token for private repo</label><input id='updateToken' type='password' autocomplete='off' placeholder='optional, used only by this browser'></div></div><div class='actions'><button id='updateCheck' type='button' class='secondary'>Check Repo</button><button id='updateInstall' type='button'>Install Update</button><button id='updateRefresh' type='button' class='secondary'>Refresh Local Status</button></div><pre id='updateLog' class='mini'>Ready. Check the repo before installing.</pre></div><div class='panel' style='margin-top:12px'><div class='help'>Reload discovery if Home Assistant does not show new entities after device or command changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Reload MQTT Discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot Hub</button></div></form></div></section>");
+    fprintf(f, "</pre></details></div><div class='panel' style='margin-top:12px'><h3>Software Update</h3><div class='help'>Pull the latest control binaries from the GitHub repository, stage them on the hub, verify them against MANIFEST.txt, then restart the local services. Dropbear/SSH is left untouched. This private repo needs a token unless you point the raw base URL at a public mirror.</div><div class='grid two'><div><label>Repository raw base URL</label><input id='updateRepo' value='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/'></div><div><label>GitHub token for private repo</label><input id='updateToken' type='password' autocomplete='off' placeholder='optional, used only by this browser'></div></div><div class='actions'><button id='updateCheck' type='button' class='secondary'>Check Repo</button><button id='updateInstall' type='button'>Install Update</button><button id='updateRefresh' type='button' class='secondary'>Refresh Local Status</button></div><pre id='updateLog' class='mini'>Ready. Check the repo before installing.</pre></div><div class='panel' style='margin-top:12px'><div class='help'>Reload discovery if Home Assistant does not show new entities after device or command changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Reload MQTT Discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot Hub</button></div></form></div></section>");
 }
 
 static void render_page(int fd, const char *message) {
@@ -4151,7 +4239,9 @@ static void render_update_apply_json(int fd, const struct request *req) {
         fclose(f);
         return;
     }
+    remove_dir_entries_with_prefix(CODEX_BIN_DIR, "codex_webui.prev");
     mkdir(UPDATE_BACKUP_DIR, 0755);
+    prune_update_backups(3);
     snprintf(backup_dir, sizeof(backup_dir), UPDATE_BACKUP_DIR "/%ld", (long)time(NULL));
     mkdir(backup_dir, 0755);
     updated[0] = 0;
@@ -4163,13 +4253,40 @@ static void render_update_apply_json(int fd, const struct request *req) {
         snprintf(backup, sizeof(backup), "%s/%s", backup_dir, UPDATE_FILES[i]);
         if (stat(dest, &st) == 0) copy_file_raw(dest, backup);
         unlink(dest_tmp);
-        if (copy_file_raw(stage, dest_tmp) != 0 || chmod(dest_tmp, 0755) != 0 || rename(dest_tmp, dest) != 0) {
+        if (copy_file_raw(stage, dest_tmp) != 0) {
             char msg[160];
+            int saved_errno = errno;
             unlink(dest_tmp);
             free(manifest);
             f = send_json_start(fd, "500 Internal Server Error");
             if (!f) return;
-            snprintf(msg, sizeof(msg), "failed to install %s", UPDATE_FILES[i]);
+            snprintf(msg, sizeof(msg), "failed to copy %s: %s", UPDATE_FILES[i], strerror(saved_errno));
+            fputs("{\"ok\":false,\"error\":", f); json_write_string(f, msg);
+            fputs("}\n", f);
+            fclose(f);
+            return;
+        }
+        if (chmod(dest_tmp, 0755) != 0) {
+            char msg[160];
+            int saved_errno = errno;
+            unlink(dest_tmp);
+            free(manifest);
+            f = send_json_start(fd, "500 Internal Server Error");
+            if (!f) return;
+            snprintf(msg, sizeof(msg), "failed to chmod %s: %s", UPDATE_FILES[i], strerror(saved_errno));
+            fputs("{\"ok\":false,\"error\":", f); json_write_string(f, msg);
+            fputs("}\n", f);
+            fclose(f);
+            return;
+        }
+        if (rename(dest_tmp, dest) != 0) {
+            char msg[160];
+            int saved_errno = errno;
+            unlink(dest_tmp);
+            free(manifest);
+            f = send_json_start(fd, "500 Internal Server Error");
+            if (!f) return;
+            snprintf(msg, sizeof(msg), "failed to rename %s: %s", UPDATE_FILES[i], strerror(saved_errno));
             fputs("{\"ok\":false,\"error\":", f); json_write_string(f, msg);
             fputs("}\n", f);
             fclose(f);
@@ -4182,6 +4299,7 @@ static void render_update_apply_json(int fd, const struct request *req) {
     copy_file_raw(UPDATE_STAGE_DIR "/MANIFEST.txt", CODEX_BIN_DIR "/MANIFEST.txt");
     chmod(CODEX_BIN_DIR "/MANIFEST.txt", 0644);
     unlink(UPDATE_STAGE_DIR "/MANIFEST.txt");
+    prune_update_backups(3);
     sync();
     free(manifest);
     f = send_json_start(fd, "200 OK");
@@ -4192,7 +4310,21 @@ static void render_update_apply_json(int fd, const struct request *req) {
     fputs("}\n", f);
     fclose(f);
     if (restart) {
-        system("(sleep 2; killall codex_bthid_keyboard 2>/dev/null; /data/codex/bin/codex_bthid_keyboard >> /cache/codex-bthid-keyboard.log 2>&1 & killall codex_webui 2>/dev/null; /data/codex/bin/codex_webui 8080 >> /cache/codex-init.log 2>&1 &) >/dev/null 2>&1 &");
+        pid_t pid;
+        shutdown(fd, SHUT_RDWR);
+        pid = fork();
+        if (pid == 0) {
+            close(fd);
+            setsid();
+            execl("/bin/sh", "sh", "-c",
+                  "sleep 3; "
+                  "killall codex_bthid_keyboard 2>/dev/null; "
+                  "/data/codex/bin/codex_bthid_keyboard >> /cache/codex-bthid-keyboard.log 2>&1 & "
+                  "killall codex_webui 2>/dev/null; "
+                  "/data/codex/bin/codex_webui 8080 >> /cache/codex-init.log 2>&1 &",
+                  (char *)NULL);
+            _exit(127);
+        }
     }
 }
 
