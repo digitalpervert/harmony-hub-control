@@ -220,7 +220,7 @@ $backupCmd = @'
 STAMP=$(date +%Y%m%d-%H%M%S)
 B=/data/codex-backups/webui-handoff-$STAMP
 mkdir -p "$B"
-for f in /etc/init.d/rcS.local /opt/luaworks/tasks/connectserver/netservicestarter.lua /usr/sbin/dropbear /usr/sbin/dropbearkey /data/codex/hub_id /data/codexmqtt/config.json; do
+for f in /etc/init.d/rcS.local /opt/luaworks/tasks/connectserver/netservicestarter.lua /usr/sbin/dropbear /usr/sbin/dropbearkey /data/codex/hub_id /data/codex/cloud_blocker.conf /data/codexmqtt/config.json; do
   if [ -e "$f" ]; then
     n=$(echo "$f" | sed 's#/#_#g')
     cp -p "$f" "$B/$n"
@@ -255,6 +255,11 @@ Upload-Bytes (Join-Path $Payload "mqtt\codexmqtt.lua") "/pkg/codexmqtt/codexmqtt
 
 Step "Uploading configuration"
 Upload-Text "$HubId`n" "/data/codex/hub_id" "644"
+if ($SkipCloudSuppression) {
+    Upload-Text "0`n" "/data/codex/cloud_blocker.conf" "644"
+} else {
+    Upload-Text "1`n" "/data/codex/cloud_blocker.conf" "644"
+}
 Upload-Text "1`n" "/etc/tdeenable" "644"
 Upload-Text "{""plugin"":""codexmqtt""}`n" "/pkg/codexmqtt/manifest.json" "644"
 Upload-Text (Build-MqttConfig) "/data/codexmqtt/config.json" "600"

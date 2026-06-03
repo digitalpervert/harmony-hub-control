@@ -22,6 +22,7 @@
 #define MQTT_CONFIG "/data/codexmqtt/config.json"
 #define WPA_CONFIG "/etc/wpa_supplicant.conf"
 #define HUB_ID_FILE "/data/codex/hub_id"
+#define CLOUD_BLOCKER_CONFIG "/data/codex/cloud_blocker.conf"
 #define DEVICE_LIST "/data/resources/DeviceList.json"
 #define FUNCTION_LIST "/data/resources/FunctionList.json"
 #define PROTOCOL_LIST "/data/resources/ProtocolList.json"
@@ -189,6 +190,59 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
         return -1;
     }
     sync();
+    return 0;
+}
+
+static int cloud_value_enabled(const char *raw) {
+    char value[32];
+    size_t i = 0;
+    while (*raw && isspace((unsigned char)*raw)) raw++;
+    while (*raw && !isspace((unsigned char)*raw) && i < sizeof(value) - 1) {
+        value[i++] = (char)tolower((unsigned char)*raw++);
+    }
+    value[i] = 0;
+    if (!value[0]) return 1;
+    return !(strcmp(value, "0") == 0 ||
+             strcmp(value, "off") == 0 ||
+             strcmp(value, "false") == 0 ||
+             strcmp(value, "disabled") == 0 ||
+             strcmp(value, "allow") == 0 ||
+             strcmp(value, "allowed") == 0);
+}
+
+static int cloud_value_known(const char *raw) {
+    char value[32];
+    size_t i = 0;
+    while (*raw && isspace((unsigned char)*raw)) raw++;
+    while (*raw && !isspace((unsigned char)*raw) && i < sizeof(value) - 1) {
+        value[i++] = (char)tolower((unsigned char)*raw++);
+    }
+    value[i] = 0;
+    return strcmp(value, "1") == 0 ||
+           strcmp(value, "on") == 0 ||
+           strcmp(value, "true") == 0 ||
+           strcmp(value, "enabled") == 0 ||
+           strcmp(value, "block") == 0 ||
+           strcmp(value, "blocked") == 0 ||
+           strcmp(value, "0") == 0 ||
+           strcmp(value, "off") == 0 ||
+           strcmp(value, "false") == 0 ||
+           strcmp(value, "disabled") == 0 ||
+           strcmp(value, "allow") == 0 ||
+           strcmp(value, "allowed") == 0;
+}
+
+
+static int load_cloud_blocker(void) {
+    char raw[32];
+    if (read_text(CLOUD_BLOCKER_CONFIG, raw, sizeof(raw)) <= 0) return 1;
+    return cloud_value_enabled(raw);
+}
+
+static int save_cloud_blocker(int enabled) {
+    const char *value = enabled ? "1" : "0";
+    if (write_file_atomic(CLOUD_BLOCKER_CONFIG, value, strlen(value)) != 0) return -1;
+    chmod(CLOUD_BLOCKER_CONFIG, 0644);
     return 0;
 }
 
@@ -608,6 +662,17 @@ static void send_file_download(int fd, const char *path, const char *filename, c
     send_all(fd, hdr, strlen(hdr));
     send_all(fd, data, len);
     free(data);
+}
+
+static void send_cloud_download(int fd) {
+    char hdr[512];
+    const char *body = load_cloud_blocker() ? "1\n" : "0\n";
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %lu\r\n"
+        "Cache-Control: no-store\r\nContent-Disposition: attachment; filename=\"cloud-blocker.conf\"\r\nConnection: close\r\n\r\n",
+        (unsigned long)strlen(body));
+    send_all(fd, hdr, strlen(hdr));
+    send_all(fd, body, strlen(body));
 }
 
 static FILE *send_json_start(int fd, const char *status) {
@@ -1383,7 +1448,7 @@ static void backup_settings(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "mkdir -p " RESOURCE_BACKUP_DIR "; d=" RESOURCE_BACKUP_DIR "/settings_$(date +%%Y%%m%%d_%%H%%M%%S); "
-        "mkdir -p \"$d\"; cp " MQTT_CONFIG " " WPA_CONFIG " \"$d\" 2>/dev/null");
+        "mkdir -p \"$d\"; cp " MQTT_CONFIG " " WPA_CONFIG " " CLOUD_BLOCKER_CONFIG " \"$d\" 2>/dev/null");
     system(cmd);
 }
 
@@ -1415,6 +1480,10 @@ static void send_bundle_download(int fd) {
     bundle_value(f, "ProtocolList.json", PROTOCOL_LIST, 1);
     bundle_value(f, "mqtt-config.json", MQTT_CONFIG, 1);
     bundle_value(f, "wpa_supplicant.conf", WPA_CONFIG, 1);
+    fputc(',', f);
+    json_write_string(f, "cloud-blocker.conf");
+    fputc(':', f);
+    json_write_string(f, load_cloud_blocker() ? "1\n" : "0\n");
     fputs("}}\n", f);
     fclose(f);
 }
@@ -2484,7 +2553,7 @@ static void page_head(FILE *f, const char *title) {
         ".setup-shell{padding:0;overflow:hidden}.wizard-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.wizard-top h3{margin:0}.wizard-grid{display:grid;grid-template-columns:210px 1fr;min-height:420px}.stepper{border-right:1px solid var(--line);background:#f8fbfa;padding:12px;display:grid;align-content:start;gap:6px}.step{display:grid;grid-template-columns:28px 1fr;gap:9px;align-items:center;width:100%;text-align:left;background:transparent;color:var(--fg);border-color:transparent;padding:10px}.step span{width:26px;height:26px;border-radius:999px;display:grid;place-items:center;background:#fff;border:1px solid var(--line);color:var(--accent);font-weight:750}.step.active{background:#fff;border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04)}.wizard-body{padding:18px}.wizard-panel{display:none}.wizard-panel.active{display:block}.wizard-status{min-height:20px;margin-top:10px;color:var(--muted)}.device-sync{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.guide-steps{display:grid;gap:8px;margin:10px 0 12px}.guide-step{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;border:1px solid var(--line);background:var(--wash);border-radius:8px;padding:9px 10px}.guide-step b{width:22px;height:22px;border-radius:999px;background:var(--soft2);color:var(--accent);display:grid;place-items:center;font-size:12px}.lab-layout,.bt-layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:14px}.bt-script-layout{display:grid;grid-template-columns:1fr;gap:12px}.bt-script-tools{display:grid;gap:8px;align-content:start}.lab-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.lab-quick{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0 12px}.lab-quick button{text-align:left;min-height:50px;background:#fff;color:var(--accent);border-color:var(--accent)}.lab-quick button:hover{background:#f8fbfa;border-color:#0b625c}.lab-quick button .queue-meta{color:var(--muted);font-weight:600}.lab-presets,.queue-tools{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.lab-presets button,.queue-tools button{padding:6px 9px;font-size:12px}.lab-advanced{margin-top:12px}.inline-check{display:inline-flex;align-items:center;gap:8px;margin-top:10px}.lab-summary{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--wash);padding:9px 10px;margin:8px 0;color:var(--muted);font-size:12px}.queue-list{display:grid;gap:7px;max-height:390px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:8px}.queue-row{display:grid;grid-template-columns:auto 1fr auto;gap:9px;align-items:start;background:#fff;border:1px solid var(--line);border-radius:7px;padding:8px}.queue-row strong{display:block}.queue-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.meter{height:8px;border-radius:999px;background:#e7eeec;overflow:hidden}.meter span{display:block;height:100%;width:0;background:var(--accent)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}"
         "@media(max-width:860px){.app-shell{grid-template-columns:1fr;padding-top:14px}.side-menu{position:sticky;top:62px;z-index:2;display:flex;overflow-x:auto;gap:6px;border-radius:10px;box-shadow:0 4px 16px rgba(25,41,37,.06);scrollbar-width:thin}.menu-item{min-width:168px}.row,.wizard-grid,.device-sync,.lab-layout,.bt-layout,.bt-script-layout{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.command{grid-template-columns:1fr}.stepper{border-right:0;border-bottom:1px solid var(--line);grid-template-columns:repeat(2,1fr)}}"
         "@media(max-width:520px){.topbar{align-items:flex-start;flex-direction:column}.app-shell{padding:12px}.side-menu{position:static;display:grid;grid-template-columns:1fr 1fr}.menu-item{min-width:0}.section-head{align-items:flex-start;flex-direction:column}.actions button,.actions a.button{width:100%}}"
-        "</style></head><body><header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><div><h1>Harmony Hub Control</h1><small>Local smart home console</small></div></div><div class='top-status'><span class='pill'>Local control</span><span class='pill'>Cloud services off</span></div></div></header><main class='app-shell'><aside class='side-menu' aria-label='Main menu'><button type='button' class='menu-item active' data-view-target='overview'><span>D</span><div><strong>Dashboard</strong><small>Status overview</small></div></button><button type='button' class='menu-item' data-view-target='ir'><span>IR</span><div><strong>IR Devices</strong><small>Add and test remotes</small></div></button><button type='button' class='menu-item' data-view-target='lab'><span>L</span><div><strong>Bulk IR Test</strong><small>Search and queue codes</small></div></button><button type='button' class='menu-item' data-view-target='bluetooth'><span>BT</span><div><strong>Bluetooth</strong><small>Pair as a keyboard</small></div></button><button type='button' class='menu-item' data-view-target='mqtt'><span>M</span><div><strong>MQTT</strong><small>Home Assistant link</small></div></button><button type='button' class='menu-item' data-view-target='wifi'><span>W</span><div><strong>Wi-Fi</strong><small>Network settings</small></div></button><button type='button' class='menu-item' data-view-target='backup'><span>B</span><div><strong>Backup</strong><small>Import and export</small></div></button><button type='button' class='menu-item' data-view-target='system'><span>S</span><div><strong>System</strong><small>Logs and updates</small></div></button></aside><div class='content'>",
+        "</style></head><body><header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><div><h1>Harmony Hub Control</h1><small>Local smart home console</small></div></div><div class='top-status'><span class='pill'>Local control</span><span class='pill'>Cloud blocker setting</span></div></div></header><main class='app-shell'><aside class='side-menu' aria-label='Main menu'><button type='button' class='menu-item active' data-view-target='overview'><span>D</span><div><strong>Dashboard</strong><small>Status overview</small></div></button><button type='button' class='menu-item' data-view-target='ir'><span>IR</span><div><strong>IR Devices</strong><small>Add and test remotes</small></div></button><button type='button' class='menu-item' data-view-target='lab'><span>L</span><div><strong>Bulk IR Test</strong><small>Search and queue codes</small></div></button><button type='button' class='menu-item' data-view-target='bluetooth'><span>BT</span><div><strong>Bluetooth</strong><small>Pair as a keyboard</small></div></button><button type='button' class='menu-item' data-view-target='mqtt'><span>M</span><div><strong>MQTT</strong><small>Home Assistant link</small></div></button><button type='button' class='menu-item' data-view-target='wifi'><span>W</span><div><strong>Wi-Fi</strong><small>Network settings</small></div></button><button type='button' class='menu-item' data-view-target='backup'><span>B</span><div><strong>Backup</strong><small>Import and export</small></div></button><button type='button' class='menu-item' data-view-target='system'><span>S</span><div><strong>System</strong><small>Logs and updates</small></div></button></aside><div class='content'>",
         f);
 }
 
@@ -2745,6 +2814,7 @@ static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
     char hub_id[64] = "16042906";
     int mqtt_up = tcp_established(mqtt->host, mqtt->port);
     int device_count = -1, command_count = 0;
+    int cloud_blocked = load_cloud_blocker();
     read_text("/proc/uptime", uptime, sizeof(uptime));
     read_text("/etc/version", version, sizeof(version));
     chomp(uptime);
@@ -2781,7 +2851,10 @@ static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
     fprintf(f, "<div class='stat'><div class='label'>IR Inventory</div><div class='value'>");
     html(f, inventory_label);
     fprintf(f, "</div><div class='muted mini'>%d commands</div></div>", command_count);
-    fprintf(f, "<div class='stat'><div class='label'>Cloud services</div><div class='value'><span class='badge ok'>off</span></div></div>");
+    fprintf(f, "<div class='stat'><div class='label'>Logitech cloud</div><div class='value'><span class='badge %s'>%s</span></div><div class='muted mini'>%s</div></div>",
+        cloud_blocked ? "ok" : "warn",
+        cloud_blocked ? "blocked" : "allowed",
+        cloud_blocked ? "local control only" : "takes effect after restart");
     fprintf(f, "<div class='stat'><div class='label'>Activity API</div><div class='value'><span class='badge %s'>%s</span></div></div>",
         activity[0] ? "ok" : "warn", activity[0] ? "responding" : "quiet");
     fprintf(f, "</div><div class='quick-actions'><button type='button' data-view-target='ir'><strong>Add or edit remotes</strong><div class='muted mini'>Find codes, learn missing buttons, and test commands.</div></button><button type='button' data-view-target='lab'><strong>Bulk test IR codes</strong><div class='muted mini'>Search many code files, skip duplicates, then send a queue.</div></button><button type='button' data-view-target='mqtt'><strong>Set up Home Assistant</strong><div class='muted mini'>Configure MQTT topics, discovery, and state publishing.</div></button><button type='button' data-view-target='wifi'><strong>Change Wi-Fi</strong><div class='muted mini'>Update the network and reboot when you are ready.</div></button><button type='button' data-view-target='backup'><strong>Back up settings</strong><div class='muted mini'>Download a restore point before larger changes.</div></button></div><div class='grid' style='margin-top:12px'>");
@@ -2831,6 +2904,7 @@ static void backup_panel(FILE *f) {
     fprintf(f, "<a class='button' href='/export/protocols'>Protocols</a>");
     fprintf(f, "<a class='button' href='/export/mqtt'>MQTT</a>");
     fprintf(f, "<a class='button' href='/export/wifi'>Wi-Fi</a>");
+    fprintf(f, "<a class='button' href='/export/cloud'>Cloud blocker</a>");
     fprintf(f, "</div></div>");
     fprintf(f, "<div class='panel'><h3>Restore from backup</h3><div class='help'>Choose what the pasted backup contains. Wi-Fi restores are saved immediately but do not take effect until reboot.</div><form method='post' action='/import#backup'>");
     fprintf(f, "<label for='backupTarget'>Backup type</label><select id='backupTarget' name='target'>");
@@ -2840,6 +2914,7 @@ static void backup_panel(FILE *f) {
     fprintf(f, "<option value='protocols'>ProtocolList.json</option>");
     fprintf(f, "<option value='mqtt'>MQTT config</option>");
     fprintf(f, "<option value='wifi'>Wi-Fi config</option>");
+    fprintf(f, "<option value='cloud'>Cloud blocker setting</option>");
     fprintf(f, "</select>");
     fprintf(f, "<label for='importFile'>Backup file</label><input id='importFile' type='file'>");
     fprintf(f, "<label for='backupPayload'>Backup contents</label><textarea id='backupPayload' class='textarea-tall' name='payload' spellcheck='false' required></textarea>");
@@ -3058,6 +3133,7 @@ static void bluetooth_panel(FILE *f) {
 
 static void system_panel(FILE *f) {
     char info[8192], logs[8192];
+    int cloud_blocked = load_cloud_blocker();
     run_cmd("echo '--- uname ---'; uname -a; echo; echo '--- memory ---'; cat /proc/meminfo; echo; echo '--- mounts ---'; mount; echo; echo '--- processes ---'; ps", info, sizeof(info));
     run_cmd("echo '--- startup log ---'; cat /cache/codex-init.log 2>/dev/null; echo; echo '--- recovery log ---'; cat /cache/codex-recovery.log 2>/dev/null; echo; echo '--- local service syslog ---'; logread 2>/dev/null | grep -i 'codex\\|mqtt' 2>/dev/null", logs, sizeof(logs));
     fprintf(f, "<section id='view-system' data-view='system' class='section'><div class='section-head'><div><h2>System</h2><div class='section-lead'>Check device information, read logs, update the web interface, or reboot when a saved change needs it.</div></div></div>");
@@ -3065,7 +3141,12 @@ static void system_panel(FILE *f) {
     html(f, info);
     fprintf(f, "</pre></details><details><summary>Logs</summary><pre>");
     html(f, logs[0] ? logs : "no matching logs");
-    fprintf(f, "</pre></details></div><div class='panel' style='margin-top:12px'><h3>Software update</h3><div class='help'>Check GitHub for newer files, copy them to the hub, verify checksums, and restart the local services. SSH access is not changed. The default public repository works without a token. Use the token field only for private repositories.</div><form id='updateForm' autocomplete='off' onsubmit='return false'><div class='grid two'><div><label for='updateRepo'>Optional public mirror URL</label><input id='updateRepo' autocomplete='url' value='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/'></div><div><label for='updateToken'>GitHub token (private repos only)</label><input id='updateToken' type='password' autocomplete='new-password' placeholder='optional; used only by this browser'></div></div><div class='actions'><button id='updateCheck' type='button' class='secondary'>Check for updates</button><button id='updateInstall' type='button'>Install update</button><button id='updateRefresh' type='button' class='secondary'>Show installed versions</button></div></form><pre id='updateLog' class='mini'>Ready. Check the public repo, or paste a token if the repo is private.</pre></div><div class='panel' style='margin-top:12px'><div class='help'>Refresh Home Assistant discovery if new devices or commands do not appear after changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Refresh Home Assistant discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot hub</button></div></form></div></section>");
+    fprintf(f, "</pre></details></div>");
+    fprintf(f, "<div class='panel' style='margin-top:12px'><h3>Cloud blocker</h3><div class='help'>Block Logitech cloud background services while keeping local web, MQTT, Bluetooth, Wi-Fi recovery, and SSH control available. The change is saved immediately and is applied by the Harmony network service after reboot or network reconnect.</div><form method='post' action='/system#system'>");
+    fprintf(f, "<label class='inline-check'><input type='checkbox' name='cloudBlocker' value='1' %s> Block Logitech cloud services</label>", cloud_blocked ? "checked" : "");
+    fprintf(f, "<div class='help'>Current saved mode: <strong>%s</strong>. Blocking prevents cloudapi, PubNub, and package manager tasks from starting.</div>", cloud_blocked ? "blocked" : "allowed after restart");
+    fprintf(f, "<div class='actions'><button name='action' value='cloud' type='submit'>Save cloud blocker setting</button><button name='action' value='cloud_reboot' type='submit' class='secondary'>Save and reboot</button></div></form></div>");
+    fprintf(f, "<div class='panel' style='margin-top:12px'><h3>Software update</h3><div class='help'>Check GitHub for newer files, copy them to the hub, verify checksums, and restart the local services. SSH access is not changed. The default public repository works without a token. Use the token field only for private repositories.</div><form id='updateForm' autocomplete='off' onsubmit='return false'><div class='grid two'><div><label for='updateRepo'>Optional public mirror URL</label><input id='updateRepo' autocomplete='url' value='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/'></div><div><label for='updateToken'>GitHub token (private repos only)</label><input id='updateToken' type='password' autocomplete='new-password' placeholder='optional; used only by this browser'></div></div><div class='actions'><button id='updateCheck' type='button' class='secondary'>Check for updates</button><button id='updateInstall' type='button'>Install update</button><button id='updateRefresh' type='button' class='secondary'>Show installed versions</button></div></form><pre id='updateLog' class='mini'>Ready. Check the public repo, or paste a token if the repo is private.</pre></div><div class='panel' style='margin-top:12px'><div class='help'>Refresh Home Assistant discovery if new devices or commands do not appear after changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Refresh Home Assistant discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot hub</button></div></form></div></section>");
 }
 
 static void render_page(int fd, const char *message) {
@@ -3174,6 +3255,19 @@ static void handle_system(int fd, const struct request *req) {
         render_page(fd, "Rebooting now.");
         sync();
         system("/sbin/reboot >/dev/null 2>&1 &");
+    } else if (strcmp(action, "cloud") == 0 || strcmp(action, "cloud_reboot") == 0) {
+        int enabled = form_checked(req->body, "cloudBlocker");
+        if (save_cloud_blocker(enabled) != 0) {
+            render_page(fd, "Failed to save cloud blocker setting.");
+            return;
+        }
+        if (strcmp(action, "cloud_reboot") == 0) {
+            render_page(fd, enabled ? "Cloud blocker enabled. Rebooting now." : "Cloud blocker disabled. Rebooting now.");
+            sync();
+            system("/sbin/reboot >/dev/null 2>&1 &");
+        } else {
+            render_page(fd, enabled ? "Cloud blocker enabled. Reboot when ready to apply it." : "Cloud blocker disabled. Reboot when ready to allow Logitech cloud services.");
+        }
     } else if (strcmp(action, "rediscover") == 0) {
         trigger_mqtt_discover();
         render_page(fd, "MQTT discovery reload requested.");
@@ -3205,6 +3299,7 @@ static const char *import_path_for_target(const char *target) {
     if (strcmp(target, "protocols") == 0) return PROTOCOL_LIST;
     if (strcmp(target, "mqtt") == 0) return MQTT_CONFIG;
     if (strcmp(target, "wifi") == 0) return WPA_CONFIG;
+    if (strcmp(target, "cloud") == 0) return CLOUD_BLOCKER_CONFIG;
     return NULL;
 }
 
@@ -3215,6 +3310,7 @@ static const char *import_label_for_target(const char *target) {
     if (strcmp(target, "protocols") == 0) return "ProtocolList.json";
     if (strcmp(target, "mqtt") == 0) return "MQTT config";
     if (strcmp(target, "wifi") == 0) return "Wi-Fi config";
+    if (strcmp(target, "cloud") == 0) return "cloud blocker setting";
     return "import";
 }
 
@@ -3231,6 +3327,11 @@ static int validate_import_payload(const char *target, const char *payload, char
     if (strcmp(target, "wifi") == 0) {
         if (strstr(payload, "network={") && strstr(payload, "ssid=")) return 0;
         snprintf(msg, msglen, "Wi-Fi import must look like a wpa_supplicant config with a network block and ssid.");
+        return -1;
+    }
+    if (strcmp(target, "cloud") == 0) {
+        if (cloud_value_known(payload)) return 0;
+        snprintf(msg, msglen, "Cloud blocker import must be 1, 0, on, off, true, false, enabled, or disabled.");
         return -1;
     }
     if (!looks_like_json_object(payload)) {
@@ -3266,6 +3367,8 @@ static int bundle_extract(const char *bundle, const char *key, char *out, size_t
 
 static void handle_import_bundle(int fd, const char *payload) {
     char msg[256];
+    char cloud[32] = "";
+    char *cloud_value;
     char *devices, *functions, *protocols, *mqtt, *wifi;
     devices = (char *)malloc(MAX_REQUEST_BODY);
     functions = (char *)malloc(MAX_REQUEST_BODY);
@@ -3295,6 +3398,13 @@ static void handle_import_bundle(int fd, const char *payload) {
         free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
         return;
     }
+    json_string(payload, "cloud-blocker.conf", cloud, sizeof(cloud));
+    cloud_value = trim_payload(cloud);
+    if (cloud_value[0] && validate_import_payload("cloud", cloud_value, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        return;
+    }
     backup_resources();
     backup_settings();
     if (write_file_atomic(DEVICE_LIST, devices, strlen(devices)) != 0 ||
@@ -3308,6 +3418,11 @@ static void handle_import_bundle(int fd, const char *payload) {
     }
     chmod(MQTT_CONFIG, 0600);
     chmod(WPA_CONFIG, 0600);
+    if (cloud_value[0] && save_cloud_blocker(cloud_value_enabled(cloud_value)) != 0) {
+        render_page(fd, "Bundle imported most files, but failed to save the cloud blocker setting.");
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        return;
+    }
     request_resource_reload();
     render_page(fd, "Backup bundle imported. Reboot when ready if Wi-Fi settings changed.");
     free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
@@ -3364,6 +3479,12 @@ static void handle_import(int fd, const struct request *req) {
     } else if (strcmp(target, "wifi") == 0) {
         chmod(WPA_CONFIG, 0600);
         render_page(fd, "Wi-Fi settings imported. Reboot when ready to use them.");
+    } else if (strcmp(target, "cloud") == 0) {
+        if (save_cloud_blocker(cloud_value_enabled(payload)) != 0) {
+            render_page(fd, "Failed to import cloud blocker setting.");
+        } else {
+            render_page(fd, "Cloud blocker setting imported. Reboot when ready to apply it.");
+        }
     } else {
         request_resource_reload();
         snprintf(msg, sizeof(msg), "Imported %s and requested a Harmony resource reload.", import_label_for_target(target));
@@ -4960,6 +5081,8 @@ static void handle_client(int client) {
         send_file_download(client, MQTT_CONFIG, "mqtt-config.json", "application/json");
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/wifi") == 0) {
         send_file_download(client, WPA_CONFIG, "wpa_supplicant.conf", "text/plain");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/cloud") == 0) {
+        send_cloud_download(client);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/mqtt") == 0) {
         handle_mqtt(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/wifi") == 0) {

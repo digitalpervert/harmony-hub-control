@@ -332,6 +332,23 @@ async function main() {
       log: log.slice(-900)
     };
   })()`, 90000);
+  const systemUi = await evaluate(`(async () => {
+    showView('system');
+    const checkbox = document.querySelector('input[name="cloudBlocker"]');
+    let exported = '';
+    try {
+      const r = await fetch('/export/cloud');
+      exported = (await r.text()).trim();
+    } catch (e) {
+      exported = 'fetch failed: ' + (e.message || e);
+    }
+    return {
+      cloudBlockerControl: !!checkbox,
+      cloudBlockerChecked: checkbox ? checkbox.checked : null,
+      cloudExport: exported,
+      text: document.querySelector('#view-system')?.innerText?.slice(0, 1200) || ''
+    };
+  })()`, 30000);
   const screenshot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
   const screenshotPath = path.join(outDir, `harmony-ui-${Date.now()}.png`);
   fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
@@ -347,6 +364,7 @@ async function main() {
     wizardFlow,
     lab,
     updateUi,
+    systemUi,
     browserMessages: eventText(recentEvents),
     failedNetwork: failedNetwork(recentEvents),
     screenshotPath,

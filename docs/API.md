@@ -167,10 +167,14 @@ GET /export/functions
 GET /export/protocols
 GET /export/mqtt
 GET /export/wifi
+GET /export/cloud
 ```
 
 Exports are for backups and debugging. Do not share files containing local
 network or credential material.
+
+`/export/cloud` returns `1` when the Logitech cloud blocker is enabled and `0`
+when cloud tasks are allowed on the next network start.
 
 ## Software Updates
 

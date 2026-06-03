@@ -107,6 +107,12 @@ The installer will prompt for missing values, create a backup on the hub, upload
 the runtime, start Dropbear if needed, start the web UI, and write MQTT config
 if provided.
 
+By default the installer enables the web UI's cloud blocker setting. That keeps
+Logitech cloudapi, PubNub, and package-manager background tasks from starting
+while local web, MQTT, Bluetooth, Wi-Fi recovery, and SSH control continue to
+work. Owners can change it later from **System > Cloud blocker**; reboot or
+reconnect the network afterward to apply the saved mode.
+
 Open the UI afterward:
 
 ```text

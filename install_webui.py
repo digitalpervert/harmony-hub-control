@@ -208,7 +208,7 @@ class Installer:
 STAMP=$(date +%Y%m%d-%H%M%S)
 B=/data/codex-backups/webui-handoff-$STAMP
 mkdir -p "$B"
-for f in /etc/init.d/rcS.local /opt/luaworks/tasks/connectserver/netservicestarter.lua /usr/sbin/dropbear /usr/sbin/dropbearkey /data/codex/hub_id /data/codexmqtt/config.json; do
+for f in /etc/init.d/rcS.local /opt/luaworks/tasks/connectserver/netservicestarter.lua /usr/sbin/dropbear /usr/sbin/dropbearkey /data/codex/hub_id /data/codex/cloud_blocker.conf /data/codexmqtt/config.json; do
   if [ -e "$f" ]; then
     n=$(echo "$f" | sed 's#/#_#g')
     cp -p "$f" "$B/$n"
@@ -246,6 +246,7 @@ echo "$B"
 
         step("Uploading configuration")
         self.upload_text(f"{hub_id}\n", "/data/codex/hub_id", "644")
+        self.upload_text("0\n" if self.args.skip_cloud_suppression else "1\n", "/data/codex/cloud_blocker.conf", "644")
         self.upload_text("1\n", "/etc/tdeenable", "644")
         self.upload_text('{"plugin":"codexmqtt"}\n', "/pkg/codexmqtt/manifest.json", "644")
         self.upload_text(self.build_mqtt_config(), "/data/codexmqtt/config.json", "600")

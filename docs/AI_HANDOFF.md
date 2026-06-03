@@ -23,8 +23,9 @@ already rooted Logitech Harmony Hub.
 - `payload/mqtt/codexmqtt.lua`: Home Assistant MQTT bridge.
 - `payload/scripts/init.sh`: hub boot startup for local services.
 - `payload/scripts/recovery_ap.sh`: reset-button recovery AP flow.
-- `payload/scripts/netservicestarter.lua`: cloud-suppressed local service
-  starter.
+- `payload/scripts/netservicestarter.lua`: local service starter that reads
+  `/data/codex/cloud_blocker.conf` before starting or blocking Logitech cloud
+  tasks.
 - `install_webui.ps1`: Windows SSH uploader/installer.
 - `install_webui.py`: Linux/macOS Python SSH uploader/installer.
 - `restore_backup.ps1`: rollback helper.
@@ -40,6 +41,7 @@ already rooted Logitech Harmony Hub.
 /data/codex/init.sh
 /data/codex/recovery_ap.sh
 /data/codex/hub_id
+/data/codex/cloud_blocker.conf
 /data/codexmqtt/config.json
 /pkg/codexmqtt/codexmqtt.lua
 /usr/sbin/dropbear
@@ -64,6 +66,10 @@ already rooted Logitech Harmony Hub.
   per key and avoids long key-held repeats.
 - MQTT should publish enough state for Home Assistant debugging, including IP
   address and bridge health.
+- Cloud blocker defaults to enabled. The System page saves
+  `/data/codex/cloud_blocker.conf`; missing or `1` blocks cloudapi, PubNub, and
+  package-manager tasks, while `0` allows them after reboot or network
+  reconnect.
 
 ## Verification Checklist
 

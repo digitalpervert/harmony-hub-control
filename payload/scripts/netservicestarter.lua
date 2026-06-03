@@ -13,6 +13,56 @@ local ssdpDiscovery
 local halConnect
 local hbusHttpServerConnect
 local ltcpServerConnector
+local cloudapi
+local pubnubServerConnect
+local packagemgr
+
+local function cloudBlockerEnabled()
+  if not io or not io.open then
+    return true
+  end
+  local f = io.open("/data/codex/cloud_blocker.conf", "r")
+  if not f then
+    return true
+  end
+  local value = string.lower(tostring(f:read("*l") or ""))
+  f:close()
+  return not (value == "0" or value == "off" or value == "false" or value == "disabled" or value == "allow" or value == "allowed")
+end
+
+local function startCloudModule(label, moduleName)
+  log.notice("starting " .. label .. " task")
+  local ok, task = pcall(require, moduleName)
+  if not ok then
+    log.notice("codex cloud task load failed", label, tostring(task))
+    return nil
+  end
+  if task and task.start then
+    local started, err = pcall(function()
+      task.start()
+    end)
+    if not started then
+      log.notice("codex cloud task start failed", label, tostring(err))
+    end
+  end
+  return task
+end
+
+local function maybeStartCloudTasks()
+  if cloudBlockerEnabled() then
+    log.notice("codex cloud blocker active: cloudapi, pubnub, and packagemgr background tasks not started")
+    return
+  end
+  if not cloudapi then
+    cloudapi = startCloudModule("cloudapi", "tasks.connectserver.transport.cloudapi")
+  end
+  if not pubnubServerConnect then
+    pubnubServerConnect = startCloudModule("PubNub Connection", "tasks.connectserver.transport.pubnubwrapper")
+  end
+  if not packagemgr or (packagemgr.taskStatus and packagemgr.taskStatus() == "dead") then
+    packagemgr = startCloudModule("packagemgr", "tasks.connectserver.transport.packagemgr")
+  end
+end
 
 local function logWifiEvent(name, id)
   local usageLog = require("tasks.crashlog.apihandler.usagelog")
@@ -68,7 +118,7 @@ local function handleEvent(event)
     end
 
     if event.label ~= "lo" then
-      log.notice("codex cloud suppression active: cloudapi, pubnub, and packagemgr background tasks not started")
+      maybeStartCloudTasks()
       system.broadcastMessageExceptMeNoWarning(MSG_NETSERVICE_NEW_ADDRESS, {
         label = event.label,
         ipaddr = event.address
