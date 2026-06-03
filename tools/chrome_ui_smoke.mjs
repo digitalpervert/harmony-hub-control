@@ -237,6 +237,44 @@ async function main() {
     }
     return out;
   })()`, 90000);
+  const wizardFlow = await evaluate(`(async () => {
+    showView('ir');
+    showWizardPanel('device');
+    const before = (await (await fetch('/api/inventory')).json()).deviceCount;
+    document.querySelector('#newDeviceName').value = 'LG C5';
+    document.querySelector('#newDeviceType').value = 'Television';
+    document.querySelector('#newDeviceManufacturer').value = 'LG';
+    document.querySelector('#newDeviceModel').value = 'C5';
+    document.querySelector('#profileDeviceForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await new Promise((resolve) => {
+      const started = Date.now();
+      const poll = setInterval(() => {
+        const panel = document.querySelector('.wizard-panel.active')?.dataset.panel;
+        const q = document.querySelector('#irdbSearch')?.value || '';
+        const status = document.querySelector('#irdbStatus')?.textContent || '';
+        if ((panel === 'library' && q === 'LG C5' && status) || Date.now() - started > 45000) {
+          clearInterval(poll);
+          resolve();
+        }
+      }, 250);
+    });
+    const sourceAfterSave = document.querySelector('#irdbSource')?.value || '';
+    document.querySelector('#irdbSource').value = 'irdb';
+    document.querySelector('#irdbSource').dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = (await (await fetch('/api/inventory')).json()).deviceCount;
+    return {
+      before,
+      after,
+      activePanel: document.querySelector('.wizard-panel.active')?.dataset.panel || '',
+      search: document.querySelector('#irdbSearch')?.value || '',
+      source: document.querySelector('#irdbSource')?.value || '',
+      selectedDevice: document.querySelector('#irdbDevice')?.value || '',
+      status: document.querySelector('#irdbStatus')?.textContent || '',
+      sourceAfterSave,
+      profileStatus: document.querySelector('#profileStatus')?.textContent || ''
+    };
+  })()`, 90000);
   const lab = await evaluate(`(async () => {
     showView('lab');
     document.querySelector('#labSource').value = 'all';
@@ -280,6 +318,7 @@ async function main() {
     api,
     irSearch,
     lgSearch,
+    wizardFlow,
     lab,
     updateUi,
     browserMessages: eventText(recentEvents),
