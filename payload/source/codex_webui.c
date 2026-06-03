@@ -33,6 +33,7 @@
 #define BT_TEXT_FIFO "/tmp/bthid_input"
 #define BT_TEXT_STATUS "/tmp/bthid_status"
 #define BT_TARGET_FILE "/data/codex/bthid_target"
+#define BT_DEVICE_STORE "/data/codex/bt-devices.json"
 #define CODEX_BIN_DIR "/data/codex/bin"
 #define UPDATE_STAGE_DIR "/tmp/codex_update"
 #define UPDATE_BACKUP_DIR "/data/codex/update-backups"
@@ -45,6 +46,9 @@
 #define MAX_IR_STORED_COMMANDS 2048
 #define MAX_IR_BATCH_COMMANDS 1024
 #define MAX_BT_SEQUENCE_BODY 32768
+#define MAX_BT_DEVICES 12
+#define MAX_BT_COMMANDS 32
+#define MAX_BT_SCRIPT_LEN 2048
 
 static const char *UPDATE_FILES[] = {
     "codex_webui",
@@ -96,6 +100,7 @@ struct ir_command {
     char id[32];
     char name[128];
     char keycode[256];
+    char raw[2048];
     int protocol_id;
     int learned;
     int has_raw;
@@ -120,8 +125,32 @@ struct ir_inventory {
     struct ir_device devices[MAX_IR_DEVICES];
 };
 
+struct bt_saved_command {
+    char name[128];
+    char script[MAX_BT_SCRIPT_LEN];
+    int delay_ms;
+};
+
+struct bt_saved_device {
+    char id[40];
+    char name[128];
+    char type[40];
+    char bdaddr[32];
+    int command_count;
+    struct bt_saved_command commands[MAX_BT_COMMANDS];
+};
+
+struct bt_inventory {
+    int device_count;
+    struct bt_saved_device devices[MAX_BT_DEVICES];
+};
+
 static void analyze_capture_storage(const char *raw_code, const char *keycode_in, const char *nec_in, const char *protocol_text, char *mode_out, size_t mode_len, char *keycode_out, size_t keycode_len, char *nec_out, size_t nec_len, int *protocol_id_out, char *summary, size_t summary_len);
 static int repair_known_protocols_for_current_commands(void);
+static int safe_bt_addr(const char *s);
+static int bt_type_allowed(const char *type);
+static void save_bthid_target(const char *type, const char *bdaddr);
+static int run_bt_saved_script(const char *type, const char *bdaddr, const char *script, int gap_ms, char *out, size_t outlen);
 
 static void chomp(char *s) {
     size_t n = strlen(s);
@@ -675,6 +704,27 @@ static void send_cloud_download(int fd) {
     send_all(fd, body, strlen(body));
 }
 
+static void send_bt_devices_download(int fd) {
+    char hdr[512];
+    char *data;
+    const char *empty = "{\"version\":1,\"devices\":[]}\n";
+    size_t len = 0;
+    int owned = 1;
+    data = read_file_alloc(BT_DEVICE_STORE, MAX_RESOURCE_FILE, &len);
+    if (!data) {
+        data = (char *)empty;
+        len = strlen(empty);
+        owned = 0;
+    }
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %lu\r\n"
+        "Cache-Control: no-store\r\nContent-Disposition: attachment; filename=\"bt-devices.json\"\r\nConnection: close\r\n\r\n",
+        (unsigned long)len);
+    send_all(fd, hdr, strlen(hdr));
+    send_all(fd, data, len);
+    if (owned) free(data);
+}
+
 static FILE *send_json_start(int fd, const char *status) {
     char hdr[256];
     FILE *f;
@@ -1144,6 +1194,7 @@ static int load_ir_inventory(struct ir_inventory *inv) {
                 if (cid > inv->max_command_id) inv->max_command_id = cid;
                 json_string_range(cpos, obj_end, "Name", cmd->name, sizeof(cmd->name));
                 json_string_range(cpos, obj_end, "KeyCode", cmd->keycode, sizeof(cmd->keycode));
+                json_string_range(cpos, obj_end, "Raw", cmd->raw, sizeof(cmd->raw));
                 cmd->protocol_id = (int)json_long_range(cpos, obj_end, "ProtocolId", 0);
                 cmd->learned = json_bool_range(cpos, obj_end, "IsLearned", 0);
                 cmd->has_raw = json_has_nonnull_value(cpos, obj_end, "Raw") && !cmd->keycode[0];
@@ -1448,7 +1499,7 @@ static void backup_settings(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "mkdir -p " RESOURCE_BACKUP_DIR "; d=" RESOURCE_BACKUP_DIR "/settings_$(date +%%Y%%m%%d_%%H%%M%%S); "
-        "mkdir -p \"$d\"; cp " MQTT_CONFIG " " WPA_CONFIG " " CLOUD_BLOCKER_CONFIG " \"$d\" 2>/dev/null");
+        "mkdir -p \"$d\"; cp " MQTT_CONFIG " " WPA_CONFIG " " CLOUD_BLOCKER_CONFIG " " BT_DEVICE_STORE " \"$d\" 2>/dev/null");
     system(cmd);
 }
 
@@ -1480,6 +1531,7 @@ static void send_bundle_download(int fd) {
     bundle_value(f, "ProtocolList.json", PROTOCOL_LIST, 1);
     bundle_value(f, "mqtt-config.json", MQTT_CONFIG, 1);
     bundle_value(f, "wpa_supplicant.conf", WPA_CONFIG, 1);
+    bundle_value(f, "bt-devices.json", BT_DEVICE_STORE, 1);
     fputc(',', f);
     json_write_string(f, "cloud-blocker.conf");
     fputc(':', f);
@@ -2149,6 +2201,103 @@ fail:
     return NULL;
 }
 
+static int find_ir_command_span(const char *raw, const char *device_id, const char *command_name, const char **obj, const char **obj_end) {
+    const char *arr, *arr_end, *cpos;
+    if (find_device_command_array(raw, device_id, &arr, &arr_end) != 0) return -1;
+    cpos = arr + 1;
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end) {
+        char name[128];
+        const char *end = find_matching_json(cpos, '{', '}');
+        if (!end || end > arr_end) break;
+        json_string_range(cpos, end, "Name", name, sizeof(name));
+        if (strcmp(name, command_name) == 0) {
+            if (obj) *obj = cpos;
+            if (obj_end) *obj_end = end;
+            return 0;
+        }
+        cpos = end + 1;
+    }
+    return -1;
+}
+
+static int update_ir_command(const char *device_id, const char *old_name, const char *new_name, const char *mode, const char *protocol_text, const char *nec, const char *keycode, const char *raw_code, char *msg, size_t msglen) {
+    char *raw;
+    const char *arr, *arr_end, *obj, *obj_end;
+    size_t len;
+    long id;
+    int protocol_id = atoi(protocol_text);
+    char effective_mode[16];
+    char code[512];
+    char *cmd = NULL;
+    if (!safe_label(device_id) || !safe_label(old_name) || !safe_label(new_name)) {
+        snprintf(msg, msglen, "Device, current command name, and new command name are required.");
+        return -1;
+    }
+    if (protocol_id <= 0) protocol_id = 2;
+    raw = read_file_alloc(DEVICE_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw || find_device_command_array(raw, device_id, &arr, &arr_end) != 0 ||
+        find_ir_command_span(raw, device_id, old_name, &obj, &obj_end) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Command %s was not found on device %s.", old_name, device_id);
+        return -1;
+    }
+    if (strcmp(old_name, new_name) != 0 && command_array_has_name(arr, arr_end, new_name)) {
+        free(raw);
+        snprintf(msg, msglen, "Command %s already exists on device %s.", new_name, device_id);
+        return -1;
+    }
+    id = json_long_range(obj, obj_end, "Id-", 0);
+    if (id <= 0) id = 39000000 + (long)(time(NULL) % 9000000);
+    copy_text(effective_mode, sizeof(effective_mode), mode && mode[0] ? mode : "keycode");
+    code[0] = 0;
+    if (strcmp(effective_mode, "raw") == 0) {
+        if (!raw_code[0]) {
+            free(raw);
+            snprintf(msg, msglen, "Raw command data is required.");
+            return -1;
+        }
+    } else if (strcmp(effective_mode, "nec") == 0) {
+        if (build_nec_keycode(nec, protocol_id, code, sizeof(code)) != 0) {
+            free(raw);
+            snprintf(msg, msglen, "NEC value must be 1-8 hex digits.");
+            return -1;
+        }
+    } else {
+        copy_text(effective_mode, sizeof(effective_mode), "keycode");
+        if (!keycode[0]) {
+            free(raw);
+            snprintf(msg, msglen, "Harmony compact code is required.");
+            return -1;
+        }
+        copy_text(code, sizeof(code), keycode);
+    }
+    cmd = build_ir_command_json(id, new_name, effective_mode, protocol_id, code, raw_code);
+    if (!cmd) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to build updated command.");
+        return -1;
+    }
+    backup_resources();
+    if (strcmp(effective_mode, "raw") != 0 && ensure_builtin_protocol_for_id(protocol_id) != 0) {
+        free(raw);
+        free(cmd);
+        snprintf(msg, msglen, "Failed to ensure IR protocol %d.", protocol_id);
+        return -1;
+    }
+    if (replace_span(&raw, &len, (size_t)(obj - raw), (size_t)(obj_end + 1 - raw), cmd) != 0 ||
+        write_file_atomic(DEVICE_LIST, raw, len) != 0) {
+        free(raw);
+        free(cmd);
+        snprintf(msg, msglen, "Failed to save updated command %s.", new_name);
+        return -1;
+    }
+    free(raw);
+    free(cmd);
+    request_resource_reload();
+    snprintf(msg, msglen, "Updated command %s on device %s.", new_name, device_id);
+    return 0;
+}
+
 static int add_ir_command(const char *device_id, const char *name, const char *mode, const char *protocol_text, const char *nec, const char *keycode, const char *raw_code, char *msg, size_t msglen) {
     char *raw;
     const char *arr, *arr_end;
@@ -2549,7 +2698,7 @@ static void page_head(FILE *f, const char *title) {
         "input[type=checkbox]{width:auto;min-height:0}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}"
         "button,a.button{border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:6px;padding:9px 12px;min-height:38px;cursor:pointer;font-weight:650;transition:border-color .12s,background .12s,box-shadow .12s,transform .08s;text-decoration:none;line-height:1.15}button:hover,a.button:hover{box-shadow:0 2px 8px rgba(15,118,110,.12)}button:active,a.button:active{transform:translateY(1px)}button:focus-visible,a.button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid rgba(15,118,110,.28);outline-offset:2px}a.button{display:inline-flex;align-items:center;justify-content:center}.secondary{background:#fff;color:var(--accent)}.danger{border-color:var(--bad);color:var(--bad);background:#fff}.ghost{background:var(--wash);border-color:var(--line);color:var(--fg)}"
         "pre{white-space:pre-wrap;word-break:break-word;margin:0;background:var(--soft);border-radius:6px;padding:10px;max-height:340px;overflow:auto}details{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:11px 13px}summary{cursor:pointer;font-weight:650}"
-        ".msg{border-left:4px solid var(--accent2);padding:10px 12px;background:#f8fbff;border-radius:8px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-top:1px solid var(--line);padding:7px;text-align:left;vertical-align:top}.device-list{display:grid;gap:14px}.command-list{display:grid;gap:8px}.command{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.export-list{display:flex;gap:8px;flex-wrap:wrap}.hidden{display:none!important}.preview{display:grid;gap:6px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--soft)}.preview label{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:start;margin:0;color:var(--fg)}.match{width:100%;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:8px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.match strong{color:var(--accent2)}"
+        ".msg{border-left:4px solid var(--accent2);padding:10px 12px;background:#f8fbff;border-radius:8px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-top:1px solid var(--line);padding:7px;text-align:left;vertical-align:top}.device-list{display:grid;gap:14px}.command-list{display:grid;gap:8px}.command{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.command .command-editor{grid-column:1/-1;background:var(--wash)}.command-editor{margin-top:10px}.command-preview{max-height:110px;background:#fff;border:1px solid var(--line);margin-top:6px}.bt-saved{grid-column:1/-1}.bt-device-card{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}.bt-device-card h4{margin:0 0 4px;font-size:15px}.save-script-box{border-top:1px solid var(--line);padding-top:10px;margin-top:4px}.export-list{display:flex;gap:8px;flex-wrap:wrap}.hidden{display:none!important}.preview{display:grid;gap:6px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--soft)}.preview label{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:start;margin:0;color:var(--fg)}.match{width:100%;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:8px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.match strong{color:var(--accent2)}"
         ".setup-shell{padding:0;overflow:hidden}.wizard-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.wizard-top h3{margin:0}.wizard-grid{display:grid;grid-template-columns:210px 1fr;min-height:420px}.stepper{border-right:1px solid var(--line);background:#f8fbfa;padding:12px;display:grid;align-content:start;gap:6px}.step{display:grid;grid-template-columns:28px 1fr;gap:9px;align-items:center;width:100%;text-align:left;background:transparent;color:var(--fg);border-color:transparent;padding:10px}.step span{width:26px;height:26px;border-radius:999px;display:grid;place-items:center;background:#fff;border:1px solid var(--line);color:var(--accent);font-weight:750}.step.active{background:#fff;border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04)}.wizard-body{padding:18px}.wizard-panel{display:none}.wizard-panel.active{display:block}.wizard-status{min-height:20px;margin-top:10px;color:var(--muted)}.device-sync{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.guide-steps{display:grid;gap:8px;margin:10px 0 12px}.guide-step{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;border:1px solid var(--line);background:var(--wash);border-radius:8px;padding:9px 10px}.guide-step b{width:22px;height:22px;border-radius:999px;background:var(--soft2);color:var(--accent);display:grid;place-items:center;font-size:12px}.lab-layout,.bt-layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:14px}.bt-script-layout{display:grid;grid-template-columns:1fr;gap:12px}.bt-script-tools{display:grid;gap:8px;align-content:start}.lab-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.lab-quick{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0 12px}.lab-quick button{text-align:left;min-height:50px;background:#fff;color:var(--accent);border-color:var(--accent)}.lab-quick button:hover{background:#f8fbfa;border-color:#0b625c}.lab-quick button .queue-meta{color:var(--muted);font-weight:600}.lab-presets,.queue-tools{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.lab-presets button,.queue-tools button{padding:6px 9px;font-size:12px}.lab-advanced{margin-top:12px}.inline-check{display:inline-flex;align-items:center;gap:8px;margin-top:10px}.lab-summary{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--wash);padding:9px 10px;margin:8px 0;color:var(--muted);font-size:12px}.queue-list{display:grid;gap:7px;max-height:390px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:8px}.queue-row{display:grid;grid-template-columns:auto 1fr auto;gap:9px;align-items:start;background:#fff;border:1px solid var(--line);border-radius:7px;padding:8px}.queue-row strong{display:block}.queue-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.meter{height:8px;border-radius:999px;background:#e7eeec;overflow:hidden}.meter span{display:block;height:100%;width:0;background:var(--accent)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}"
         "@media(max-width:860px){.app-shell{grid-template-columns:1fr;padding-top:14px}.side-menu{position:sticky;top:62px;z-index:2;display:flex;overflow-x:auto;gap:6px;border-radius:10px;box-shadow:0 4px 16px rgba(25,41,37,.06);scrollbar-width:thin}.menu-item{min-width:168px}.row,.wizard-grid,.device-sync,.lab-layout,.bt-layout,.bt-script-layout{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.command{grid-template-columns:1fr}.stepper{border-right:0;border-bottom:1px solid var(--line);grid-template-columns:repeat(2,1fr)}}"
         "@media(max-width:520px){.topbar{align-items:flex-start;flex-direction:column}.app-shell{padding:12px}.side-menu{position:static;display:grid;grid-template-columns:1fr 1fr}.menu-item{min-width:0}.section-head{align-items:flex-start;flex-direction:column}.actions button,.actions a.button{width:100%}}"
@@ -2758,6 +2907,9 @@ static void page_end(FILE *f) {
         "function btSummarizeAdapter(raw){raw=String(raw||'');const addr=(raw.match(/BD Address:\\s*([0-9A-F:]{17})/i)||[])[1]||'',name=(raw.match(/Name:\\s*'([^']+)'/i)||[])[1]||'',mode=(raw.match(/UP RUNNING[^\\n]*/)||[])[0]||'',disc=/\"Discoverable\"[\\s\\S]{0,80}boolean true/.test(raw),pair=/\"Pairable\"[\\s\\S]{0,80}boolean true/.test(raw);return [name?('Name: '+name):'',addr?('Address: '+addr):'',mode?('Mode: '+mode.trim()):'',('Discoverable: '+(disc?'yes':'no')),('Pairable: '+(pair?'yes':'no'))].filter(Boolean).join('\\n')+'\\n\\n'+raw;}"
         "async function btRuntimeStatus(){try{const j=await (await fetch('/api/bt-text-status')).json(),s=$('btRuntimeStatus');const age=j.updated?Math.max(0,Math.round(Date.now()/1000-j.updated)):null;const lines=['Runtime: '+(j.runtime?'running':'missing'),'State: '+(j.state||'unknown'),j.pid?('PID: '+j.pid):'',j.target?('Target: '+j.target):'Target: none',age!==null?('Updated: '+age+'s ago'):'','Sent: '+(j.sent||0)+'  Skipped: '+(j.skipped||0),j.error?('Note: '+j.error):''];if(s)s.textContent=lines.filter(Boolean).join('\\n');btAppend('FIFO runtime '+(j.runtime?j.state:(j.state||'missing')));return j;}catch(e){const s=$('btRuntimeStatus');if(s)s.textContent='Runtime status failed: '+(e.message||e);btAppend('runtime status failed: '+(e.message||e));}}"
         "async function btPost(action,extra,quiet){const data=Object.assign(btFields(),extra||{},{action:action});if(!quiet)btLog(action+'...');try{const j=await postJson('/api/bt-call',data);if(j.detectedAddress){const el=$('btAddr');if(el&&!el.value.trim())el.value=j.detectedAddress;btAppend('target address detected: '+j.detectedAddress);}if(['pairing_on','pairing_off','adapter_status'].includes(action)){btPairStatus(btSummarizeAdapter(j.responseRaw||''));btMaybeFillAddr(j.responseRaw||'');}if(j.connectionRaw)btMaybeFillAddr(j.connectionRaw);if(!quiet)btLog(JSON.stringify(j,null,2));return j;}catch(e){if(quiet)throw e;btLog(action+' failed: '+(e.message||e));}}"
+        "function btSavedTargetData(){const d=btFields();return{name:d.name||'Bluetooth keyboard target',type:d.type||'btkeyboard',bdaddr:String(d.bdaddr||'').toUpperCase()};}"
+        "const btSaveTargetForm=$('btSaveTargetForm');if(btSaveTargetForm){btSaveTargetForm.addEventListener('submit',e=>{const d=btSavedTargetData();if(!/^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/.test(d.bdaddr)){e.preventDefault();btAppend('save target needs a paired target address. Refresh status after pairing, or enter the address manually.');return;}const n=$('btSaveTargetName'),t=$('btSaveTargetType'),a=$('btSaveTargetAddr');if(n)n.value=d.name;if(t)t.value=d.type;if(a)a.value=d.bdaddr;});}"
+        "const btSaveScript=$('btSaveScriptCommand');if(btSaveScript){btSaveScript.addEventListener('click',async()=>{const deviceId=$('btScriptDevice')?.value||'',name=($('btScriptCommandName')?.value||'').trim(),script=$('btScript')?.value||'',delay=String(btDelay());if(!deviceId){btAppend('choose a saved Bluetooth device first');return;}if(!name){btAppend('enter a command name before saving the script');return;}if(!script.trim()){btAppend('paste a keyboard script before saving');return;}try{btAppend('saving Bluetooth command '+name+'...');const res=await postForm('/bt/command',{deviceId:deviceId,name:name,delayMs:delay,script:script});btAppend(plainText(res.text)||'Bluetooth command saved');setTimeout(()=>location.reload(),600);}catch(e){btAppend('save command failed: '+(e.message||e));}});}"
         "function btSleep(ms){return new Promise(r=>setTimeout(r,ms));}"
         "function btDelay(){let v=parseInt($('btScriptDelay')?.value||'35',10);if(!Number.isFinite(v))v=35;v=Math.max(15,Math.min(5000,v));const e=$('btScriptDelay');if(e)e.value=String(v);return v;}"
         "function btCleanKey(s){s=String(s||'').trim().toLowerCase();const a={'return':'enter','esc':'escape','del':'delete','up':'directionup','down':'directiondown','left':'directionleft','right':'directionright','pgup':'pageup','pgdn':'pagedown','vol+':'volumeup','vol-':'volumedown','mute':'volumemute'};s=a[s]||s;if(/^f([1-9]|1[0-2])$/.test(s))return s;if(/^[0-9]$/.test(s))return'number'+s;return s.replace(/[^a-z0-9_-]/g,'');}"
@@ -2905,6 +3057,7 @@ static void backup_panel(FILE *f) {
     fprintf(f, "<a class='button' href='/export/mqtt'>MQTT</a>");
     fprintf(f, "<a class='button' href='/export/wifi'>Wi-Fi</a>");
     fprintf(f, "<a class='button' href='/export/cloud'>Cloud blocker</a>");
+    fprintf(f, "<a class='button' href='/export/bluetooth'>Bluetooth devices</a>");
     fprintf(f, "</div></div>");
     fprintf(f, "<div class='panel'><h3>Restore from backup</h3><div class='help'>Choose what the pasted backup contains. Wi-Fi restores are saved immediately but do not take effect until reboot.</div><form method='post' action='/import#backup'>");
     fprintf(f, "<label for='backupTarget'>Backup type</label><select id='backupTarget' name='target'>");
@@ -2915,6 +3068,7 @@ static void backup_panel(FILE *f) {
     fprintf(f, "<option value='mqtt'>MQTT config</option>");
     fprintf(f, "<option value='wifi'>Wi-Fi config</option>");
     fprintf(f, "<option value='cloud'>Cloud blocker setting</option>");
+    fprintf(f, "<option value='bluetooth'>Bluetooth devices</option>");
     fprintf(f, "</select>");
     fprintf(f, "<label for='importFile'>Backup file</label><input id='importFile' type='file'>");
     fprintf(f, "<label for='backupPayload'>Backup contents</label><textarea id='backupPayload' class='textarea-tall' name='payload' spellcheck='false' required></textarea>");
@@ -2934,6 +3088,49 @@ static void ir_device_options(FILE *f, const struct ir_inventory *inv, const cha
         html(f, dev->id);
         fprintf(f, ")</option>");
     }
+}
+
+static void ir_command_editor(FILE *f, const char *device_id, const struct ir_command *cmd, int edit) {
+    char protocol[24];
+    const char *mode = "keycode";
+    const char *name = "";
+    const char *keycode = "";
+    const char *raw = "";
+    snprintf(protocol, sizeof(protocol), "%d", cmd ? (cmd->protocol_id > 0 ? cmd->protocol_id : 2) : 2);
+    if (cmd) {
+        name = cmd->name;
+        keycode = cmd->keycode;
+        raw = cmd->raw;
+        mode = cmd->has_raw ? "raw" : "keycode";
+    }
+    fprintf(f, "<details class='command-editor'><summary>%s</summary><form method='post' action='%s#ir'>",
+        edit ? "Edit command" : "Add command manually",
+        edit ? "/ir/update-command" : "/ir/command");
+    fprintf(f, "<input type='hidden' name='deviceId' value='");
+    html(f, device_id);
+    fprintf(f, "'>");
+    if (edit) {
+        fprintf(f, "<input type='hidden' name='oldName' value='");
+        html(f, name);
+        fprintf(f, "'>");
+    }
+    fprintf(f, "<div class='row'><div><label>Command name</label><input name='name' value='");
+    html(f, name);
+    fprintf(f, "' required placeholder='Power, Input HDMI 1, Volume Up'></div><div><label>Save format</label><select name='mode'>");
+    fprintf(f, "<option value='keycode'%s>Harmony compact code</option>", strcmp(mode, "keycode") == 0 ? " selected" : "");
+    fprintf(f, "<option value='nec'>NEC 32-bit code</option>");
+    fprintf(f, "<option value='raw'%s>Raw timing replay</option>", strcmp(mode, "raw") == 0 ? " selected" : "");
+    fprintf(f, "</select></div></div>");
+    fprintf(f, "<div class='row'><div><label>Protocol id</label><input name='protocol' value='");
+    html(f, protocol);
+    fprintf(f, "' placeholder='2'></div><div><label>NEC hex code</label><input name='nec' placeholder='E0E040BF'></div></div>");
+    fprintf(f, "<label>Harmony compact code</label><input name='keycode' value='");
+    html(f, keycode);
+    fprintf(f, "' placeholder='G:Toshiba 32 Bit:(0xE0E040BF)(Repeat)():3'>");
+    fprintf(f, "<label>Raw timing data</label><textarea name='raw' class='textarea-tall' spellcheck='false' placeholder='F38000P...'>");
+    html(f, raw);
+    fprintf(f, "</textarea><div class='actions'><button type='submit'>%s</button></div></form></details>",
+        edit ? "Save command changes" : "Add command");
 }
 
 static void ir_setup_flow(FILE *f, const struct ir_inventory *inv) {
@@ -3027,6 +3224,7 @@ static void ir_panel(FILE *f) {
         fprintf(f, "<form method='post' action='/ir/delete-device#ir'><input type='hidden' name='deviceId' value='");
         html(f, dev->id);
         fprintf(f, "'><div class='actions'><button class='danger' type='submit'>Delete device</button></div></form>");
+        ir_command_editor(f, dev->id, NULL, 0);
         fprintf(f, "<div class='command-list mini'>");
         for (j = 0; j < dev->command_count; j++) {
             const struct ir_command *cmd = &dev->commands[j];
@@ -3048,7 +3246,9 @@ static void ir_panel(FILE *f) {
             html(f, dev->id);
             fprintf(f, "'><input type='hidden' name='command' value='");
             html(f, cmd->name);
-            fprintf(f, "'><button class='danger' type='submit'>Delete command</button></form></div></div>");
+            fprintf(f, "'><button class='danger' type='submit'>Delete command</button></form></div>");
+            ir_command_editor(f, dev->id, cmd, 1);
+            fprintf(f, "</div>");
         }
         if (dev->command_count == 0) {
             fprintf(f, "<div class='muted'>No commands saved yet.</div>");
@@ -3088,12 +3288,440 @@ static void ir_lab_panel(FILE *f) {
     free(inv);
 }
 
+static int safe_bt_store_id(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t n = strlen(s);
+    if (n == 0 || n > 36) return 0;
+    while (*p) {
+        if (!isalnum(*p) && *p != '_' && *p != '-') return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int safe_bt_script_text(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t n = strlen(s);
+    if (n == 0 || n >= MAX_BT_SCRIPT_LEN) return 0;
+    while (*p) {
+        if (*p < 32 && *p != '\n' && *p != '\r' && *p != '\t') return 0;
+        if (*p == 127) return 0;
+        p++;
+    }
+    return 1;
+}
+
+static void make_bt_device_id(char *out, size_t outlen) {
+    snprintf(out, outlen, "bt_%ld_%d", (long)time(NULL), (int)(getpid() % 10000));
+}
+
+static int load_bt_inventory(struct bt_inventory *inv) {
+    char *raw;
+    const char *key, *arr, *arr_end, *dpos;
+    memset(inv, 0, sizeof(*inv));
+    raw = read_file_alloc(BT_DEVICE_STORE, MAX_RESOURCE_FILE, NULL);
+    if (!raw) return 0;
+    key = strstr(raw, "\"devices\"");
+    arr = key ? strchr(key, '[') : NULL;
+    arr_end = arr ? find_matching_json(arr, '[', ']') : NULL;
+    if (!arr || !arr_end) {
+        free(raw);
+        return 0;
+    }
+    dpos = arr + 1;
+    while ((dpos = strchr(dpos, '{')) != NULL && dpos < arr_end && inv->device_count < MAX_BT_DEVICES) {
+        struct bt_saved_device *dev = &inv->devices[inv->device_count];
+        const char *dev_end = find_matching_json(dpos, '{', '}');
+        const char *cmd_key, *cmd_arr, *cmd_end, *cpos;
+        if (!dev_end || dev_end > arr_end) break;
+        json_string_range(dpos, dev_end, "id", dev->id, sizeof(dev->id));
+        json_string_range(dpos, dev_end, "name", dev->name, sizeof(dev->name));
+        json_string_range(dpos, dev_end, "type", dev->type, sizeof(dev->type));
+        json_string_range(dpos, dev_end, "bdaddr", dev->bdaddr, sizeof(dev->bdaddr));
+        if (!dev->id[0] || !dev->name[0]) {
+            dpos = dev_end + 1;
+            continue;
+        }
+        if (!dev->type[0]) strcpy(dev->type, "btkeyboard");
+        cmd_key = strstr(dpos, "\"commands\"");
+        cmd_arr = (cmd_key && cmd_key < dev_end) ? strchr(cmd_key, '[') : NULL;
+        cmd_end = cmd_arr ? find_matching_json(cmd_arr, '[', ']') : NULL;
+        if (cmd_arr && cmd_end && cmd_end < dev_end) {
+            cpos = cmd_arr + 1;
+            while ((cpos = strchr(cpos, '{')) != NULL && cpos < cmd_end && dev->command_count < MAX_BT_COMMANDS) {
+                struct bt_saved_command *cmd = &dev->commands[dev->command_count];
+                const char *obj_end = find_matching_json(cpos, '{', '}');
+                if (!obj_end || obj_end > cmd_end) break;
+                json_string_range(cpos, obj_end, "name", cmd->name, sizeof(cmd->name));
+                json_string_range(cpos, obj_end, "script", cmd->script, sizeof(cmd->script));
+                cmd->delay_ms = (int)json_long_range(cpos, obj_end, "delayMs", 35);
+                if (cmd->delay_ms < 15) cmd->delay_ms = 35;
+                if (cmd->delay_ms > 5000) cmd->delay_ms = 5000;
+                if (cmd->name[0] && cmd->script[0]) dev->command_count++;
+                cpos = obj_end + 1;
+            }
+        }
+        inv->device_count++;
+        dpos = dev_end + 1;
+    }
+    free(raw);
+    return 0;
+}
+
+static int save_bt_inventory(const struct bt_inventory *inv) {
+    char tmp[256];
+    FILE *f;
+    int i, j;
+    snprintf(tmp, sizeof(tmp), "%s.new", BT_DEVICE_STORE);
+    f = fopen(tmp, "wb");
+    if (!f) return -1;
+    fputs("{\"version\":1,\"devices\":[", f);
+    for (i = 0; i < inv->device_count; i++) {
+        const struct bt_saved_device *dev = &inv->devices[i];
+        if (i) fputc(',', f);
+        fputs("{\"id\":", f); json_write_string(f, dev->id);
+        fputs(",\"name\":", f); json_write_string(f, dev->name);
+        fputs(",\"type\":", f); json_write_string(f, dev->type);
+        fputs(",\"bdaddr\":", f); json_write_string(f, dev->bdaddr);
+        fputs(",\"commands\":[", f);
+        for (j = 0; j < dev->command_count; j++) {
+            const struct bt_saved_command *cmd = &dev->commands[j];
+            if (j) fputc(',', f);
+            fputs("{\"name\":", f); json_write_string(f, cmd->name);
+            fputs(",\"delayMs\":", f); fprintf(f, "%d", cmd->delay_ms);
+            fputs(",\"script\":", f); json_write_string(f, cmd->script);
+            fputc('}', f);
+        }
+        fputs("]}", f);
+    }
+    fputs("]}\n", f);
+    if (fclose(f) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, BT_DEVICE_STORE) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    chmod(BT_DEVICE_STORE, 0644);
+    sync();
+    return 0;
+}
+
+static int find_bt_device_index(const struct bt_inventory *inv, const char *device_id) {
+    int i;
+    for (i = 0; i < inv->device_count; i++) {
+        if (strcmp(inv->devices[i].id, device_id) == 0) return i;
+    }
+    return -1;
+}
+
+static int find_bt_command_index(const struct bt_saved_device *dev, const char *name) {
+    int i;
+    for (i = 0; i < dev->command_count; i++) {
+        if (strcmp(dev->commands[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int upsert_bt_device(const char *device_id, const char *name, const char *type, const char *bdaddr, char *msg, size_t msglen) {
+    struct bt_inventory inv;
+    int idx;
+    if (!safe_label(name) || !bt_type_allowed(type) || !safe_bt_addr(bdaddr)) {
+        snprintf(msg, msglen, "Bluetooth device needs a name, supported keyboard type, and address.");
+        return -1;
+    }
+    load_bt_inventory(&inv);
+    if (device_id && device_id[0]) {
+        if (!safe_bt_store_id(device_id)) {
+            snprintf(msg, msglen, "Invalid Bluetooth device id.");
+            return -1;
+        }
+        idx = find_bt_device_index(&inv, device_id);
+        if (idx < 0) {
+            snprintf(msg, msglen, "Bluetooth device %s was not found.", device_id);
+            return -1;
+        }
+    } else {
+        if (inv.device_count >= MAX_BT_DEVICES) {
+            snprintf(msg, msglen, "Bluetooth device limit reached.");
+            return -1;
+        }
+        idx = inv.device_count++;
+        memset(&inv.devices[idx], 0, sizeof(inv.devices[idx]));
+        make_bt_device_id(inv.devices[idx].id, sizeof(inv.devices[idx].id));
+    }
+    copy_text(inv.devices[idx].name, sizeof(inv.devices[idx].name), name);
+    copy_text(inv.devices[idx].type, sizeof(inv.devices[idx].type), type);
+    copy_text(inv.devices[idx].bdaddr, sizeof(inv.devices[idx].bdaddr), bdaddr);
+    backup_settings();
+    if (save_bt_inventory(&inv) != 0) {
+        snprintf(msg, msglen, "Failed to save Bluetooth devices.");
+        return -1;
+    }
+    save_bthid_target(type, bdaddr);
+    snprintf(msg, msglen, "Saved Bluetooth device %s.", name);
+    return 0;
+}
+
+static int delete_bt_device(const char *device_id, char *msg, size_t msglen) {
+    struct bt_inventory inv;
+    int idx, i;
+    if (!safe_bt_store_id(device_id)) {
+        snprintf(msg, msglen, "Invalid Bluetooth device id.");
+        return -1;
+    }
+    load_bt_inventory(&inv);
+    idx = find_bt_device_index(&inv, device_id);
+    if (idx < 0) {
+        snprintf(msg, msglen, "Bluetooth device %s was not found.", device_id);
+        return -1;
+    }
+    for (i = idx; i + 1 < inv.device_count; i++) inv.devices[i] = inv.devices[i + 1];
+    inv.device_count--;
+    backup_settings();
+    if (save_bt_inventory(&inv) != 0) {
+        snprintf(msg, msglen, "Failed to delete Bluetooth device.");
+        return -1;
+    }
+    snprintf(msg, msglen, "Deleted Bluetooth device %s.", device_id);
+    return 0;
+}
+
+static int upsert_bt_command(const char *device_id, const char *old_name, const char *name, const char *script, int delay_ms, char *msg, size_t msglen) {
+    struct bt_inventory inv;
+    struct bt_saved_device *dev;
+    int didx, cidx;
+    if (!safe_bt_store_id(device_id) || !safe_label(name) || !safe_bt_script_text(script)) {
+        snprintf(msg, msglen, "Bluetooth command needs a saved device, command name, and script.");
+        return -1;
+    }
+    if (delay_ms < 15) delay_ms = 35;
+    if (delay_ms > 5000) delay_ms = 5000;
+    load_bt_inventory(&inv);
+    didx = find_bt_device_index(&inv, device_id);
+    if (didx < 0) {
+        snprintf(msg, msglen, "Bluetooth device %s was not found.", device_id);
+        return -1;
+    }
+    dev = &inv.devices[didx];
+    if (old_name && old_name[0]) {
+        if (!safe_label(old_name)) {
+            snprintf(msg, msglen, "Invalid old Bluetooth command name.");
+            return -1;
+        }
+        cidx = find_bt_command_index(dev, old_name);
+        if (cidx < 0) {
+            snprintf(msg, msglen, "Bluetooth command %s was not found.", old_name);
+            return -1;
+        }
+        if (strcmp(old_name, name) != 0 && find_bt_command_index(dev, name) >= 0) {
+            snprintf(msg, msglen, "Bluetooth command %s already exists.", name);
+            return -1;
+        }
+    } else {
+        if (find_bt_command_index(dev, name) >= 0) {
+            snprintf(msg, msglen, "Bluetooth command %s already exists.", name);
+            return -1;
+        }
+        if (dev->command_count >= MAX_BT_COMMANDS) {
+            snprintf(msg, msglen, "Bluetooth command limit reached for this device.");
+            return -1;
+        }
+        cidx = dev->command_count++;
+        memset(&dev->commands[cidx], 0, sizeof(dev->commands[cidx]));
+    }
+    copy_text(dev->commands[cidx].name, sizeof(dev->commands[cidx].name), name);
+    copy_text(dev->commands[cidx].script, sizeof(dev->commands[cidx].script), script);
+    dev->commands[cidx].delay_ms = delay_ms;
+    backup_settings();
+    if (save_bt_inventory(&inv) != 0) {
+        snprintf(msg, msglen, "Failed to save Bluetooth command.");
+        return -1;
+    }
+    snprintf(msg, msglen, "Saved Bluetooth command %s.", name);
+    return 0;
+}
+
+static int delete_bt_command(const char *device_id, const char *name, char *msg, size_t msglen) {
+    struct bt_inventory inv;
+    struct bt_saved_device *dev;
+    int didx, cidx, i;
+    if (!safe_bt_store_id(device_id) || !safe_label(name)) {
+        snprintf(msg, msglen, "Invalid Bluetooth command request.");
+        return -1;
+    }
+    load_bt_inventory(&inv);
+    didx = find_bt_device_index(&inv, device_id);
+    if (didx < 0) {
+        snprintf(msg, msglen, "Bluetooth device %s was not found.", device_id);
+        return -1;
+    }
+    dev = &inv.devices[didx];
+    cidx = find_bt_command_index(dev, name);
+    if (cidx < 0) {
+        snprintf(msg, msglen, "Bluetooth command %s was not found.", name);
+        return -1;
+    }
+    for (i = cidx; i + 1 < dev->command_count; i++) dev->commands[i] = dev->commands[i + 1];
+    dev->command_count--;
+    backup_settings();
+    if (save_bt_inventory(&inv) != 0) {
+        snprintf(msg, msglen, "Failed to delete Bluetooth command.");
+        return -1;
+    }
+    snprintf(msg, msglen, "Deleted Bluetooth command %s.", name);
+    return 0;
+}
+
+static int send_bt_saved_command(const char *device_id, const char *name, char *msg, size_t msglen) {
+    struct bt_inventory inv;
+    struct bt_saved_device *dev;
+    struct bt_saved_command *cmd;
+    int didx, cidx, rc;
+    char reply[8192];
+    if (!safe_bt_store_id(device_id) || !safe_label(name)) {
+        snprintf(msg, msglen, "Invalid Bluetooth command request.");
+        return -1;
+    }
+    load_bt_inventory(&inv);
+    didx = find_bt_device_index(&inv, device_id);
+    if (didx < 0) {
+        snprintf(msg, msglen, "Bluetooth device %s was not found.", device_id);
+        return -1;
+    }
+    dev = &inv.devices[didx];
+    cidx = find_bt_command_index(dev, name);
+    if (cidx < 0) {
+        snprintf(msg, msglen, "Bluetooth command %s was not found.", name);
+        return -1;
+    }
+    cmd = &dev->commands[cidx];
+    reply[0] = 0;
+    rc = run_bt_saved_script(dev->type, dev->bdaddr, cmd->script, cmd->delay_ms, reply, sizeof(reply));
+    snprintf(msg, msglen, "%s Bluetooth command %s on %s. %s",
+        rc == 0 ? "Sent" : "Failed to send", name, dev->name, reply[0] ? reply : "");
+    return rc;
+}
+
 struct bt_quick_key {
     const char *code;
     const char *label;
 };
 
+static const char *bt_type_label(const char *type) {
+    if (strcmp(type, "btkeyboard-nexus") == 0) return "Nexus keyboard";
+    if (strcmp(type, "fire") == 0) return "Fire TV / media keys";
+    if (strcmp(type, "ps3") == 0) return "PlayStation 3";
+    if (strcmp(type, "wii") == 0) return "Nintendo Wii";
+    return "Standard keyboard";
+}
+
+static void bt_type_options(FILE *f, const char *selected) {
+    const char *types[] = {"btkeyboard", "btkeyboard-nexus", "fire", "ps3", "wii"};
+    size_t i;
+    for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        fprintf(f, "<option value='");
+        html(f, types[i]);
+        fprintf(f, "'%s>", selected && strcmp(selected, types[i]) == 0 ? " selected" : "");
+        html(f, bt_type_label(types[i]));
+        fprintf(f, "</option>");
+    }
+}
+
+static void bt_device_options(FILE *f, const struct bt_inventory *inv) {
+    int i;
+    for (i = 0; i < inv->device_count; i++) {
+        fprintf(f, "<option value='");
+        html(f, inv->devices[i].id);
+        fprintf(f, "'>");
+        html(f, inv->devices[i].name);
+        fprintf(f, " (");
+        html(f, inv->devices[i].bdaddr);
+        fprintf(f, ")</option>");
+    }
+}
+
+static void bt_command_editor(FILE *f, const struct bt_saved_device *dev, const struct bt_saved_command *cmd, int edit) {
+    fprintf(f, "<details class='command-editor'><summary>%s</summary><form method='post' action='/bt/command#bluetooth'>",
+        edit ? "Edit keyboard command" : "Add keyboard command");
+    fprintf(f, "<input type='hidden' name='deviceId' value='");
+    html(f, dev->id);
+    fprintf(f, "'>");
+    if (edit) {
+        fprintf(f, "<input type='hidden' name='oldName' value='");
+        html(f, cmd->name);
+        fprintf(f, "'>");
+    }
+    fprintf(f, "<div class='row'><div><label>Command name</label><input name='name' required value='");
+    html(f, edit ? cmd->name : "");
+    fprintf(f, "' placeholder='Open YouTube, Home, Search'></div><div><label>Pause between keys (ms)</label><input name='delayMs' inputmode='numeric' value='%d'></div></div>",
+        edit ? cmd->delay_ms : 35);
+    fprintf(f, "<label>Keyboard script</label><textarea name='script' class='textarea-tall' spellcheck='false' required placeholder='TEXT hello from harmony&#10;KEY enter&#10;COMBO ctrl+l'>");
+    if (edit) html(f, cmd->script);
+    fprintf(f, "</textarea><div class='help'>Use TEXT words, KEY enter, COMBO ctrl+l, WAIT 500. TEXT lines are sent through the accurate FIFO helper.</div><div class='actions'><button type='submit'>%s</button></div></form></details>",
+        edit ? "Save command changes" : "Add command");
+}
+
+static void bt_saved_devices_panel(FILE *f, const struct bt_inventory *inv) {
+    int i, j;
+    fprintf(f, "<div class='panel bt-saved'><h3>Saved Bluetooth devices</h3><div class='help'>Store paired targets here, then save reusable keyboard scripts as commands. These devices behave like IR devices: you can send, edit, add, or delete commands.</div>");
+    if (inv->device_count == 0) {
+        fprintf(f, "<div class='muted mini'>No Bluetooth devices saved yet. Pair a target above, refresh status, then save it here.</div></div>");
+        return;
+    }
+    for (i = 0; i < inv->device_count; i++) {
+        const struct bt_saved_device *dev = &inv->devices[i];
+        fprintf(f, "<div class='bt-device-card'><h4>");
+        html(f, dev->name);
+        fprintf(f, "</h4><div class='muted mini'>");
+        html(f, bt_type_label(dev->type));
+        fprintf(f, " / ");
+        html(f, dev->bdaddr);
+        fprintf(f, " / id ");
+        html(f, dev->id);
+        fprintf(f, "</div><form method='post' action='/bt/device#bluetooth'><input type='hidden' name='deviceId' value='");
+        html(f, dev->id);
+        fprintf(f, "'><div class='row'><div><label>Name</label><input name='name' value='");
+        html(f, dev->name);
+        fprintf(f, "' required></div><div><label>Keyboard type</label><select name='type'>");
+        bt_type_options(f, dev->type);
+        fprintf(f, "</select></div></div><label>Bluetooth address</label><input name='bdaddr' value='");
+        html(f, dev->bdaddr);
+        fprintf(f, "' required><div class='actions'><button type='submit'>Save device details</button></div></form>");
+        fprintf(f, "<form method='post' action='/bt/delete-device#bluetooth'><input type='hidden' name='deviceId' value='");
+        html(f, dev->id);
+        fprintf(f, "'><div class='actions'><button class='danger' type='submit'>Delete device</button></div></form>");
+        bt_command_editor(f, dev, NULL, 0);
+        fprintf(f, "<div class='command-list mini'>");
+        for (j = 0; j < dev->command_count; j++) {
+            const struct bt_saved_command *cmd = &dev->commands[j];
+            fprintf(f, "<div class='command'><div><strong>");
+            html(f, cmd->name);
+            fprintf(f, "</strong><div class='muted'>Keyboard script / %d ms between keys</div><pre class='mini command-preview'>", cmd->delay_ms);
+            html(f, cmd->script);
+            fprintf(f, "</pre></div><div class='actions'>");
+            fprintf(f, "<form method='post' action='/bt/send-command#bluetooth'><input type='hidden' name='deviceId' value='");
+            html(f, dev->id);
+            fprintf(f, "'><input type='hidden' name='command' value='");
+            html(f, cmd->name);
+            fprintf(f, "'><button type='submit'>Run command</button></form>");
+            fprintf(f, "<form method='post' action='/bt/delete-command#bluetooth'><input type='hidden' name='deviceId' value='");
+            html(f, dev->id);
+            fprintf(f, "'><input type='hidden' name='command' value='");
+            html(f, cmd->name);
+            fprintf(f, "'><button class='danger' type='submit'>Delete command</button></form></div>");
+            bt_command_editor(f, dev, cmd, 1);
+            fprintf(f, "</div>");
+        }
+        if (dev->command_count == 0) fprintf(f, "<div class='muted mini'>No keyboard commands saved for this device yet.</div>");
+        fprintf(f, "</div></div>");
+    }
+    fprintf(f, "</div>");
+}
+
 static void bluetooth_panel(FILE *f) {
+    struct bt_inventory btinv;
     const struct bt_quick_key commands[] = {
         {"directionup", "Up"}, {"directiondown", "Down"}, {"directionleft", "Left"}, {"directionright", "Right"},
         {"enter", "Enter"}, {"escape", "Escape"}, {"back", "Back"}, {"menu", "Menu"}, {"home", "Home"}, {"end", "End"}, {"insert", "Insert"},
@@ -3105,12 +3733,14 @@ static void bluetooth_panel(FILE *f) {
         {"ctrlc", "Ctrl+C"}, {"ctrlv", "Ctrl+V"}, {"ctrlx", "Ctrl+X"}, {"alttab", "Alt+Tab"}, {"altf4", "Alt+F4"}, {"ctrlaltdelete", "Ctrl+Alt+Delete"}
     };
     size_t i;
+    load_bt_inventory(&btinv);
     fprintf(f, "<section id='view-bluetooth' data-view='bluetooth' class='section'><div class='section-head'><div><h2>Bluetooth keyboard</h2><div class='section-lead'>Make the hub appear as a Bluetooth keyboard, pair it from the device you want to control, then send keys or scripts.</div></div><span class='pill'>Keyboard mode</span></div>");
     fprintf(f, "<div class='bt-layout'><div class='panel'><h3>Pair a device</h3><div class='guide-steps'><div class='guide-step'><b>1</b><div><strong>Start pairing mode here.</strong><div class='muted mini'>The hub becomes visible as the name below.</div></div></div><div class='guide-step'><b>2</b><div><strong>Pair from the target device.</strong><div class='muted mini'>Open Bluetooth settings on the TV, computer, console, or media box and choose the hub.</div></div></div><div class='guide-step'><b>3</b><div><strong>Refresh status, then send keys.</strong><div class='muted mini'>The status box should show a connected target before scripts run.</div></div></div></div>");
     fprintf(f, "<div class='row'><div><label>Name shown during pairing</label><input id='btName' value='Harmony Keyboard' maxlength='48'></div><div><label>Keyboard type</label><select id='btType'><option value='btkeyboard' selected>Standard keyboard</option><option value='btkeyboard-nexus'>Nexus keyboard</option><option value='fire'>Fire TV / media keys</option><option value='ps3'>PlayStation 3</option><option value='wii'>Nintendo Wii</option></select></div></div>");
     fprintf(f, "<div class='actions'><button id='btPairingOn' type='button'>Start pairing mode</button><button id='btAdapterStatus' type='button' class='secondary'>Refresh status</button><button id='btPairingOff' type='button' class='danger'>Stop pairing mode</button></div>");
     fprintf(f, "<div class='help'>After pairing, Refresh status usually finds the connected device automatically. The status box also shows technical details for troubleshooting.</div><pre id='btPairStatus' class='mini' style='margin-top:12px'>Pairing status has not been refreshed yet.</pre>");
-    fprintf(f, "<details class='lab-advanced'><summary>Manual connection tools</summary><div class='row'><div><label>Bluetooth address</label><input id='btAddr' placeholder='AA:BB:CC:DD:EE:FF'></div><div><label>PIN if requested</label><input id='btPin' inputmode='numeric' placeholder='Optional legacy PIN'></div></div><div class='row'><div><label>Search time (seconds)</label><input id='btTimeout' inputmode='numeric' value='8'></div><div></div></div><div class='actions'><button id='btClassicScan' type='button' class='secondary'>Find classic devices</button><button id='btScan' type='button' class='secondary'>Find BLE devices</button><button id='btStatus' type='button' class='secondary'>Check connection</button><button id='btConnect' type='button' class='secondary'>Connect</button><button id='btDisconnect' type='button' class='danger'>Disconnect</button></div></details></div>");
+    fprintf(f, "<details class='lab-advanced'><summary>Manual connection tools</summary><div class='row'><div><label>Bluetooth address</label><input id='btAddr' placeholder='AA:BB:CC:DD:EE:FF'></div><div><label>PIN if requested</label><input id='btPin' inputmode='numeric' placeholder='Optional legacy PIN'></div></div><div class='row'><div><label>Search time (seconds)</label><input id='btTimeout' inputmode='numeric' value='8'></div><div></div></div><div class='actions'><button id='btClassicScan' type='button' class='secondary'>Find classic devices</button><button id='btScan' type='button' class='secondary'>Find BLE devices</button><button id='btStatus' type='button' class='secondary'>Check connection</button><button id='btConnect' type='button' class='secondary'>Connect</button><button id='btDisconnect' type='button' class='danger'>Disconnect</button></div></details>");
+    fprintf(f, "<form id='btSaveTargetForm' method='post' action='/bt/device#bluetooth'><input id='btSaveTargetName' type='hidden' name='name'><input id='btSaveTargetType' type='hidden' name='type'><input id='btSaveTargetAddr' type='hidden' name='bdaddr'><div class='actions'><button type='submit' class='secondary'>Save paired target</button></div><div class='help'>Saves the connected Bluetooth target so scripts can be stored as reusable commands.</div></form></div>");
     fprintf(f, "<div class='panel'><h3>Send Keys</h3><div class='help'>Use these after the target has paired and connected. Each named key is pressed and released cleanly. The hex report option is only for advanced troubleshooting.</div><label>Key or shortcut</label><input id='btCode' list='btCodes' placeholder='enter, space, ctrl+l, alt+f4'><datalist id='btCodes'>");
     for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
         fprintf(f, "<option value='");
@@ -3127,8 +3757,16 @@ static void bluetooth_panel(FILE *f) {
     }
     fprintf(f, "</div><div class='actions'><button id='btSend' type='button'>Send key</button><button id='btEnterTest' type='button' class='secondary'>Send Enter test</button><button id='btReleaseAll' type='button' class='danger'>Release all keys</button></div>");
     fprintf(f, "<div class='callout' style='margin-top:14px'><strong>Reliable text sending</strong> The background keyboard helper types TEXT script lines as exact press-and-release pairs. If it is not running, the page falls back to slower key reports.</div><div class='actions'><button id='btRuntimeRefresh' type='button' class='secondary'>Check text helper</button></div><pre id='btRuntimeStatus' class='mini'>Text helper status has not loaded yet.</pre>");
-    fprintf(f, "<h3 style='margin-top:18px'>Keyboard script</h3><div class='bt-script-layout'><div><label>Script</label><textarea id='btScript' class='textarea-tall' spellcheck='false' placeholder='TEXT hello from harmony&#10;WAIT 300&#10;KEY enter&#10;COMBO ctrl+l&#10;TEXT https://home-assistant.io&#10;KEY enter'></textarea></div><div class='bt-script-tools'><div class='callout'><strong>Script examples</strong>TEXT words, KEY enter, COMBO ctrl+l, WAIT 500. Bare key names are treated as KEY lines. TEXT uses the accurate text helper when available.</div><label>Pause between keys (ms)</label><input id='btScriptDelay' inputmode='numeric' value='35'><div class='actions'><button id='btScriptPreviewBtn' type='button' class='secondary'>Preview script</button><button id='btScriptRun' type='button'>Run script</button><button id='btScriptStop' type='button' class='danger'>Stop script</button></div></div></div><pre id='btScriptPreview' class='mini' style='margin-top:12px'>Paste a script to preview or run.</pre></div></div>");
-    fprintf(f, "<div class='panel'><h3>Bluetooth log</h3><pre id='btLog' class='mini'>Ready. Start pairing mode, then pair from the target device.</pre></div></section>");
+    fprintf(f, "<h3 style='margin-top:18px'>Keyboard script</h3><div class='bt-script-layout'><div><label>Script</label><textarea id='btScript' class='textarea-tall' spellcheck='false' placeholder='TEXT hello from harmony&#10;WAIT 300&#10;KEY enter&#10;COMBO ctrl+l&#10;TEXT https://home-assistant.io&#10;KEY enter'></textarea></div><div class='bt-script-tools'><div class='callout'><strong>Script examples</strong>TEXT words, KEY enter, COMBO ctrl+l, WAIT 500. Bare key names are treated as KEY lines. TEXT uses the accurate text helper when available.</div><label>Pause between keys (ms)</label><input id='btScriptDelay' inputmode='numeric' value='35'><div class='actions'><button id='btScriptPreviewBtn' type='button' class='secondary'>Preview script</button><button id='btScriptRun' type='button'>Run script</button><button id='btScriptStop' type='button' class='danger'>Stop script</button></div>");
+    if (btinv.device_count > 0) {
+        fprintf(f, "<div class='save-script-box'><label>Save this script to</label><select id='btScriptDevice'>");
+        bt_device_options(f, &btinv);
+        fprintf(f, "</select><label>Command name</label><input id='btScriptCommandName' placeholder='Open YouTube'><div class='actions'><button id='btSaveScriptCommand' type='button' class='secondary'>Save as command</button></div></div>");
+    }
+    fprintf(f, "</div></div><pre id='btScriptPreview' class='mini' style='margin-top:12px'>Paste a script to preview or run.</pre></div></div>");
+    fprintf(f, "<div class='panel'><h3>Bluetooth log</h3><pre id='btLog' class='mini'>Ready. Start pairing mode, then pair from the target device.</pre></div>");
+    bt_saved_devices_panel(f, &btinv);
+    fprintf(f, "</section>");
 }
 
 static void system_panel(FILE *f) {
@@ -3300,6 +3938,7 @@ static const char *import_path_for_target(const char *target) {
     if (strcmp(target, "mqtt") == 0) return MQTT_CONFIG;
     if (strcmp(target, "wifi") == 0) return WPA_CONFIG;
     if (strcmp(target, "cloud") == 0) return CLOUD_BLOCKER_CONFIG;
+    if (strcmp(target, "bluetooth") == 0) return BT_DEVICE_STORE;
     return NULL;
 }
 
@@ -3311,6 +3950,7 @@ static const char *import_label_for_target(const char *target) {
     if (strcmp(target, "mqtt") == 0) return "MQTT config";
     if (strcmp(target, "wifi") == 0) return "Wi-Fi config";
     if (strcmp(target, "cloud") == 0) return "cloud blocker setting";
+    if (strcmp(target, "bluetooth") == 0) return "Bluetooth devices";
     return "import";
 }
 
@@ -3332,6 +3972,11 @@ static int validate_import_payload(const char *target, const char *payload, char
     if (strcmp(target, "cloud") == 0) {
         if (cloud_value_known(payload)) return 0;
         snprintf(msg, msglen, "Cloud blocker import must be 1, 0, on, off, true, false, enabled, or disabled.");
+        return -1;
+    }
+    if (strcmp(target, "bluetooth") == 0) {
+        if (looks_like_json_object(payload) && strstr(payload, "\"devices\"")) return 0;
+        snprintf(msg, msglen, "Bluetooth devices import must be a JSON object with a devices list.");
         return -1;
     }
     if (!looks_like_json_object(payload)) {
@@ -3369,24 +4014,26 @@ static void handle_import_bundle(int fd, const char *payload) {
     char msg[256];
     char cloud[32] = "";
     char *cloud_value;
-    char *devices, *functions, *protocols, *mqtt, *wifi;
+    char *devices, *functions, *protocols, *mqtt, *wifi, *bluetooth;
     devices = (char *)malloc(MAX_REQUEST_BODY);
     functions = (char *)malloc(MAX_REQUEST_BODY);
     protocols = (char *)malloc(MAX_REQUEST_BODY);
     mqtt = (char *)malloc(MAX_REQUEST_BODY);
     wifi = (char *)malloc(MAX_REQUEST_BODY);
-    if (!devices || !functions || !protocols || !mqtt || !wifi) {
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+    bluetooth = (char *)malloc(MAX_REQUEST_BODY);
+    if (!devices || !functions || !protocols || !mqtt || !wifi || !bluetooth) {
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
         render_page(fd, "Not enough memory to import bundle.");
         return;
     }
+    bluetooth[0] = 0;
     if (bundle_extract(payload, "DeviceList.json", devices, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "FunctionList.json", functions, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "ProtocolList.json", protocols, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "mqtt-config.json", mqtt, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "wpa_supplicant.conf", wifi, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     if (validate_import_payload("devices", devices, msg, sizeof(msg)) != 0 ||
@@ -3395,14 +4042,20 @@ static void handle_import_bundle(int fd, const char *payload) {
         validate_import_payload("mqtt", mqtt, msg, sizeof(msg)) != 0 ||
         validate_import_payload("wifi", wifi, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        return;
+    }
+    json_string(payload, "bt-devices.json", bluetooth, MAX_REQUEST_BODY);
+    if (bluetooth[0] && validate_import_payload("bluetooth", bluetooth, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     json_string(payload, "cloud-blocker.conf", cloud, sizeof(cloud));
     cloud_value = trim_payload(cloud);
     if (cloud_value[0] && validate_import_payload("cloud", cloud_value, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     backup_resources();
@@ -3413,19 +4066,25 @@ static void handle_import_bundle(int fd, const char *payload) {
         write_file_atomic(MQTT_CONFIG, mqtt, strlen(mqtt)) != 0 ||
         write_file_atomic(WPA_CONFIG, wifi, strlen(wifi)) != 0) {
         render_page(fd, "Failed to import owner bundle.");
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     chmod(MQTT_CONFIG, 0600);
     chmod(WPA_CONFIG, 0600);
+    if (bluetooth[0] && write_file_atomic(BT_DEVICE_STORE, bluetooth, strlen(bluetooth)) != 0) {
+        render_page(fd, "Bundle imported most files, but failed to save Bluetooth devices.");
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        return;
+    }
+    if (bluetooth[0]) chmod(BT_DEVICE_STORE, 0644);
     if (cloud_value[0] && save_cloud_blocker(cloud_value_enabled(cloud_value)) != 0) {
         render_page(fd, "Bundle imported most files, but failed to save the cloud blocker setting.");
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     request_resource_reload();
     render_page(fd, "Backup bundle imported. Reboot when ready if Wi-Fi settings changed.");
-    free(devices); free(functions); free(protocols); free(mqtt); free(wifi);
+    free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
 }
 
 static void handle_import(int fd, const struct request *req) {
@@ -3485,6 +4144,9 @@ static void handle_import(int fd, const struct request *req) {
         } else {
             render_page(fd, "Cloud blocker setting imported. Reboot when ready to apply it.");
         }
+    } else if (strcmp(target, "bluetooth") == 0) {
+        chmod(BT_DEVICE_STORE, 0644);
+        render_page(fd, "Bluetooth devices imported.");
     } else {
         request_resource_reload();
         snprintf(msg, sizeof(msg), "Imported %s and requested a Harmony resource reload.", import_label_for_target(target));
@@ -4076,6 +4738,159 @@ static int write_bt_text_fifo(const char *text, char *err, size_t errlen) {
         return -1;
     }
     close(fd);
+    return 0;
+}
+
+static void append_run_status(char *out, size_t outlen, const char *text) {
+    size_t used;
+    if (!out || !outlen || !text || !text[0]) return;
+    used = strlen(out);
+    if (used + 2 >= outlen) return;
+    snprintf(out + used, outlen - used, "%s%s", used ? "\n" : "", text);
+}
+
+static int flush_bt_saved_sequence(const char *type, const char *bdaddr, char **seq, size_t *seq_len, size_t *seq_cap, int *chunk_keys, int gap_ms, int *total_keys, char *out, size_t outlen) {
+    char params[256], reply[2048], note[256];
+    char *jt = NULL, *ja = NULL;
+    int rc;
+    if (!seq || !*seq || !seq_len || *seq_len == 0 || !chunk_keys || *chunk_keys <= 0) return 0;
+    jt = json_escape_alloc(type);
+    ja = json_escape_alloc(bdaddr);
+    if (!jt || !ja) {
+        free(jt); free(ja);
+        append_run_status(out, outlen, "not enough memory to send Bluetooth key sequence");
+        return -1;
+    }
+    snprintf(params, sizeof(params), "{\"type\":%s,\"bdaddr\":%s}", jt, ja);
+    free(jt);
+    free(ja);
+    reply[0] = 0;
+    rc = run_hal_json_binary_sequence("bthid.report", params, *seq, 8, gap_ms, reply, sizeof(reply));
+    if (rc != 0) {
+        snprintf(note, sizeof(note), "key sequence failed after %d keys: %s", total_keys ? *total_keys : 0, reply[0] ? reply : "no response");
+        append_run_status(out, outlen, note);
+        free(*seq);
+        *seq = NULL;
+        *seq_len = 0;
+        *seq_cap = 0;
+        *chunk_keys = 0;
+        return -1;
+    }
+    if (total_keys) *total_keys += *chunk_keys;
+    snprintf(note, sizeof(note), "sent %d key%s", *chunk_keys, *chunk_keys == 1 ? "" : "s");
+    append_run_status(out, outlen, note);
+    free(*seq);
+    *seq = NULL;
+    *seq_len = 0;
+    *seq_cap = 0;
+    *chunk_keys = 0;
+    return 0;
+}
+
+static int run_bt_saved_script(const char *type, const char *bdaddr, const char *script, int gap_ms, char *out, size_t outlen) {
+    char *copy, *line, *save;
+    char *seq = NULL;
+    size_t seq_len = 0, seq_cap = 0, script_len;
+    int chunk_keys = 0, total_keys = 0, text_bytes = 0, waits = 0;
+    char err[256], note[256];
+    if (out && outlen) out[0] = 0;
+    if (!bt_type_allowed(type) || !safe_bt_addr(bdaddr)) {
+        snprintf(out, outlen, "saved Bluetooth device has an invalid keyboard type or address");
+        return -1;
+    }
+    if (!safe_bt_script_text(script)) {
+        snprintf(out, outlen, "saved Bluetooth script is empty or contains unsupported control characters");
+        return -1;
+    }
+    if (gap_ms < 15) gap_ms = 35;
+    if (gap_ms > 5000) gap_ms = 5000;
+    save_bthid_target(type, bdaddr);
+    script_len = strlen(script);
+    copy = (char *)malloc(script_len + 1);
+    if (!copy) {
+        snprintf(out, outlen, "not enough memory to run Bluetooth script");
+        return -1;
+    }
+    memcpy(copy, script, script_len + 1);
+    line = strtok_r(copy, "\n", &save);
+    while (line) {
+        char *clean = trim_in_place(line);
+        char *arg = clean;
+        while (*clean && clean[strlen(clean) - 1] == '\r') clean[strlen(clean) - 1] = 0;
+        if (!clean[0] || clean[0] == '#') {
+            line = strtok_r(NULL, "\n", &save);
+            continue;
+        }
+        while (*arg && !isspace((unsigned char)*arg)) arg++;
+        if (*arg) {
+            *arg++ = 0;
+            while (*arg == ' ' || *arg == '\t') arg++;
+        }
+        if (strcasecmp(clean, "WAIT") == 0 || strcasecmp(clean, "SLEEP") == 0) {
+            int ms = atoi(arg);
+            if (flush_bt_saved_sequence(type, bdaddr, &seq, &seq_len, &seq_cap, &chunk_keys, gap_ms, &total_keys, out, outlen) != 0) {
+                free(copy);
+                return -1;
+            }
+            if (ms < 0) ms = 0;
+            if (ms > 60000) ms = 60000;
+            usleep((useconds_t)ms * 1000);
+            waits++;
+        } else if (strcasecmp(clean, "TEXT") == 0 || strcasecmp(clean, "TYPE") == 0) {
+            size_t chars = strlen(arg);
+            int settle_ms;
+            if (flush_bt_saved_sequence(type, bdaddr, &seq, &seq_len, &seq_cap, &chunk_keys, gap_ms, &total_keys, out, outlen) != 0) {
+                free(copy);
+                return -1;
+            }
+            if (!chars) {
+                snprintf(out, outlen, "TEXT step needs text after the command");
+                free(copy);
+                return -1;
+            }
+            if (write_bt_text_fifo(arg, err, sizeof(err)) != 0) {
+                snprintf(out, outlen, "Bluetooth text helper failed: %s", err);
+                free(copy);
+                return -1;
+            }
+            text_bytes += (int)chars;
+            settle_ms = 100 + (int)chars * (gap_ms + 5);
+            if (settle_ms > 120000) settle_ms = 120000;
+            usleep((useconds_t)settle_ms * 1000);
+            snprintf(note, sizeof(note), "typed %lu text byte%s", (unsigned long)chars, chars == 1 ? "" : "s");
+            append_run_status(out, outlen, note);
+        } else {
+            const char *key = clean;
+            if (strcasecmp(clean, "KEY") == 0 || strcasecmp(clean, "SEND") == 0 ||
+                strcasecmp(clean, "PRESS") == 0 || strcasecmp(clean, "COMBO") == 0 ||
+                strcasecmp(clean, "HOTKEY") == 0) {
+                key = arg;
+            }
+            if (!key || !key[0] || bt_sequence_add_code(key, &seq, &seq_len, &seq_cap, &chunk_keys, err, sizeof(err)) != 0) {
+                snprintf(out, outlen, "%s", err[0] ? err : "unsupported Bluetooth keyboard script line");
+                free(seq);
+                free(copy);
+                return -1;
+            }
+            if (chunk_keys >= 64 || seq_len > 12000) {
+                if (flush_bt_saved_sequence(type, bdaddr, &seq, &seq_len, &seq_cap, &chunk_keys, gap_ms, &total_keys, out, outlen) != 0) {
+                    free(copy);
+                    return -1;
+                }
+            }
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    if (flush_bt_saved_sequence(type, bdaddr, &seq, &seq_len, &seq_cap, &chunk_keys, gap_ms, &total_keys, out, outlen) != 0) {
+        free(copy);
+        return -1;
+    }
+    snprintf(note, sizeof(note), "script complete: %d key%s, %d text byte%s, %d wait%s",
+        total_keys, total_keys == 1 ? "" : "s",
+        text_bytes, text_bytes == 1 ? "" : "s",
+        waits, waits == 1 ? "" : "s");
+    append_run_status(out, outlen, note);
+    free(copy);
     return 0;
 }
 
@@ -4845,6 +5660,21 @@ static void handle_ir_command(int fd, const struct request *req) {
     render_page(fd, msg);
 }
 
+static void handle_ir_update_command(int fd, const struct request *req) {
+    char device_id[64], old_name[128], name[128], mode[32], protocol[32], nec[64], keycode[512], raw[2048], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "oldName", old_name, sizeof(old_name));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "mode", mode, sizeof(mode));
+    form_value(req->body, "protocol", protocol, sizeof(protocol));
+    form_value(req->body, "nec", nec, sizeof(nec));
+    form_value(req->body, "keycode", keycode, sizeof(keycode));
+    form_value(req->body, "raw", raw, sizeof(raw));
+    if (!mode[0]) strcpy(mode, "keycode");
+    update_ir_command(device_id, old_name, name, mode, protocol, nec, keycode, raw, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
 static void handle_irdb_import(int fd, const struct request *req) {
     char device_id[64], msg[512];
     char *payload;
@@ -4925,6 +5755,79 @@ static void handle_ir_delete_command(int fd, const struct request *req) {
     form_value(req->body, "command", command, sizeof(command));
     delete_ir_command(device_id, command, msg, sizeof(msg));
     render_page(fd, msg);
+}
+
+static void handle_bt_device(int fd, const struct request *req) {
+    char device_id[64], name[128], type[40], bdaddr[32], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "type", type, sizeof(type));
+    form_value(req->body, "bdaddr", bdaddr, sizeof(bdaddr));
+    if (!type[0]) strcpy(type, "btkeyboard");
+    upsert_bt_device(device_id, name, type, bdaddr, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_bt_delete_device(int fd, const struct request *req) {
+    char device_id[64], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    delete_bt_device(device_id, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_bt_command(int fd, const struct request *req) {
+    char device_id[64], old_name[128], name[128], delay_text[24], msg[512];
+    char *script;
+    int delay_ms;
+    if (req->body_truncated) {
+        render_page(fd, "Bluetooth script was too large.");
+        return;
+    }
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "oldName", old_name, sizeof(old_name));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "delayMs", delay_text, sizeof(delay_text));
+    script = (char *)malloc(MAX_BT_SCRIPT_LEN);
+    if (!script) {
+        render_page(fd, "Not enough memory to save Bluetooth command.");
+        return;
+    }
+    form_value(req->body, "script", script, MAX_BT_SCRIPT_LEN);
+    delay_ms = atoi(delay_text);
+    upsert_bt_command(device_id, old_name, name, script, delay_ms, msg, sizeof(msg));
+    render_page(fd, msg);
+    free(script);
+}
+
+static void handle_bt_delete_command(int fd, const struct request *req) {
+    char device_id[64], command[128], msg[512];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "command", command, sizeof(command));
+    delete_bt_command(device_id, command, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_bt_send_command(int fd, const struct request *req) {
+    char device_id[64], command[128], msg[1024];
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "command", command, sizeof(command));
+    send_bt_saved_command(device_id, command, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void render_bt_saved_command_json(int fd, const struct request *req) {
+    char device_id[64], command[128], msg[1024];
+    int rc;
+    FILE *f;
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "command", command, sizeof(command));
+    rc = send_bt_saved_command(device_id, command, msg, sizeof(msg));
+    f = send_json_start(fd, rc == 0 ? "200 OK" : "400 Bad Request");
+    if (!f) return;
+    fputs("{\"ok\":", f); fputs(rc == 0 ? "true" : "false", f);
+    fputs(",\"message\":", f); json_write_string(f, msg);
+    fputs("}\n", f);
+    fclose(f);
 }
 
 static void free_request(struct request *req) {
@@ -5059,6 +5962,8 @@ static void handle_client(int client) {
         render_bluetooth_text_status_json(client);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-text") == 0) {
         render_bluetooth_text_json(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/bt-saved-command") == 0) {
+        render_bt_saved_command_json(client, &req);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/update-status") == 0) {
         render_update_status_json(client);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-begin") == 0) {
@@ -5083,6 +5988,8 @@ static void handle_client(int client) {
         send_file_download(client, WPA_CONFIG, "wpa_supplicant.conf", "text/plain");
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/cloud") == 0) {
         send_cloud_download(client);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/bluetooth") == 0) {
+        send_bt_devices_download(client);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/mqtt") == 0) {
         handle_mqtt(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/wifi") == 0) {
@@ -5099,6 +6006,8 @@ static void handle_client(int client) {
         handle_ir_new_device(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/command") == 0) {
         handle_ir_command(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/update-command") == 0) {
+        handle_ir_update_command(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/irdb-import") == 0) {
         handle_irdb_import(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/capture") == 0) {
@@ -5107,6 +6016,16 @@ static void handle_client(int client) {
         handle_ir_delete_device(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/delete-command") == 0) {
         handle_ir_delete_command(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/device") == 0) {
+        handle_bt_device(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/delete-device") == 0) {
+        handle_bt_delete_device(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/command") == 0) {
+        handle_bt_command(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/delete-command") == 0) {
+        handle_bt_delete_command(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/send-command") == 0) {
+        handle_bt_send_command(client, &req);
     } else {
         send_text(client, "404 Not Found", "not found\n");
     }
