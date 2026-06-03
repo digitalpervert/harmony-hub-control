@@ -33,6 +33,11 @@ const seedText = arg('seed', String(Date.now()));
 const sourceArg = arg('source', 'all').toLowerCase();
 const doConfigure = has('configure') && !!hub;
 const doDryRun = has('dry-run') || !doConfigure;
+const showUnsupported = has('show-unsupported');
+const pathFilters = process.argv
+  .filter((x) => x.startsWith('--path='))
+  .map((x) => x.slice('--path='.length).toLowerCase())
+  .filter(Boolean);
 let webuiParseIrText = null;
 
 let randState = 0;
@@ -702,7 +707,16 @@ async function main() {
   console.log(`seed=${seedText} source=${sourceArg} sample=${sampleCount} perDevice=${perDevice} configure=${doConfigure} dryRun=${doDryRun}`);
   const index = await loadIndex();
   console.log(`loaded ${index.length} database file entries`);
-  const sample = pickMany(index, sampleCount);
+  let sample = pickMany(index, sampleCount);
+  if (pathFilters.length) {
+    sample = [];
+    for (const filter of pathFilters) {
+      const found = index.find((entry) => entry.path.toLowerCase() === filter)
+        || index.find((entry) => entry.path.toLowerCase().includes(filter));
+      if (!found) throw new Error(`path filter did not match a database file: ${filter}`);
+      sample.push(found);
+    }
+  }
   const report = [];
   const totals = { files: 0, rows: 0, supported: 0, compact: 0, raw: 0, configured: 0 };
   const protocolGaps = new Map();
@@ -725,6 +739,13 @@ async function main() {
       report.push({ entry, sum, config });
       const unsupported = parsed.rows.length - sum.supported;
       console.log(`${i + 1}. ${entry.source} ${entry.path}: rows=${parsed.rows.length} supported=${sum.supported} compact=${sum.compact} raw=${sum.raw} unsupported=${unsupported}${config.configured ? ` -> ${config.name} (${config.deviceId})` : ''}`);
+      if (showUnsupported && unsupported) {
+        const examples = parsed.rows
+          .filter((row) => !(row.raw || row.keycode))
+          .slice(0, 8)
+          .map((row) => `${row.name || '(unnamed)'} / ${row.protocol || row.meta || 'unknown'}`);
+        console.log(`   unsupported examples: ${examples.join(' | ')}`);
+      }
     } catch (e) {
       console.log(`${i + 1}. ${entry.source} ${entry.path}: ERROR ${e.message || e}`);
       report.push({ entry, error: String(e.message || e) });
