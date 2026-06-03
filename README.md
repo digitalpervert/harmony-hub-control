@@ -32,6 +32,7 @@ MQTT credentials, firmware dumps, or personal backups.
   Install_Harmony_Control.cmd
                            Double-click post-root installer for Windows
   install_webui.ps1        Windows installer for rooted hubs with SSH
+  install_webui.py         Linux/macOS Python installer for rooted hubs
   restore_backup.ps1       Restores the installer's hub-side backup
   payload/
     bin/                   MIPS binaries shipped to the hub
@@ -58,12 +59,15 @@ No build server is required to install the current payload.
 ## Quick Install
 
 Run after the hub has just been rooted with the LAN root tool. The installer
-uses the current Windows user's Harmony SSH key. It looks in `.ssh` for a
-private key whose filename starts with `harmony_owner_`:
+uses your Harmony SSH key. It looks in `.ssh` for a private key whose filename
+starts with `harmony_owner_`:
 
 ```text
 %USERPROFILE%\.ssh\harmony_owner_*
+~/.ssh/harmony_owner_*
 ```
+
+### Windows
 
 Double-click:
 
@@ -83,6 +87,20 @@ PowerShell can also be run directly:
 
 ```powershell
 .\install_webui.ps1 -HubHost <hub-ip>
+```
+
+### Linux/macOS
+
+Use the Python 3 installer from the repository root:
+
+```bash
+python3 install_webui.py --hub-host <hub-ip>
+```
+
+For a non-interactive install with MQTT disabled:
+
+```bash
+python3 install_webui.py --hub-host <hub-ip> --key-path ~/.ssh/harmony_owner_<key-name> --mqtt-disabled --no-prompt
 ```
 
 The installer will prompt for missing values, create a backup on the hub, upload
@@ -111,7 +129,7 @@ Keep changes scoped and reviewable:
 2. Rebuild MIPS binaries only when native source changes.
 3. Replace the corresponding file under `payload/bin/`.
 4. Update `payload/bin/MANIFEST.txt`.
-5. Install to a test hub with `install_webui.ps1`.
+5. Install to a test hub with `install_webui.ps1` on Windows or `install_webui.py` on Linux/macOS.
 6. Verify the dashboard, IR import, Bluetooth HID, MQTT, and rollback paths.
 
 Do not commit local secrets, hub backups, firmware dumps, root tooling, or
@@ -143,6 +161,12 @@ IR database parser smoke test:
 
 ```powershell
 node .\tools\ir_database_smoke_test.mjs --sample=24 --per-device=10 --source=all --dry-run
+```
+
+Linux/macOS:
+
+```bash
+node ./tools/ir_database_smoke_test.mjs --sample=24 --per-device=10 --source=all --dry-run
 ```
 
 To create test devices and import supported commands without sending IR:

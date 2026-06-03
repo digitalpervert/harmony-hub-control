@@ -26,6 +26,7 @@ already rooted Logitech Harmony Hub.
 - `payload/scripts/netservicestarter.lua`: cloud-suppressed local service
   starter.
 - `install_webui.ps1`: Windows SSH uploader/installer.
+- `install_webui.py`: Linux/macOS Python SSH uploader/installer.
 - `restore_backup.ps1`: rollback helper.
 
 ## Runtime Paths On Hub
@@ -68,7 +69,7 @@ already rooted Logitech Harmony Hub.
 
 After changing web UI or runtime behavior:
 
-1. Deploy with `install_webui.ps1`.
+1. Deploy with `install_webui.ps1` on Windows or `python3 install_webui.py` on Linux/macOS.
 2. Open `http://<hub-ip>:8080/`.
 3. Check Dashboard, IR Devices, IR Sweep, Bluetooth, MQTT, Wi-Fi, Backup, and
    System sections.

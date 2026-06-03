@@ -26,13 +26,14 @@ After rebuilding:
 
 1. Copy the required binaries from `build/output/` into `payload/bin/`.
 2. Refresh `payload/bin/MANIFEST.txt`.
-3. Deploy to a test hub with `install_webui.ps1`.
+3. Deploy to a test hub with `install_webui.ps1` or `python3 install_webui.py`.
 4. Confirm checksums and runtime behavior.
 
 ## Windows
 
-Windows is used for deployment, not native cross-compilation. Use WSL, a Linux
-VM, or the existing build server for rebuilding MIPS binaries.
+Windows can deploy with PowerShell, and Linux/macOS can deploy with the Python
+installer. Use WSL, a Linux VM, or the existing build server for rebuilding MIPS
+binaries.
 
 ## Dropbear
 
