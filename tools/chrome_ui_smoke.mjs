@@ -215,6 +215,28 @@ async function main() {
       importable: document.querySelectorAll('#irdbPreview input:not(:disabled)').length
     };
   })()`, 90000);
+  const lgSearch = await evaluate(`(async () => {
+    showView('ir');
+    const out = {};
+    for (const source of ['irdb', 'all']) {
+      document.querySelector('#irdbSource').value = source;
+      document.querySelector('#irdbSearch').value = 'LG C5';
+      document.querySelector('#irdbPath').value = '';
+      document.querySelector('#irdbPath').dataset.source = '';
+      await runIrdSearch();
+      const selectedPath = document.querySelector('#irdbPath')?.value || '';
+      if (selectedPath) await fetchIrdPath();
+      out[source] = {
+        results: document.querySelectorAll('#irdbResults .match').length,
+        status: document.querySelector('#irdbStatus')?.textContent || '',
+        selectedPath,
+        previewRows: document.querySelectorAll('#irdbPreview label').length,
+        importable: document.querySelectorAll('#irdbPreview input:not(:disabled)').length,
+        log: document.querySelector('#irdbLog')?.textContent?.slice(0, 700) || ''
+      };
+    }
+    return out;
+  })()`, 90000);
   const lab = await evaluate(`(async () => {
     showView('lab');
     document.querySelector('#labSource').value = 'all';
@@ -257,6 +279,7 @@ async function main() {
     base,
     api,
     irSearch,
+    lgSearch,
     lab,
     updateUi,
     browserMessages: eventText(recentEvents),
