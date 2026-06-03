@@ -198,6 +198,18 @@ async function main() {
       log: document.querySelector('#labLog')?.textContent?.slice(-900) || ''
     };
   })()`, 120000);
+  const updateUi = await evaluate(`(async () => {
+    showView('system');
+    const repo = document.querySelector('#updateRepo');
+    if (repo) repo.value = 'https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/';
+    if (typeof updateCheckRepo !== 'function') return { ok: false, error: 'updateCheckRepo is not available' };
+    await updateCheckRepo();
+    const log = document.querySelector('#updateLog')?.textContent || '';
+    return {
+      ok: /Already current\\.|file\\(s\\) need update/.test(log) && !/update check failed/i.test(log),
+      log: log.slice(-900)
+    };
+  })()`, 90000);
   const screenshot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
   const screenshotPath = path.join(outDir, `harmony-ui-${Date.now()}.png`);
   fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
@@ -208,6 +220,7 @@ async function main() {
     api,
     irSearch,
     lab,
+    updateUi,
     browserMessages: eventText(cdp.events),
     screenshotPath,
   };
