@@ -19,8 +19,15 @@ function wait(ms) {
 }
 
 async function connectChrome() {
-  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-  const target = targets.find((x) => x.type === 'page') || targets[0];
+  let target;
+  try {
+    const created = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
+    if (created.ok) target = await created.json();
+  } catch {
+    // Older Chrome builds may reject target creation; fall back to the first tab.
+  }
+  const targets = target ? [] : await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  target = target || targets.find((x) => x.type === 'page') || targets[0];
   if (!target?.webSocketDebuggerUrl) throw new Error(`no page target on Chrome DevTools port ${port}`);
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   const pending = new Map();
@@ -44,7 +51,23 @@ async function connectChrome() {
   function send(method, params = {}) {
     const id = nextId++;
     ws.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+    const ms = Number(params.timeout || 30000) + 10000;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`CDP ${method} timed out after ${ms} ms`));
+      }, ms);
+      pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+    });
   }
   return { ws, send, events };
 }
@@ -96,11 +119,15 @@ async function main() {
   await wait(600);
   const eventStart = cdp.events.length;
   async function evaluate(expression, timeout = 30000) {
+    const wrapped = `Promise.race([
+      (${expression}),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('smoke evaluation timed out after ${timeout} ms')), ${timeout}))
+    ])`;
     const result = await send('Runtime.evaluate', {
-      expression,
+      expression: wrapped,
       awaitPromise: true,
       returnByValue: true,
-      timeout,
+      timeout: timeout + 5000,
     });
     if (result.exceptionDetails) {
       throw new Error(result.exceptionDetails.text || result.exceptionDetails.exception?.description || 'evaluation failed');
