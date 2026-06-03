@@ -1,8 +1,19 @@
 #!/usr/bin/env node
 
+import fs from 'node:fs';
+import pathModule from 'node:path';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+
+const __dirname = pathModule.dirname(fileURLToPath(import.meta.url));
+
 const IRDB_BASE = 'https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/';
 const FLIPPER_BASE = 'https://cdn.jsdelivr.net/gh/Lucaslhm/Flipper-IRDB@main/';
 const FLIPPER_INDEX = 'https://api.github.com/repos/Lucaslhm/Flipper-IRDB/git/trees/main?recursive=1';
+const LIRC_BASE = 'https://raw.githubusercontent.com/probonopd/lirc-remotes/master/';
+const LIRC_INDEX = 'https://api.github.com/repos/probonopd/lirc-remotes/git/trees/master?recursive=1';
+const SMARTIR_BASE = 'https://raw.githubusercontent.com/smartHomeHub/SmartIR/master/';
+const SMARTIR_INDEX = 'https://api.github.com/repos/smartHomeHub/SmartIR/git/trees/master?recursive=1';
 
 function arg(name, fallback = '') {
   const eq = process.argv.find((x) => x.startsWith(`--${name}=`));
@@ -22,6 +33,7 @@ const seedText = arg('seed', String(Date.now()));
 const sourceArg = arg('source', 'all').toLowerCase();
 const doConfigure = has('configure') && !!hub;
 const doDryRun = has('dry-run') || !doConfigure;
+let webuiParseIrText = null;
 
 let randState = 0;
 for (const ch of seedText) randState = (randState * 31 + ch.charCodeAt(0)) >>> 0;
@@ -39,6 +51,51 @@ function pickMany(items, count) {
     out.push(copy.splice(Math.floor(random() * copy.length), 1)[0]);
   }
   return out;
+}
+
+function loadWebuiParser() {
+  if (webuiParseIrText) return webuiParseIrText;
+  const sourcePath = pathModule.join(__dirname, '..', 'payload', 'source', 'codex_webui.c');
+  const c = fs.readFileSync(sourcePath, 'utf8');
+  const script = [...c.matchAll(/^\s*"((?:\\.|[^"\\])*)"\s*$/gm)]
+    .map((m) => JSON.parse(`"${m[1]}"`))
+    .join('');
+  const start = script.indexOf('const IRDB_BASE');
+  const end = script.indexOf('async function postJson');
+  if (start < 0 || end < 0) throw new Error('could not extract web UI IR parser');
+  const context = {
+    console,
+    fetch,
+    atob: (s) => Buffer.from(String(s || '').replace(/\s+/g, ''), 'base64').toString('binary'),
+    document: {
+      createElement: () => ({
+        _v: '',
+        set innerHTML(v) {
+          this._v = String(v || '')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'");
+        },
+        get value() {
+          return this._v;
+        },
+      }),
+    },
+    DOMParser: class {
+      parseFromString() {
+        return { querySelector: () => null, querySelectorAll: () => [] };
+      }
+    },
+    $: () => null,
+    history: {},
+    location: {},
+  };
+  vm.createContext(context);
+  vm.runInContext(`${script.slice(start, end)};this.__parseIrText=parseIrText;`, context);
+  webuiParseIrText = (body, source, path) => context.__parseIrText(body, source, path);
+  return webuiParseIrText;
 }
 
 function rev8(v) {
@@ -529,13 +586,34 @@ async function loadIndex() {
     const tree = await json(FLIPPER_INDEX);
     sources.push(...(tree.tree || []).map((x) => x.path).filter((x) => x && x.endsWith('.ir')).map((path) => ({ source: 'flipper', path })));
   }
+  if (sourceArg === 'all' || sourceArg === 'lirc') {
+    const tree = await json(LIRC_INDEX);
+    sources.push(...(tree.tree || [])
+      .filter((x) => x.type === 'blob')
+      .map((x) => (x.path || '').replace(/^\//, ''))
+      .filter((x) => x && x !== 'README.md' && !/\.(png|jpg|jpeg|gif|md|html)$/i.test(x))
+      .map((path) => ({ source: 'lirc', path })));
+  }
+  if (sourceArg === 'all' || sourceArg === 'smartir') {
+    const tree = await json(SMARTIR_INDEX);
+    sources.push(...(tree.tree || [])
+      .filter((x) => x.type === 'blob')
+      .map((x) => (x.path || '').replace(/^\//, ''))
+      .filter((x) => /^codes\/.+\.json$/i.test(x))
+      .map((path) => ({ source: 'smartir', path })));
+  }
   return sources;
 }
 
 async function parseEntry(entry) {
-  const url = entry.source === 'irdb' ? `${IRDB_BASE}${entry.path}` : `${FLIPPER_BASE}${entry.path}`;
+  let url;
+  if (entry.source === 'irdb') url = `${IRDB_BASE}${entry.path}`;
+  else if (entry.source === 'flipper') url = `${FLIPPER_BASE}${entry.path}`;
+  else if (entry.source === 'lirc') url = `${LIRC_BASE}${entry.path}`;
+  else if (entry.source === 'smartir') url = `${SMARTIR_BASE}${entry.path}`;
+  else throw new Error(`unknown source ${entry.source}`);
   const body = await text(url);
-  const rows = entry.source === 'irdb' ? csvEntries(body) : flipperEntries(body);
+  const rows = loadWebuiParser()(body, entry.source, entry.path);
   return { ...entry, url, rows };
 }
 
