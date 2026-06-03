@@ -61,6 +61,15 @@ function eventText(events) {
     });
 }
 
+function failedNetwork(events) {
+  return events
+    .filter((e) => e.method === 'Network.responseReceived' && e.params?.response?.status >= 400)
+    .map((e) => ({
+      status: e.params.response.status,
+      url: e.params.response.url,
+    }));
+}
+
 async function main() {
   fs.mkdirSync(outDir, { recursive: true });
   const cdp = await connectChrome();
@@ -85,6 +94,7 @@ async function main() {
   await send('Page.navigate', { url: hub });
   await load;
   await wait(600);
+  const eventStart = cdp.events.length;
   async function evaluate(expression, timeout = 30000) {
     const result = await send('Runtime.evaluate', {
       expression,
@@ -213,6 +223,7 @@ async function main() {
   const screenshot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
   const screenshotPath = path.join(outDir, `harmony-ui-${Date.now()}.png`);
   fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+  const recentEvents = cdp.events.slice(eventStart);
   const report = {
     hub,
     timestamp: new Date().toISOString(),
@@ -221,7 +232,8 @@ async function main() {
     irSearch,
     lab,
     updateUi,
-    browserMessages: eventText(cdp.events),
+    browserMessages: eventText(recentEvents),
+    failedNetwork: failedNetwork(recentEvents),
     screenshotPath,
   };
   const reportPath = path.join(outDir, 'latest.json');
