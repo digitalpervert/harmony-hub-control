@@ -26,7 +26,7 @@ function has(name) {
   return process.argv.includes(`--${name}`);
 }
 
-const sampleCount = Math.max(1, Math.min(80, Number(arg('sample', '10')) || 10));
+const sampleCount = Math.max(1, Math.min(500, Number(arg('sample', '10')) || 10));
 const perDevice = Math.max(1, Math.min(80, Number(arg('per-device', '12')) || 12));
 const hub = arg('hub', '').replace(/\/$/, '');
 const seedText = arg('seed', String(Date.now()));
