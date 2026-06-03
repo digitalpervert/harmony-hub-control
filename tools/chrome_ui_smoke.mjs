@@ -181,6 +181,31 @@ async function main() {
       .slice(0, 20);
     return { title: document.title, bodyLength: document.documentElement.outerHTML.length, duplicateIds: dupes, views, unlabeled, lowContrast, overflow };
   })()`);
+  async function responsiveCheck(width, height) {
+    await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width < 600 });
+    await wait(300);
+    return evaluate(`(() => {
+      const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+      const views = [];
+      for (const btn of document.querySelectorAll('[data-view-target]')) {
+        const view = btn.dataset.viewTarget;
+        btn.click();
+        const active = document.querySelector('[data-view].active')?.dataset.view || '';
+        views.push({ view, active, ok: view === active });
+      }
+      const overflow = [...document.querySelectorAll('button,a.button,input,select,textarea,.match,.queue-row,.menu-item,.panel,.setup-shell')]
+        .filter((el) => visible(el) && el.scrollWidth > el.clientWidth + 3)
+        .map((el) => ({ tag: el.tagName.toLowerCase(), cls: el.className || '', text: (el.value || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 90), delta: el.scrollWidth - el.clientWidth }))
+        .slice(0, 20);
+      return { width: innerWidth, height: innerHeight, views, overflow };
+    })()`);
+  }
+  const responsive = [];
+  for (const [width, height] of [[390, 780], [768, 900], [1280, 900]]) {
+    responsive.push(await responsiveCheck(width, height));
+  }
+  await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+  await wait(300);
   const api = await evaluate(`(async () => {
     const out = {};
     for (const [name, url] of Object.entries({
@@ -315,6 +340,7 @@ async function main() {
     hub,
     timestamp: new Date().toISOString(),
     base,
+    responsive,
     api,
     irSearch,
     lgSearch,
