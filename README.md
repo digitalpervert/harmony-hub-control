@@ -128,8 +128,20 @@ if provided.
 By default the installer enables the web UI's cloud blocker setting. That keeps
 Logitech cloudapi, PubNub, and package-manager background tasks from starting
 while local web, MQTT, Bluetooth, Wi-Fi recovery, and SSH control continue to
-work. Owners can change it later from **System > Cloud blocker**; reboot or
-reconnect the network afterward to apply the saved mode.
+work. Fresh installs reboot once at the end so the patched network-service
+startup is actually active before the handoff finishes. Owners can change it
+later from **System > Cloud blocker** and use **Save and reboot** to apply the
+new mode.
+
+To stage the setting without the install-time reboot:
+
+```powershell
+.\install_webui.ps1 -HubHost <hub-ip> -NoApplyCloudRestart
+```
+
+```bash
+python3 install_webui.py --hub-host <hub-ip> --no-apply-cloud-restart
+```
 
 Open the UI afterward:
 

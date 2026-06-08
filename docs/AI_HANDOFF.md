@@ -69,7 +69,8 @@ already rooted Logitech Harmony Hub.
 - Cloud blocker defaults to enabled. The System page saves
   `/data/codex/cloud_blocker.conf`; missing or `1` blocks cloudapi, PubNub, and
   package-manager tasks, while `0` allows them after reboot or network
-  reconnect.
+  reconnect. The installers reboot once after a normal cloud-blocking install
+  so new deployments finish with the blocker already active.
 
 ## Verification Checklist
 

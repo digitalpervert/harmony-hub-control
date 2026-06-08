@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -135,6 +136,24 @@ def local_md5(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def tcp_open(host: str, port: int, timeout: float = 1.2) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_port(host: str, port: int, seconds: int, label: str) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if tcp_open(host, port):
+            info(f"{label} is reachable on port {port}")
+            return
+        time.sleep(2)
+    raise RuntimeError(f"{label} did not become reachable on port {port} within {seconds} seconds")
 
 
 class Installer:
@@ -361,10 +380,20 @@ echo "$B"
                     f"checksum mismatch for {parts[1]}: expected {expected[parts[1]]} got {parts[0]}"
                 )
 
+        if not self.args.skip_cloud_suppression and not self.args.no_apply_cloud_restart:
+            step("Applying cloud blocker")
+            info("Rebooting the hub so Logitech cloud services restart in blocked mode.")
+            self.run_remote("(/bin/sleep 2; /sbin/reboot || reboot) >/dev/null 2>&1 & echo rebooting", timeout=30, quiet=True)
+            time.sleep(8)
+            wait_for_port(self.args.hub_host, self.args.port, 180, "SSH")
+            wait_for_port(self.args.hub_host, 8080, 180, "Web UI")
+
         step("Done")
         info(f"Web UI: http://{self.args.hub_host}:8080/")
         info("Web UI authentication: disabled")
         info(f"Backup directory on hub: {backup_dir}")
+        if not self.args.skip_cloud_suppression:
+            info("Cloud blocker: enabled and applied")
         info("If IR commands do not work, update /data/codex/hub_id with the correct hub id and restart codex_webui.")
 
 
@@ -386,6 +415,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mqtt-client-id", default="harmony-local-mqtt", help="MQTT client ID")
     parser.add_argument("--mqtt-disabled", action="store_true", help="Install with MQTT disabled")
     parser.add_argument("--skip-cloud-suppression", action="store_true", help="Do not replace netservicestarter.lua")
+    parser.add_argument("--no-apply-cloud-restart", action="store_true", help="Do not reboot after enabling the Logitech cloud blocker")
     parser.add_argument("--no-prompt", action="store_true", help="Fail instead of asking for missing required values")
     return parser.parse_args(argv)
 

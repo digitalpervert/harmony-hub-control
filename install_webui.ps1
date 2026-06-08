@@ -14,6 +14,7 @@ param(
     [string]$MqttClientId = "harmony-local-mqtt",
     [switch]$MqttDisabled,
     [switch]$SkipCloudSuppression,
+    [switch]$NoApplyCloudRestart,
     [switch]$NoPrompt
 )
 
@@ -180,6 +181,32 @@ function Invoke-Remote([string]$Command, [byte[]]$InputBytes = $null, [int]$Time
         Write-Host $stderr.Trim() -ForegroundColor DarkGray
     }
     return $stdout
+}
+
+function Test-TcpPort([string]$TargetHost, [int]$TargetPort, [int]$TimeoutMs = 1200) {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $async = $client.BeginConnect($TargetHost, $TargetPort, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($async)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        try { $client.Close() } catch {}
+    }
+}
+
+function Wait-TcpPort([string]$TargetHost, [int]$TargetPort, [int]$Seconds, [string]$Label) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-TcpPort $TargetHost $TargetPort 1200) {
+            Info "$Label is reachable on port $TargetPort"
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "$Label did not become reachable on port $TargetPort within $Seconds seconds"
 }
 
 function Split-RemoteDir([string]$Path) {
@@ -363,8 +390,20 @@ foreach ($line in ($verify -split "`n")) {
     }
 }
 
+if (-not $SkipCloudSuppression -and -not $NoApplyCloudRestart) {
+    Step "Applying cloud blocker"
+    Info "Rebooting the hub so Logitech cloud services restart in blocked mode."
+    Invoke-Remote "(/bin/sleep 2; /sbin/reboot || reboot) >/dev/null 2>&1 & echo rebooting" $null 30000 | Out-Null
+    Start-Sleep -Seconds 8
+    Wait-TcpPort $HubHost $Port 180 "SSH"
+    Wait-TcpPort $HubHost 8080 180 "Web UI"
+}
+
 Step "Done"
 Info "Web UI: http://$HubHost`:8080/"
 Info "Web UI authentication: disabled"
 Info "Backup directory on hub: $backupDir"
+if (-not $SkipCloudSuppression) {
+    Info "Cloud blocker: enabled and applied"
+}
 Info "If IR commands do not work, update /data/codex/hub_id with the correct hub id and restart codex_webui."
