@@ -34,6 +34,8 @@ authorized_keys
 .env
 secrets.*
 config.local.json
+harmony_hub_id.txt
+harmony_hub_id.json
 
 # Build output
 build/toolchains/

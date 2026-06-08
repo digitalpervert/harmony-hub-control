@@ -65,6 +65,61 @@ def resolve_default_key_path() -> Path | None:
     return sorted(keys, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
 
+def valid_hub_id(value: str) -> bool:
+    return value.isdigit() and len(value) >= 4
+
+
+def read_json_file(path: Path) -> object | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def resolve_saved_hub_id(hub_host: str) -> tuple[str, Path] | None:
+    candidate_paths: list[Path] = []
+    home = Path.home()
+    candidate_paths.extend(
+        [
+            home / ".harmony-hub" / "known_hubs.json",
+            home / ".harmony-hub" / "last_root.json",
+            home / ".harmony-hub" / "hub_id.txt",
+            ROOT / "harmony_hub_id.txt",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for path in candidate_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        if not path.is_file():
+            continue
+        if path.name == "known_hubs.json":
+            known = read_json_file(path)
+            if isinstance(known, dict):
+                entry = known.get(hub_host)
+                if isinstance(entry, dict):
+                    hub_id = str(entry.get("hub_id", "")).strip()
+                    if valid_hub_id(hub_id):
+                        return hub_id, path
+            continue
+        if path.name == "last_root.json":
+            last = read_json_file(path)
+            if isinstance(last, dict) and str(last.get("host", "")) == hub_host:
+                hub_id = str(last.get("hub_id", "")).strip()
+                if valid_hub_id(hub_id):
+                    return hub_id, path
+            continue
+        try:
+            hub_id = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if valid_hub_id(hub_id):
+            return hub_id, path
+    return None
+
+
 def remote_quote(value: str) -> str:
     return shlex.quote(value)
 
@@ -197,11 +252,21 @@ class Installer:
             if existing:
                 hub_id = existing
                 info(f"hub id from existing /data/codex/hub_id: {hub_id}")
-            elif not self.args.no_prompt:
-                hub_id = input("Hub ID from the root tool output (blank for fallback 16042906): ").strip()
-        if not hub_id:
-            hub_id = "16042906"
-            info("using fallback hub id 16042906; change /data/codex/hub_id later if IR commands do not work")
+            else:
+                saved = resolve_saved_hub_id(self.args.hub_host)
+                if saved:
+                    hub_id, source = saved
+                    info(f"hub id from root-tool handoff: {hub_id} ({source})")
+            if not hub_id and not self.args.no_prompt:
+                hub_id = input("Hub ID from the root tool output or ~/.harmony-hub handoff file: ").strip()
+        if not valid_hub_id(hub_id):
+            if hub_id:
+                raise RuntimeError(f"Invalid Hub ID {hub_id!r}. Re-run the root tool or pass --hub-id with the numeric value.")
+            raise RuntimeError(
+                "Hub ID is required. Re-run the root tool so it writes the handoff file, "
+                "or pass --hub-id with the numeric value printed as hub_id=..."
+            )
+        info(f"using hub id {hub_id}")
 
         step("Creating remote backup")
         backup_cmd = r"""

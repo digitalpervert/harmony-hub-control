@@ -2,9 +2,14 @@
 PATH=/data/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 LOG=/cache/codex-init.log
 HUB_ID=$(cat /data/codex/hub_id 2>/dev/null)
-[ -n "$HUB_ID" ] || HUB_ID=16042906
+case "$HUB_ID" in
+  *[!0-9]*|"") HUB_ID="" ;;
+esac
 
 echo "$(date) codex init start" >> "$LOG"
+if [ -z "$HUB_ID" ]; then
+  echo "$(date) missing numeric /data/codex/hub_id; skipping HBus startup actions" >> "$LOG"
+fi
 
 if [ -x /data/codex/bin/dropbear ]; then
   echo '#!/bin/sh' > /usr/sbin/dropbear
@@ -41,7 +46,7 @@ fi
 
 (
   sleep 70
-  if [ -x /data/codex/bin/codex_hbus ]; then
+  if [ -n "$HUB_ID" ] && [ -x /data/codex/bin/codex_hbus ]; then
     /data/codex/bin/codex_hbus "$HUB_ID" "harmony.automation?discover" '{"gatewayType":"codexmqtt"}' >> "$LOG" 2>&1
   fi
 ) &

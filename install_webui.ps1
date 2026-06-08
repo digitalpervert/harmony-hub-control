@@ -52,6 +52,65 @@ function Resolve-DefaultKeyPath() {
     return $keys[0].FullName
 }
 
+function Test-HubId([string]$Value) {
+    return [bool]($Value -match '^[0-9]{4,}$')
+}
+
+function Get-UniquePathList([string[]]$Paths) {
+    $seen = @{}
+    $out = @()
+    foreach ($path in $Paths) {
+        if (-not $path) { continue }
+        if ($seen.ContainsKey($path)) { continue }
+        $seen[$path] = $true
+        $out += $path
+    }
+    return $out
+}
+
+function Resolve-SavedHubId([string]$HubHost) {
+    $userRoot = $env:USERPROFILE
+    if (-not $userRoot) { $userRoot = [Environment]::GetFolderPath("UserProfile") }
+    $paths = @()
+    if ($userRoot) {
+        $paths += Join-Path $userRoot ".harmony-hub\known_hubs.json"
+        $paths += Join-Path $userRoot ".harmony-hub\last_root.json"
+        $paths += Join-Path $userRoot ".harmony-hub\hub_id.txt"
+    }
+    if ($HOME -and $HOME -ne $userRoot) {
+        $paths += Join-Path $HOME ".harmony-hub\known_hubs.json"
+        $paths += Join-Path $HOME ".harmony-hub\last_root.json"
+        $paths += Join-Path $HOME ".harmony-hub\hub_id.txt"
+    }
+    $paths += Join-Path $ScriptRoot "harmony_hub_id.txt"
+
+    foreach ($path in (Get-UniquePathList $paths)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
+        try {
+            if ($path.EndsWith("known_hubs.json")) {
+                $known = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                $entry = $known.PSObject.Properties[$HubHost].Value
+                if ($entry -and (Test-HubId $entry.hub_id)) {
+                    return [pscustomobject]@{ HubId = [string]$entry.hub_id; Source = $path }
+                }
+            } elseif ($path.EndsWith("last_root.json")) {
+                $last = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                if ($last.host -eq $HubHost -and (Test-HubId $last.hub_id)) {
+                    return [pscustomobject]@{ HubId = [string]$last.hub_id; Source = $path }
+                }
+            } else {
+                $value = (Get-Content -LiteralPath $path -Raw).Trim()
+                if (Test-HubId $value) {
+                    return [pscustomobject]@{ HubId = $value; Source = $path }
+                }
+            }
+        } catch {
+            Info "ignored unreadable Hub ID handoff file ${path}: $($_.Exception.Message)"
+        }
+    }
+    return $null
+}
+
 function Quote-ProcessArg([string]$Arg) {
     if ($null -eq $Arg) { return '""' }
     if ($Arg.Length -eq 0) { return '""' }
@@ -206,14 +265,28 @@ if (-not $HubId) {
     if ($existingHubId) {
         $HubId = $existingHubId
         Info "hub id from existing /data/codex/hub_id: $HubId"
+    } else {
+        $savedHub = Resolve-SavedHubId $HubHost
+        if ($savedHub) {
+            $HubId = $savedHub.HubId
+            Info "hub id from root-tool handoff: $HubId ($($savedHub.Source))"
+        }
+    }
+    if (-not $HubId -and -not $NoPrompt) {
+        $HubId = Read-Host "Hub ID from the root tool output or ~/.harmony-hub handoff file"
+    }
+}
+if (-not (Test-HubId $HubId)) {
+    if ($HubId) {
+        throw "Invalid Hub ID '$HubId'. Re-run the root tool or pass the numeric Hub ID with -HubId."
     } elseif (-not $NoPrompt) {
-        $HubId = Read-Host "Hub ID from the root tool output (blank for fallback 16042906)"
+        throw "Hub ID is required. Re-run the root tool so it writes the handoff file, or pass -HubId with the numeric value printed as hub_id=..."
     }
 }
 if (-not $HubId) {
-    $HubId = "16042906"
-    Info "using fallback hub id $HubId; change /data/codex/hub_id later if IR commands do not work"
+    throw "Hub ID is required. Re-run the root tool so it writes the handoff file, or pass -HubId with the numeric value printed as hub_id=..."
 }
+Info "using hub id $HubId"
 
 Step "Creating remote backup"
 $backupCmd = @'

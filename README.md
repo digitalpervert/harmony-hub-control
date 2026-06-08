@@ -67,6 +67,22 @@ starts with `harmony_owner_`:
 ~/.ssh/harmony_owner_*
 ```
 
+The installer also needs the real numeric Harmony Hub ID for local HBus
+commands. If you rooted the hub with `harmony-hub-root`, this is read
+automatically from the handoff file under `.harmony-hub`. If the handoff file is
+missing, pass the exact value printed by the root tool as `hub_id=...`:
+
+```powershell
+.\install_webui.ps1 -HubHost <hub-ip> -HubId <numeric-id>
+```
+
+```bash
+python3 install_webui.py --hub-host <hub-ip> --hub-id <numeric-id>
+```
+
+Do not use a guessed Hub ID; IR, capture, MQTT, and dashboard HBus calls depend
+on the real value.
+
 ### Windows
 
 Double-click:

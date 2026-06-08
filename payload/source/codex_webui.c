@@ -1029,12 +1029,25 @@ static int save_wifi(const struct wifi_config *cfg) {
     return 0;
 }
 
+static int load_hub_id(char *hub_id, size_t hub_id_len) {
+    size_t i, n;
+    if (!hub_id || hub_id_len == 0) return 0;
+    hub_id[0] = '\0';
+    read_text(HUB_ID_FILE, hub_id, hub_id_len);
+    chomp(hub_id);
+    n = strlen(hub_id);
+    if (n < 4) return 0;
+    for (i = 0; i < n; i++) {
+        if (!isdigit((unsigned char)hub_id[i])) return 0;
+    }
+    return 1;
+}
+
 static void trigger_mqtt_discover(void) {
-    char hub_id[64] = "16042906";
+    char hub_id[64];
     char escaped[128];
     char cmd[384];
-    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
-    chomp(hub_id);
+    if (!load_hub_id(hub_id, sizeof(hub_id))) return;
     shell_escape_single(hub_id, escaped, sizeof(escaped));
     snprintf(cmd, sizeof(cmd),
         "/data/codex/bin/codex_hbus '%s' harmony.automation?discover '{\"gatewayType\":\"codexmqtt\"}' >/dev/null 2>&1 &",
@@ -2648,10 +2661,13 @@ static void log_ir_note_event(const char *event, const char *source, const char 
 }
 
 static void send_ir_command_action_ex(const char *device_id, const char *command, const char *source, const char *run_id, char *out, size_t outlen) {
-    char hub_id[64] = "16042906";
+    char hub_id[64];
     char action[512], params[768], esc_id[128], esc_params[1024], cmd[1400];
-    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
-    chomp(hub_id);
+    if (!load_hub_id(hub_id, sizeof(hub_id))) {
+        snprintf(out, outlen, "Hub ID is missing. Re-run the root tool or reinstall with the numeric Hub ID printed as hub_id=...");
+        log_ir_event(source, run_id, device_id, command, out);
+        return;
+    }
     snprintf(action, sizeof(action), "{\\\"type\\\":\\\"IRCommand\\\",\\\"deviceId\\\":\\\"%s\\\",\\\"command\\\":\\\"%s\\\"}", device_id, command);
     snprintf(params, sizeof(params), "{\"status\":\"pressrelease\",\"count\":1,\"action\":\"%s\"}", action);
     shell_escape_single(hub_id, esc_id, sizeof(esc_id));
@@ -2666,10 +2682,12 @@ static void send_ir_command_action(const char *device_id, const char *command, c
 }
 
 static void capture_ir_command_action(char *out, size_t outlen) {
-    char hub_id[64] = "16042906";
+    char hub_id[64];
     char esc_id[128], cmd[512];
-    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
-    chomp(hub_id);
+    if (!load_hub_id(hub_id, sizeof(hub_id))) {
+        snprintf(out, outlen, "Hub ID is missing. Re-run the root tool or reinstall with the numeric Hub ID printed as hub_id=...");
+        return;
+    }
     shell_escape_single(hub_id, esc_id, sizeof(esc_id));
     snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' ir.cap '{\"hbusData\":{\"timeout\":15000}}' 2>&1", esc_id);
     run_cmd(cmd, out, outlen);
@@ -2981,7 +2999,8 @@ static void page_end(FILE *f) {
 static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
     char uptime[128], version[128], ifconfig[2048], activity[1024];
     char uptime_label[80], inventory_label[80];
-    char hub_id[64] = "16042906";
+    char hub_id[64];
+    int hub_id_ok;
     int mqtt_up = tcp_established(mqtt->host, mqtt->port);
     int device_count = -1, command_count = 0;
     int cloud_blocked = load_cloud_blocker();
@@ -2997,8 +3016,7 @@ static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
         if (days > 0) snprintf(uptime_label, sizeof(uptime_label), "%ldd %ldh %ldm", days, hours, minutes);
         else snprintf(uptime_label, sizeof(uptime_label), "%ldh %ldm", hours, minutes);
     }
-    read_text(HUB_ID_FILE, hub_id, sizeof(hub_id));
-    chomp(hub_id);
+    hub_id_ok = load_hub_id(hub_id, sizeof(hub_id));
     run_cmd("ifconfig ath0 2>/dev/null", ifconfig, sizeof(ifconfig));
     if (scan_ir_resource_stats(&device_count, &command_count, NULL, NULL) != 0) {
         device_count = -1;
@@ -3008,9 +3026,13 @@ static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
     else snprintf(inventory_label, sizeof(inventory_label), "%d devices", device_count);
     {
         char esc_id[128], cmd[384];
-        shell_escape_single(hub_id, esc_id, sizeof(esc_id));
-        snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' harmony.engine?getCurrentActivity '{}' 2>/dev/null", esc_id);
-        run_cmd(cmd, activity, sizeof(activity));
+        if (hub_id_ok) {
+            shell_escape_single(hub_id, esc_id, sizeof(esc_id));
+            snprintf(cmd, sizeof(cmd), "/data/codex/bin/codex_hbus '%s' harmony.engine?getCurrentActivity '{}' 2>/dev/null", esc_id);
+            run_cmd(cmd, activity, sizeof(activity));
+        } else {
+            activity[0] = '\0';
+        }
     }
     fprintf(f, "<section id='view-overview' data-view='overview' class='section active'><div class='section-head'><div><h2>Dashboard</h2><div class='section-lead'>Check hub health, saved devices, and service status before changing settings.</div></div></div>");
     fprintf(f, "<div class='cards dashboard-cards'>");
