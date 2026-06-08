@@ -257,8 +257,6 @@ class Installer:
                 if saved:
                     hub_id, source = saved
                     info(f"hub id from root-tool handoff: {hub_id} ({source})")
-            if not hub_id and not self.args.no_prompt:
-                hub_id = input("Hub ID from the root tool output or ~/.harmony-hub handoff file: ").strip()
         if not valid_hub_id(hub_id):
             if hub_id:
                 raise RuntimeError(f"Invalid Hub ID {hub_id!r}. Re-run the root tool or pass --hub-id with the numeric value.")

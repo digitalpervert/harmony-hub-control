@@ -272,9 +272,6 @@ if (-not $HubId) {
             Info "hub id from root-tool handoff: $HubId ($($savedHub.Source))"
         }
     }
-    if (-not $HubId -and -not $NoPrompt) {
-        $HubId = Read-Host "Hub ID from the root tool output or ~/.harmony-hub handoff file"
-    }
 }
 if (-not (Test-HubId $HubId)) {
     if ($HubId) {
@@ -289,18 +286,7 @@ if (-not $HubId) {
 Info "using hub id $HubId"
 
 Step "Creating remote backup"
-$backupCmd = @'
-STAMP=$(date +%Y%m%d-%H%M%S)
-B=/data/codex-backups/webui-handoff-$STAMP
-mkdir -p "$B"
-for f in /etc/init.d/rcS.local /opt/luaworks/tasks/connectserver/netservicestarter.lua /usr/sbin/dropbear /usr/sbin/dropbearkey /data/codex/hub_id /data/codex/cloud_blocker.conf /data/codexmqtt/config.json; do
-  if [ -e "$f" ]; then
-    n=$(echo "$f" | sed 's#/#_#g')
-    cp -p "$f" "$B/$n"
-  fi
-done
-echo "$B"
-'@
+$backupCmd = 'STAMP=$(date +%Y%m%d-%H%M%S); B=/data/codex-backups/webui-handoff-$STAMP; mkdir -p "$B"; for f in /etc/init.d/rcS.local /opt/luaworks/tasks/connectserver/netservicestarter.lua /usr/sbin/dropbear /usr/sbin/dropbearkey /data/codex/hub_id /data/codex/cloud_blocker.conf /data/codexmqtt/config.json; do if [ -e "$f" ]; then n=$(echo "$f" | sed ''s#/#_#g''); cp -p "$f" "$B/$n"; fi; done; echo "$B"'
 $backupDir = (Invoke-Remote $backupCmd $null 30000).Trim()
 Info "backup=$backupDir"
 

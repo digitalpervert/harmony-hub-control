@@ -81,7 +81,9 @@ python3 install_webui.py --hub-host <hub-ip> --hub-id <numeric-id>
 ```
 
 Do not use a guessed Hub ID; IR, capture, MQTT, and dashboard HBus calls depend
-on the real value.
+on the real value. The installer does not prompt for a Hub ID interactively,
+because guessed numeric values are accepted by the shell but fail against the
+hub.
 
 ### Windows
 
