@@ -40,11 +40,11 @@ function Prompt-IfMissing([string]$Value, [string]$Label, [switch]$Required) {
 }
 
 function Resolve-DefaultKeyPath() {
-    $home = $env:USERPROFILE
-    if (-not $home) { $home = [Environment]::GetFolderPath("UserProfile") }
-    if (-not $home) { return "" }
-    $sshDir = Join-Path $home ".ssh"
-    if (-not (Test-Path -LiteralPath $sshDir)) { return "" }
+    $userHome = $env:USERPROFILE
+    if (-not $userHome) { $userHome = [Environment]::GetFolderPath("UserProfile") }
+    if (-not $userHome) { return "" }
+    $sshDir = Join-Path $userHome ".ssh"
+    if (-not (Test-Path -LiteralPath $sshDir -PathType Container -ErrorAction SilentlyContinue)) { return "" }
     $keys = @(Get-ChildItem -LiteralPath $sshDir -File -Filter "harmony_owner_*" -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notlike "*.pub" } |
         Sort-Object LastWriteTime -Descending)
