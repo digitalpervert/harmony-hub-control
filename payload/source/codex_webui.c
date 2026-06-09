@@ -2720,7 +2720,7 @@ static void page_head(FILE *f, const char *title) {
         "button,a.button{border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:6px;padding:9px 12px;min-height:38px;cursor:pointer;font-weight:650;transition:border-color .12s,background .12s,box-shadow .12s,transform .08s;text-decoration:none;line-height:1.15}button:hover,a.button:hover{box-shadow:0 2px 8px rgba(15,118,110,.12)}button:active,a.button:active{transform:translateY(1px)}button:focus-visible,a.button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid rgba(15,118,110,.28);outline-offset:2px}a.button{display:inline-flex;align-items:center;justify-content:center}.secondary{background:#fff;color:var(--accent)}.danger{border-color:var(--bad);color:var(--bad);background:#fff}.ghost{background:var(--wash);border-color:var(--line);color:var(--fg)}"
         "pre{white-space:pre-wrap;word-break:break-word;margin:0;background:var(--soft);border-radius:6px;padding:10px;max-height:340px;overflow:auto}details{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:11px 13px}summary{cursor:pointer;font-weight:650}"
         ".msg{border-left:4px solid var(--accent2);padding:10px 12px;background:#f8fbff;border-radius:8px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-top:1px solid var(--line);padding:7px;text-align:left;vertical-align:top}.device-list{display:grid;gap:14px}.command-list{display:grid;gap:8px}.command{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.command .command-editor{grid-column:1/-1;background:var(--wash)}.command-editor{margin-top:10px}.command-preview{max-height:110px;background:#fff;border:1px solid var(--line);margin-top:6px}.bt-saved{grid-column:1/-1}.bt-device-card{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}.bt-device-card h4{margin:0 0 4px;font-size:15px}.save-script-box{border-top:1px solid var(--line);padding-top:10px;margin-top:4px}.export-list{display:flex;gap:8px;flex-wrap:wrap}.hidden{display:none!important}.preview{display:grid;gap:6px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--soft)}.preview label{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:start;margin:0;color:var(--fg)}.match{width:100%;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:8px;white-space:normal;overflow-wrap:anywhere;word-break:break-word}.match strong{color:var(--accent2)}"
-        ".ir-stored-layout{display:grid;grid-template-columns:minmax(230px,.34fr) minmax(0,1fr);gap:14px;align-items:start;margin-bottom:15px}.ir-device-picks{display:grid;gap:8px}.ir-device-pick{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:11px}.ir-device-pick:hover,.ir-device-pick.active{background:var(--soft2);border-color:#b9d8d3}.ir-device-pick strong{display:block}.ir-device-workspace{display:none;gap:14px}.ir-device-workspace.active{display:grid}.ir-work-head{display:flex;align-items:start;justify-content:space-between;gap:12px}.ir-control-layout{display:grid;grid-template-columns:minmax(250px,360px) minmax(0,1fr);gap:16px;align-items:start}.ir-remote-card{display:grid;justify-items:center;gap:10px}.ir-remote-shell{width:100%;display:grid;place-items:center;background:linear-gradient(180deg,#f7faf9,#edf3f1);border:1px solid var(--line);border-radius:8px;padding:10px}.ir-remote-skin{position:relative;width:min(100%,315px);aspect-ratio:591/1280}.ir-remote-skin img{display:block;width:100%;height:100%;object-fit:contain;border-radius:12px;box-shadow:0 14px 34px rgba(10,18,16,.18)}.remote-hotspot{position:absolute;min-height:0;padding:0;border-radius:999px;border:1px solid rgba(15,118,110,.55);background:rgba(15,118,110,.12);color:transparent;box-shadow:0 0 0 1px rgba(255,255,255,.18) inset;touch-action:manipulation;margin:0}.remote-hotspot button{width:100%;height:100%;min-height:0;padding:0;border:0;background:transparent;color:transparent;box-shadow:none;border-radius:inherit}.remote-hotspot button:hover{box-shadow:none}.remote-hotspot:hover,.remote-hotspot.sending{background:rgba(15,118,110,.28);border-color:#00a899;box-shadow:0 0 0 2px rgba(255,255,255,.5),0 8px 18px rgba(0,0,0,.2)}.remote-hotspot:focus-within{outline:2px solid #fff;outline-offset:2px}.remote-hotspot.disabled{background:transparent;border-color:transparent;box-shadow:none;cursor:default;pointer-events:none}.ir-quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}.ir-quick-grid .ir-send-form button{width:100%;background:#fff;color:var(--accent);border-color:var(--line);text-align:left;min-height:42px}.ir-quick-grid .ir-send-form button:hover,.ir-quick-grid .ir-send-form button.sending{background:var(--soft2);border-color:var(--accent)}.ir-command-tools{display:grid;gap:10px}.ir-command-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.ir-command-row form{margin:0}.ir-status{min-height:20px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}"
+        ".ir-stored-layout{display:grid;grid-template-columns:minmax(230px,.34fr) minmax(0,1fr);gap:14px;align-items:start;margin-bottom:15px}.ir-device-picks{display:grid;gap:8px}.ir-device-pick{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);padding:11px}.ir-device-pick:hover,.ir-device-pick.active{background:var(--soft2);border-color:#b9d8d3}.ir-device-pick strong{display:block}.ir-device-workspace{display:none;gap:14px}.ir-device-workspace.active{display:grid}.ir-work-head{display:flex;align-items:start;justify-content:space-between;gap:12px}.ir-control-layout{display:grid;grid-template-columns:minmax(250px,360px) minmax(0,1fr);gap:16px;align-items:start}.ir-remote-card{display:grid;justify-items:center;gap:10px;width:100%}.ir-remote-shell{width:100%;display:grid;place-items:center;background:linear-gradient(180deg,#f7faf9,#edf3f1);border:1px solid var(--line);border-radius:8px;padding:10px}.ir-remote-skin{position:relative;width:min(100%,315px);aspect-ratio:591/1280}.ir-remote-skin img{display:block;width:100%;height:100%;object-fit:contain;border-radius:12px;box-shadow:0 14px 34px rgba(10,18,16,.18)}.remote-hotspot{position:absolute;min-height:0;padding:0;border-radius:999px;border:1px solid rgba(15,118,110,.55);background:rgba(15,118,110,.12);color:transparent;box-shadow:0 0 0 1px rgba(255,255,255,.18) inset;touch-action:manipulation;margin:0}.remote-hotspot button{width:100%;height:100%;min-height:0;padding:0;border:0;background:transparent;color:transparent;box-shadow:none;border-radius:inherit}.remote-hotspot button:hover{box-shadow:none}.remote-hotspot:hover,.remote-hotspot.sending{background:rgba(15,118,110,.28);border-color:#00a899;box-shadow:0 0 0 2px rgba(255,255,255,.5),0 8px 18px rgba(0,0,0,.2)}.remote-hotspot:focus-within{outline:2px solid #fff;outline-offset:2px}.remote-hotspot.disabled{background:transparent;border-color:transparent;box-shadow:none;cursor:default;pointer-events:none}.ir-quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}.ir-remote-card .ir-quick-grid{width:100%}.ir-quick-grid .ir-send-form button{width:100%;background:#fff;color:var(--accent);border-color:var(--line);text-align:left;min-height:42px}.ir-quick-grid .ir-send-form button:hover,.ir-quick-grid .ir-send-form button.sending{background:var(--soft2);border-color:var(--accent)}.ir-unmapped{width:100%;border-top:1px solid var(--line);padding-top:10px}.ir-command-tools{display:grid;gap:10px}.ir-command-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}.ir-command-row form{margin:0}.ir-status{min-height:20px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}"
         ".setup-shell{padding:0;overflow:hidden}.wizard-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.wizard-top h3{margin:0}.wizard-grid{display:grid;grid-template-columns:210px 1fr;min-height:420px}.stepper{border-right:1px solid var(--line);background:#f8fbfa;padding:12px;display:grid;align-content:start;gap:6px}.step{display:grid;grid-template-columns:28px 1fr;gap:9px;align-items:center;width:100%;text-align:left;background:transparent;color:var(--fg);border-color:transparent;padding:10px}.step span{width:26px;height:26px;border-radius:999px;display:grid;place-items:center;background:#fff;border:1px solid var(--line);color:var(--accent);font-weight:750}.step.active{background:#fff;border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04)}.wizard-body{padding:18px;min-width:0;max-width:100%}.wizard-panel{display:none;min-width:0;max-width:100%}.wizard-panel.active{display:block}.wizard-status{min-height:20px;margin-top:10px;color:var(--muted)}.device-sync{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.guide-steps{display:grid;gap:8px;margin:10px 0 12px}.guide-step{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;border:1px solid var(--line);background:var(--wash);border-radius:8px;padding:9px 10px}.guide-step>*{min-width:0}.guide-step b{width:22px;height:22px;border-radius:999px;background:var(--soft2);color:var(--accent);display:grid;place-items:center;font-size:12px}.lab-layout,.bt-layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:14px;min-width:0}.lab-layout>*,.bt-layout>*{min-width:0}.bt-script-layout{display:grid;grid-template-columns:1fr;gap:12px;min-width:0}.bt-script-tools{display:grid;gap:8px;align-content:start;min-width:0}.lab-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.lab-quick{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0 12px}.lab-quick button{text-align:left;min-height:50px;background:#fff;color:var(--accent);border-color:var(--accent)}.lab-quick button:hover{background:#f8fbfa;border-color:#0b625c}.lab-quick button .queue-meta{color:var(--muted);font-weight:600}.lab-presets,.queue-tools{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.lab-presets button,.queue-tools button{padding:6px 9px;font-size:12px}.lab-advanced{margin-top:12px}.inline-check{display:inline-flex;align-items:center;gap:8px;margin-top:10px}.lab-summary{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--wash);padding:9px 10px;margin:8px 0;color:var(--muted);font-size:12px}.queue-list{display:grid;gap:7px;max-height:390px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--soft);padding:8px}.queue-row{display:grid;grid-template-columns:auto 1fr auto;gap:9px;align-items:start;background:#fff;border:1px solid var(--line);border-radius:7px;padding:8px}.queue-row strong{display:block}.queue-meta{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.meter{height:8px;border-radius:999px;background:#e7eeec;overflow:hidden}.meter span{display:block;height:100%;width:0;background:var(--accent)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}.kb-panel{width:100%;max-width:100%;min-width:0;margin-top:10px;overflow-x:auto;overflow-y:hidden;padding-bottom:6px;-webkit-overflow-scrolling:touch}.kb-row{display:flex;gap:3px;margin-bottom:3px;justify-content:flex-start;min-width:max-content}.kb-key{min-width:36px;height:38px;padding:0 6px;border:1px solid var(--line);border-radius:5px;background:#fff;cursor:pointer;font-size:12px;font-family:inherit;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .06s,color .06s;color:var(--fg)}.kb-key:hover{background:var(--soft);border-color:var(--accent)}.kb-key.kb-on{background:var(--accent);color:#fff;border-color:var(--accent)}.kb-15{min-width:54px}.kb-2{min-width:72px}.kb-225{min-width:82px}.kb-25{min-width:90px}.kb-275{min-width:100px}.kb-sp{flex:1;min-width:180px;max-width:360px}.kb-fwd{margin-bottom:8px}"
         "@media(max-width:980px){.ir-stored-layout,.ir-control-layout{grid-template-columns:minmax(0,1fr)}.ir-remote-skin{width:min(100%,250px)}}"
         "@media(max-width:860px){header{padding:12px 14px}.topbar{max-width:none;width:100%}.app-shell{width:100%;max-width:100%;grid-template-columns:minmax(0,1fr);padding:14px;gap:16px}.side-menu{position:sticky;top:62px;z-index:2;display:flex;max-width:100%;overflow-x:auto;gap:6px;border-radius:10px;box-shadow:0 4px 16px rgba(25,41,37,.06);scrollbar-width:thin}.menu-item{min-width:168px}.row,.wizard-grid,.device-sync,.lab-layout,.bt-layout,.bt-script-layout{grid-template-columns:minmax(0,1fr)}.kv{grid-template-columns:1fr}.command,.ir-command-row{grid-template-columns:1fr}.stepper{border-right:0;border-bottom:1px solid var(--line);grid-template-columns:repeat(2,1fr)}}"
@@ -3216,7 +3216,7 @@ static const struct ir_remote_button IR_REMOTE_BUTTONS[] = {
     {"Blue", "blue", 73.25, 30.00, 17.45, 3.75},
     {"DVR", "dvr|recordings", 9.00, 36.95, 27.40, 5.05},
     {"Guide", "guide|epg", 36.40, 36.95, 26.40, 5.05},
-    {"Info", "info|information|displayinfo", 62.80, 36.95, 26.75, 5.05},
+    {"Info", "info|information|displayinfo|settings|setting|setup|option|options", 62.80, 36.95, 26.75, 5.05},
     {"Exit", "exit|clear|cancel", 9.10, 45.45, 36.05, 4.95},
     {"Menu", "menu|home", 53.95, 45.45, 35.70, 4.95},
     {"Up", "up|directionup|arrowup|cursorup", 36.40, 49.85, 27.60, 6.30},
@@ -3225,9 +3225,9 @@ static const struct ir_remote_button IR_REMOTE_BUTTONS[] = {
     {"Down", "down|directiondown|arrowdown|cursordown", 36.40, 64.55, 27.60, 6.20},
     {"OK", "ok|select|enter", 40.10, 56.10, 19.80, 9.10},
     {"Volume up", "volumeup|volup|vol up|vol_up|volume up", 9.30, 52.20, 19.30, 8.85},
-    {"Volume down", "volumedown|voldown|vol down|vol_down|volume down", 9.30, 61.05, 19.30, 9.05},
-    {"Channel up", "channelup|chup|ch up|ch_next|chnext|channel next|pageup|pgup", 70.20, 52.20, 19.15, 8.85},
-    {"Channel down", "channeldown|chdown|ch down|ch_prev|chprev|channel prev|pagedown|pgdown", 70.20, 61.05, 19.15, 9.05},
+    {"Volume down", "volumedown|voldown|voldn|vol down|vol_down|vol_dn|volume down", 9.30, 61.05, 19.30, 9.05},
+    {"Channel up", "channelup|chup|chnext|ch_next|ch up|channel next|channelnext|pageup|pgup", 70.20, 52.20, 19.15, 8.85},
+    {"Channel down", "channeldown|chdown|chdn|chprev|ch_prev|ch down|ch_dn|channel prev|channel previous|channel down|channelprev|channeldn|pagedown|pgdown", 70.20, 61.05, 19.15, 9.05},
     {"Mute", "mute", 9.30, 71.70, 36.20, 5.30},
     {"Back", "back|return|previous", 54.15, 71.70, 35.55, 5.30},
     {"1", "1|digit1|number1|num1", 9.30, 80.45, 27.10, 3.45},
@@ -3284,6 +3284,16 @@ static const struct ir_command *ir_find_remote_command(const struct ir_device *d
     return NULL;
 }
 
+static int ir_command_has_remote_button(const struct ir_command *cmd) {
+    size_t i;
+    char key[160];
+    ir_command_key(cmd->name, key, sizeof(key));
+    for (i = 0; i < sizeof(IR_REMOTE_BUTTONS) / sizeof(IR_REMOTE_BUTTONS[0]); i++) {
+        if (ir_alias_match(key, IR_REMOTE_BUTTONS[i].aliases)) return 1;
+    }
+    return 0;
+}
+
 static void ir_send_hidden_inputs(FILE *f, const char *device_id, const char *command) {
     fprintf(f, "<input type='hidden' name='deviceId' value='");
     html(f, device_id);
@@ -3321,17 +3331,40 @@ static void ir_remote_hotspot(FILE *f, const struct ir_device *dev, const struct
     }
 }
 
+static void ir_render_unmapped_commands(FILE *f, const struct ir_device *dev) {
+    int i, mapped = 0, unmapped = 0;
+    for (i = 0; i < dev->command_count; i++) {
+        if (ir_command_has_remote_button(&dev->commands[i])) mapped++;
+        else unmapped++;
+    }
+    fprintf(f, "<div class='ir-unmapped'><div class='muted mini'>Remote skin maps %d of %d saved commands.</div>", mapped, dev->command_count);
+    if (unmapped > 0) {
+        fprintf(f, "<h3>Saved buttons not on this remote</h3><div class='help'>These commands are saved for the device, but the photo does not have a matching physical button. Send them from here.</div><div class='ir-quick-grid'>");
+        for (i = 0; i < dev->command_count; i++) {
+            if (!ir_command_has_remote_button(&dev->commands[i])) {
+                ir_quick_send_button(f, dev, &dev->commands[i]);
+            }
+        }
+        fprintf(f, "</div>");
+    } else if (dev->command_count > 0) {
+        fprintf(f, "<div class='help'>Every saved command has a matching button on this remote skin.</div>");
+    }
+    fprintf(f, "</div>");
+}
+
 static void ir_render_remote_skin(FILE *f, const struct ir_device *dev) {
     size_t i;
     fprintf(f, "<div class='ir-remote-card'><h3>Remote control</h3><div class='ir-remote-shell'><div class='ir-remote-skin'><img data-remote-skin alt='Harmony remote control layout'>");
     for (i = 0; i < sizeof(IR_REMOTE_BUTTONS) / sizeof(IR_REMOTE_BUTTONS[0]); i++) {
         ir_remote_hotspot(f, dev, &IR_REMOTE_BUTTONS[i]);
     }
-    fprintf(f, "</div></div><div class='help'>Highlighted areas send the closest saved command for this device. Buttons without a saved match stay inactive.</div></div>");
+    fprintf(f, "</div></div><div class='help'>Highlighted areas send the closest saved command for this device. Buttons without a saved match stay inactive.</div>");
+    ir_render_unmapped_commands(f, dev);
+    fprintf(f, "</div>");
 }
 
 static void ir_render_device_workspace(FILE *f, const struct ir_device *dev, int active) {
-    int j, quick_count = dev->command_count < 24 ? dev->command_count : 24;
+    int j, quick_count = dev->command_count <= 80 ? dev->command_count : 80;
     fprintf(f, "<div class='ir-device-workspace%s' data-ir-device='", active ? " active" : "");
     html(f, dev->id);
     fprintf(f, "'><div class='ir-work-head'><div><h3>");
@@ -3351,7 +3384,7 @@ static void ir_render_device_workspace(FILE *f, const struct ir_device *dev, int
     fprintf(f, "<div class='ir-command-tools'><div><label>Find saved command</label><input class='ir-command-filter' data-command-filter='");
     html(f, dev->id);
     fprintf(f, "' placeholder='power, hdmi, volume, menu'></div>");
-    fprintf(f, "<div><h3>Quick buttons</h3><div class='ir-quick-grid' data-command-list='");
+    fprintf(f, "<div><h3>All saved buttons</h3><div class='ir-quick-grid' data-command-list='");
     html(f, dev->id);
     fprintf(f, "'>");
     for (j = 0; j < quick_count; j++) ir_quick_send_button(f, dev, &dev->commands[j]);
