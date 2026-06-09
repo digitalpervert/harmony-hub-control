@@ -25,6 +25,8 @@
 #define WPA_CONFIG "/etc/wpa_supplicant.conf"
 #define HUB_ID_FILE "/data/codex/hub_id"
 #define CLOUD_BLOCKER_CONFIG "/data/codex/cloud_blocker.conf"
+#define WEBUI_AUTH_CONFIG "/data/codex/webui_auth.conf"
+#define UPDATE_STATE_CONFIG "/data/codex/update_state.conf"
 #define DEVICE_LIST "/data/resources/DeviceList.json"
 #define FUNCTION_LIST "/data/resources/FunctionList.json"
 #define PROTOCOL_LIST "/data/resources/ProtocolList.json"
@@ -96,6 +98,20 @@ struct wifi_config {
     int open;
     char ssid[256];
     char psk[256];
+};
+
+struct webui_auth_config {
+    int enabled;
+    char username[64];
+    char password[128];
+};
+
+struct update_check_state {
+    long checked_at;
+    int available;
+    int changes;
+    char message[192];
+    char source[192];
 };
 
 struct ir_command {
@@ -274,6 +290,99 @@ static int save_cloud_blocker(int enabled) {
     const char *value = enabled ? "1" : "0";
     if (write_file_atomic(CLOUD_BLOCKER_CONFIG, value, strlen(value)) != 0) return -1;
     chmod(CLOUD_BLOCKER_CONFIG, 0644);
+    return 0;
+}
+
+static int config_line_value(const char *raw, const char *key, char *out, size_t outlen) {
+    size_t keylen = strlen(key), n;
+    const char *p = raw, *v, *e;
+    if (!outlen) return 0;
+    out[0] = 0;
+    while (p && *p) {
+        if (strncmp(p, key, keylen) == 0 && p[keylen] == '=') {
+            v = p + keylen + 1;
+            e = strchr(v, '\n');
+            if (!e) e = v + strlen(v);
+            n = (size_t)(e - v);
+            if (n >= outlen) n = outlen - 1;
+            memcpy(out, v, n);
+            out[n] = 0;
+            chomp(out);
+            return 1;
+        }
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    return 0;
+}
+
+static void clean_config_value(char *s) {
+    while (*s) {
+        if (*s == '\n' || *s == '\r' || *s == '\t') *s = ' ';
+        s++;
+    }
+}
+
+static int safe_auth_field(const char *s, int allow_colon) {
+    if (!s || !*s) return 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s++;
+        if (c < 32 || c == 127) return 0;
+        if (!allow_colon && c == ':') return 0;
+    }
+    return 1;
+}
+
+static void load_webui_auth(struct webui_auth_config *cfg) {
+    char raw[512], value[160];
+    memset(cfg, 0, sizeof(*cfg));
+    strcpy(cfg->username, "admin");
+    if (read_text(WEBUI_AUTH_CONFIG, raw, sizeof(raw)) <= 0) return;
+    if (config_line_value(raw, "enabled", value, sizeof(value))) cfg->enabled = atoi(value) ? 1 : 0;
+    if (config_line_value(raw, "username", value, sizeof(value)) && safe_auth_field(value, 0)) {
+        snprintf(cfg->username, sizeof(cfg->username), "%s", value);
+    }
+    if (config_line_value(raw, "password", value, sizeof(value)) && safe_auth_field(value, 1)) {
+        snprintf(cfg->password, sizeof(cfg->password), "%s", value);
+    }
+    if (cfg->enabled && (!cfg->username[0] || !cfg->password[0])) cfg->enabled = 0;
+}
+
+static int save_webui_auth(const struct webui_auth_config *cfg) {
+    char data[384], user[64], pass[128];
+    snprintf(user, sizeof(user), "%s", cfg->username);
+    snprintf(pass, sizeof(pass), "%s", cfg->password);
+    clean_config_value(user);
+    clean_config_value(pass);
+    snprintf(data, sizeof(data), "enabled=%d\nusername=%s\npassword=%s\n",
+        cfg->enabled ? 1 : 0, user, pass);
+    if (write_file_atomic(WEBUI_AUTH_CONFIG, data, strlen(data)) != 0) return -1;
+    chmod(WEBUI_AUTH_CONFIG, 0600);
+    return 0;
+}
+
+static void load_update_state(struct update_check_state *st) {
+    char raw[768], value[256];
+    memset(st, 0, sizeof(*st));
+    strcpy(st->message, "Update status has not been checked yet.");
+    if (read_text(UPDATE_STATE_CONFIG, raw, sizeof(raw)) <= 0) return;
+    if (config_line_value(raw, "checkedAt", value, sizeof(value))) st->checked_at = atol(value);
+    if (config_line_value(raw, "available", value, sizeof(value))) st->available = atoi(value) ? 1 : 0;
+    if (config_line_value(raw, "changes", value, sizeof(value))) st->changes = atoi(value);
+    if (config_line_value(raw, "message", value, sizeof(value))) snprintf(st->message, sizeof(st->message), "%s", value);
+    if (config_line_value(raw, "source", value, sizeof(value))) snprintf(st->source, sizeof(st->source), "%s", value);
+}
+
+static int save_update_state(const struct update_check_state *st) {
+    char data[768], msg[192], source[192];
+    snprintf(msg, sizeof(msg), "%s", st->message);
+    snprintf(source, sizeof(source), "%s", st->source);
+    clean_config_value(msg);
+    clean_config_value(source);
+    snprintf(data, sizeof(data), "checkedAt=%ld\navailable=%d\nchanges=%d\nmessage=%s\nsource=%s\n",
+        st->checked_at, st->available ? 1 : 0, st->changes, msg, source);
+    if (write_file_atomic(UPDATE_STATE_CONFIG, data, strlen(data)) != 0) return -1;
+    chmod(UPDATE_STATE_CONFIG, 0644);
     return 0;
 }
 
@@ -593,6 +702,65 @@ static void send_all(int fd, const char *data, size_t len) {
         data += sent;
         len -= (size_t)sent;
     }
+}
+
+static int b64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int base64_decode_text(const char *in, char *out, size_t outlen) {
+    int val = 0, valb = -8;
+    size_t w = 0;
+    if (!outlen) return -1;
+    while (*in && *in != '\r' && *in != '\n') {
+        int d;
+        if (*in == '=') break;
+        if (isspace((unsigned char)*in)) {
+            in++;
+            continue;
+        }
+        d = b64_value(*in++);
+        if (d < 0) return -1;
+        val = (val << 6) | d;
+        valb += 6;
+        if (valb >= 0) {
+            if (w + 1 >= outlen) return -1;
+            out[w++] = (char)((val >> valb) & 0xff);
+            valb -= 8;
+        }
+    }
+    out[w] = 0;
+    return (int)w;
+}
+
+static int webui_auth_ok(const struct request *req) {
+    struct webui_auth_config cfg;
+    char decoded[256], expected[256];
+    const char *prefix = "Basic ";
+    load_webui_auth(&cfg);
+    if (!cfg.enabled) return 1;
+    if (strncasecmp(req->auth, prefix, strlen(prefix)) != 0) return 0;
+    if (base64_decode_text(req->auth + strlen(prefix), decoded, sizeof(decoded)) < 0) return 0;
+    snprintf(expected, sizeof(expected), "%s:%s", cfg.username, cfg.password);
+    return strcmp(decoded, expected) == 0;
+}
+
+static void send_auth_required(int fd) {
+    const char *body = "authentication required\n";
+    char hdr[384];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "WWW-Authenticate: Basic realm=\"Harmony Hub Control\", charset=\"UTF-8\"\r\n"
+        "Content-Type: text/plain\r\nContent-Length: %lu\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        (unsigned long)strlen(body));
+    send_all(fd, hdr, strlen(hdr));
+    send_all(fd, body, strlen(body));
 }
 
 static int http_get_body(const char *host, const char *path, char **body, size_t max_body, char *err, size_t errlen) {
@@ -2928,16 +3096,20 @@ static void page_end(FILE *f) {
         "const irdbFile=$('irdbFile');if(irdbFile){irdbFile.addEventListener('change',()=>{const file=irdbFile.files&&irdbFile.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{const p=$('irdbPaste');if(p)p.value=reader.result||'';irdbStatus('loaded file '+file.name+'; click Parse Pasted Codes');};reader.readAsText(file);});}"
         "const parsePaste=$('irdbParsePaste');if(parsePaste){parsePaste.addEventListener('click',()=>{const text=$('irdbPaste')?.value||'',path=$('irdbFile')?.files?.[0]?.name||$('irdbPath')?.value||'pasted codes',source=pickSourceForPath(path);clearIrdPreview();if(!text.trim()){irdbStatus('paste a code file or choose a file first');return;}const rows=parseIrText(text,source,path);irdbLog('parsed pasted/file input as '+sourceLabel(source)+': '+rows.length+' commands');renderIrdRows(rows);});}"
         "async function postJson(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data||{})});const t=await r.text();let j;try{j=JSON.parse(t);}catch(e){throw new Error(t||('http '+r.status));}if(!r.ok||j.ok===false)throw new Error(j.message||j.error||('http '+r.status));return j;}"
-        "const UPDATE_NAMES=['codex_webui','codex_bthid_keyboard','codex_hal_ltcp','codex_hbus','codex_portal','codex_dhcpd'];const UPDATE_API='https://api.github.com/repos/Ripthulhu/harmony-hub-control/contents/payload/bin/';const UPDATE_DEFAULT_RAW='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/';const UPDATE_CDN='https://cdn.jsdelivr.net/gh/Ripthulhu/harmony-hub-control@main/payload/bin/';const UPDATE_CDN_FAST='https://fastly.jsdelivr.net/gh/Ripthulhu/harmony-hub-control@main/payload/bin/';const HEX=Array.from({length:256},(_,i)=>i.toString(16).padStart(2,'0'));"
+        "const UPDATE_NAMES=['codex_webui','codex_bthid_keyboard','codex_hal_ltcp','codex_hbus','codex_portal','codex_dhcpd'];const UPDATE_API='https://api.github.com/repos/Ripthulhu/harmony-hub-control/contents/payload/bin/';const UPDATE_DEFAULT_RAW='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/';const UPDATE_CDN='https://cdn.jsdelivr.net/gh/Ripthulhu/harmony-hub-control@main/payload/bin/';const UPDATE_CDN_FAST='https://fastly.jsdelivr.net/gh/Ripthulhu/harmony-hub-control@main/payload/bin/';const UPDATE_AUTO_INTERVAL=6*60*60*1000;const HEX=Array.from({length:256},(_,i)=>i.toString(16).padStart(2,'0'));"
         "function updateLog(t){const el=$('updateLog');if(el)el.textContent=t||'';}function updateAppend(t){const el=$('updateLog');if(!el)return;let p=el.textContent||'';if(/^Ready\\./.test(p))p='';el.textContent=(p?p+'\\n':'')+String(t||'');el.scrollTop=el.scrollHeight;}"
         "function updateBase(){let b=($('updateRepo')?.value||'').trim()||UPDATE_DEFAULT_RAW;return b.endsWith('/')?b:b+'/';}function updateToken(){return($('updateToken')?.value||'').trim();}function updateUsesDefaultRepo(){return updateBase().toLowerCase()===UPDATE_DEFAULT_RAW.toLowerCase();}function updateBases(){const a=[updateBase()];if(updateUsesDefaultRepo())a.push(UPDATE_CDN,UPDATE_CDN_FAST);return Array.from(new Set(a.map(x=>x.endsWith('/')?x:x+'/')));}"
         "function parseUpdateManifest(t){return String(t||'').replace(/\\r/g,'').split('\\n').map(line=>{const m=line.match(/^([0-9a-fA-F]{32})\\s+(\\S+)$/);return m?{md5:m[1].toLowerCase(),name:m[2]}:null;}).filter(x=>x&&UPDATE_NAMES.includes(x.name));}"
         "async function updateFetchUrl(label,url,asText){const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),25000);try{const r=await fetch(url,{cache:'no-store',signal:ctrl.signal});if(!r.ok)throw new Error('http '+r.status);return asText?await r.text():await r.arrayBuffer();}catch(e){throw new Error(label+' '+((e&&e.name)==='AbortError'?'timeout':(e&&e.message?e.message:e)));}finally{clearTimeout(timer);}}"
         "async function updateFetch(name,token){const errs=[],asText=name==='MANIFEST.txt';if(token||updateUsesDefaultRepo()){try{const headers={'Accept':'application/vnd.github+json'};if(token)headers.Authorization='Bearer '+token;const r=await fetch(UPDATE_API+encodeURIComponent(name)+'?ref=main&t='+Date.now(),{headers:headers,cache:'no-store'});if(!r.ok)throw new Error('http '+r.status+([401,403,404].includes(r.status)?' - token required for private repos or exhausted anonymous API access':''));const j=await r.json(),bin=atob(String(j.content||'').replace(/\\s/g,'')),u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return asText?new TextDecoder().decode(u):u.buffer;}catch(e){errs.push('GitHub API '+(e.message||e));if(token)throw new Error(errs.join('; '));}}for(const base of updateBases()){try{return await updateFetchUrl(base.replace(/^https?:\\/\\//,''),base+encodeURIComponent(name)+'?t='+Date.now(),asText);}catch(e){errs.push(e.message||String(e));}}throw new Error(errs.join('; ')||'no update source configured');}"
+        "function updateAgeText(ts){const d=Math.max(0,Date.now()-Number(ts||0)*1000),m=Math.floor(d/60000),h=Math.floor(d/3600000),days=Math.floor(d/86400000);if(!ts)return'not checked';if(days>0)return'checked '+days+'d ago';if(h>0)return'checked '+h+'h ago';if(m>0)return'checked '+m+'m ago';return'checked just now';}"
+        "function updateDashboardBadge(st){const b=$('dashUpdateBadge'),d=$('dashUpdateDetail');if(!b||!d)return;st=st||{};const checked=Number(st.checkedAt||0),changes=Number(st.changes||0);b.classList.remove('ok','warn','bad');if(!checked){b.classList.add('warn');b.textContent='not checked';d.textContent='Checks automatically while this page is open.';return;}if(changes<0){b.classList.add('bad');b.textContent='check failed';}else if(st.available){const n=changes||1;b.classList.add('warn');b.textContent=n+' update'+(n===1?'':'s');}else{b.classList.add('ok');b.textContent='current';}d.textContent=updateAgeText(checked)+'. '+(st.message||'');}"
+        "async function updateLoadState(){try{const r=await fetch('/api/update-check-state',{cache:'no-store'});if(!r.ok)throw new Error('http '+r.status);const j=await r.json();updateDashboardBadge(j);return j;}catch(e){return null;}}"
+        "async function updateSaveState(st){st=st||{};try{await postJson('/api/update-check-state',{checkedAt:String(st.checkedAt||Math.floor(Date.now()/1000)),available:st.available?'1':'0',changes:String(st.changes||0),message:st.message||'',source:st.source||updateBase()});updateDashboardBadge(st);}catch(e){}}"
         "function chunkHex(bytes,start,end){let s='';for(let i=start;i<end;i++)s+=HEX[bytes[i]];return s;}async function updateLocalStatus(){const j=await(await fetch('/api/update-status')).json();const lines=['Local control binaries:'];(j.files||[]).forEach(f=>lines.push((f.present?'ok ':'missing ')+f.name+' '+(f.md5||'')+' '+(f.size||0)+' bytes'));updateLog(lines.join('\\n'));return j;}"
-        "async function updateCheckRepo(){try{updateLog('checking repository...');const token=updateToken(),manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest),local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);let changes=0;const lines=['Repository files:'];entries.forEach(e=>{const cur=byName[e.name]||{},same=cur.md5&&cur.md5.toLowerCase()===e.md5;changes+=same?0:1;lines.push((same?'current ':'update  ')+e.name+' repo '+e.md5+' local '+(cur.md5||'missing'));});lines.push(changes?changes+' file(s) need update.':'Already current.');updateLog(lines.join('\\n'));}catch(e){updateLog('update check failed: '+(e.message||e));}}"
-        "async function updateInstallRepo(){try{const token=updateToken();updateLog('loading manifest...');const manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest);if(!entries.length)throw new Error('manifest has no updateable codex binaries');const local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);const todo=entries.filter(e=>!(byName[e.name]&&String(byName[e.name].md5||'').toLowerCase()===e.md5));if(!todo.length){updateLog('Already current.');return;}await postJson('/api/update-begin',{manifest:manifest});updateLog('staging '+todo.length+' file(s)...');for(const e of todo){updateAppend('fetch '+e.name);const buf=await updateFetch(e.name,token),bytes=new Uint8Array(buf);let off=0;while(off<bytes.length){const end=Math.min(off+24576,bytes.length),hex=chunkHex(bytes,off,end);await postJson('/api/update-chunk',{file:e.name,offset:String(off),hex:hex});off=end;updateAppend('  '+e.name+' '+off+' / '+bytes.length);} }const j=await postJson('/api/update-apply',{restart:'1'});updateAppend('installed: '+j.updated);updateAppend('backup: '+j.backupDir);updateAppend('services are restarting; refresh in about 5 seconds.');setTimeout(updateLocalStatus,6000);}catch(e){updateAppend('update failed: '+(e.message||e));}}"
-        "const updateRefresh=$('updateRefresh');if(updateRefresh)updateRefresh.addEventListener('click',updateLocalStatus);const updateCheck=$('updateCheck');if(updateCheck)updateCheck.addEventListener('click',updateCheckRepo);const updateInstall=$('updateInstall');if(updateInstall)updateInstall.addEventListener('click',updateInstallRepo);if($('updateLog'))updateLocalStatus();"
+        "async function updateCheckRepo(silent){try{if(!silent)updateLog('checking repository...');const token=updateToken(),manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest),local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);let changes=0;const lines=['Repository files:'];entries.forEach(e=>{const cur=byName[e.name]||{},same=cur.md5&&cur.md5.toLowerCase()===e.md5;changes+=same?0:1;lines.push((same?'current ':'update  ')+e.name+' repo '+e.md5+' local '+(cur.md5||'missing'));});const msg=changes?changes+' file(s) need update.':'Already current.';lines.push(msg);const st={checkedAt:Math.floor(Date.now()/1000),available:changes>0,changes:changes,message:msg,source:updateBase()};await updateSaveState(st);if(!silent)updateLog(lines.join('\\n'));return st;}catch(e){const msg='update check failed: '+(e.message||e),st={checkedAt:Math.floor(Date.now()/1000),available:false,changes:-1,message:msg,source:updateBase()};await updateSaveState(st);if(!silent)updateLog(msg);return st;}}"
+        "async function updateInstallRepo(){try{const token=updateToken();updateLog('loading manifest...');const manifest=await updateFetch('MANIFEST.txt',token),entries=parseUpdateManifest(manifest);if(!entries.length)throw new Error('manifest has no updateable codex binaries');const local=await(await fetch('/api/update-status')).json(),byName={};(local.files||[]).forEach(f=>byName[f.name]=f);const todo=entries.filter(e=>!(byName[e.name]&&String(byName[e.name].md5||'').toLowerCase()===e.md5));if(!todo.length){updateLog('Already current.');await updateSaveState({checkedAt:Math.floor(Date.now()/1000),available:false,changes:0,message:'Already current.',source:updateBase()});return;}await postJson('/api/update-begin',{manifest:manifest});updateLog('staging '+todo.length+' file(s)...');for(const e of todo){updateAppend('fetch '+e.name);const buf=await updateFetch(e.name,token),bytes=new Uint8Array(buf);let off=0;while(off<bytes.length){const end=Math.min(off+24576,bytes.length),hex=chunkHex(bytes,off,end);await postJson('/api/update-chunk',{file:e.name,offset:String(off),hex:hex});off=end;updateAppend('  '+e.name+' '+off+' / '+bytes.length);} }const j=await postJson('/api/update-apply',{restart:'1'});updateAppend('installed: '+j.updated);updateAppend('backup: '+j.backupDir);updateAppend('services are restarting; refresh in about 5 seconds.');await updateSaveState({checkedAt:Math.floor(Date.now()/1000),available:false,changes:0,message:'Update installed; services are restarting.',source:updateBase()});setTimeout(updateLocalStatus,6000);}catch(e){updateAppend('update failed: '+(e.message||e));}}"
+        "const updateRefresh=$('updateRefresh');if(updateRefresh)updateRefresh.addEventListener('click',updateLocalStatus);const updateCheck=$('updateCheck');if(updateCheck)updateCheck.addEventListener('click',()=>updateCheckRepo(false));const updateInstall=$('updateInstall');if(updateInstall)updateInstall.addEventListener('click',updateInstallRepo);if($('updateLog'))updateLocalStatus();updateLoadState().then(st=>{const last=Number(st&&st.checkedAt||0)*1000;if(!last||Date.now()-last>UPDATE_AUTO_INTERVAL)updateCheckRepo(true);});setInterval(()=>updateCheckRepo(true),UPDATE_AUTO_INTERVAL);"
         "function btFields(){return{type:$('btType')?.value||'btkeyboard',name:($('btName')?.value||'Harmony Keyboard').trim(),bdaddr:($('btAddr')?.value||'').trim(),pin:($('btPin')?.value||'').trim(),code:($('btCode')?.value||'').trim(),timeout:$('btTimeout')?.value||'8'};}"
         "function btLog(t){const el=$('btLog');if(el)el.textContent=t||'';}"
         "function btAppend(t){const el=$('btLog');if(!el)return;let p=el.textContent||'';if(/^Ready\\./.test(p))p='';if(p.length>6000)p=p.slice(-5000);el.textContent=(p?p+'\\n':'')+String(t||'');el.scrollTop=el.scrollHeight;}"
@@ -3020,11 +3192,15 @@ static void page_end(FILE *f) {
 static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
     char uptime[128], version[128], ifconfig[2048], activity[1024];
     char uptime_label[80], inventory_label[80];
+    char update_badge[48], update_detail[224], update_age[64];
     char hub_id[64];
+    struct update_check_state update_state;
+    const char *update_class;
     int hub_id_ok;
     int mqtt_up = tcp_established(mqtt->host, mqtt->port);
     int device_count = -1, command_count = 0;
     int cloud_blocked = load_cloud_blocker();
+    long now = time(NULL), age;
     read_text("/proc/uptime", uptime, sizeof(uptime));
     read_text("/etc/version", version, sizeof(version));
     chomp(uptime);
@@ -3045,6 +3221,30 @@ static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
     }
     if (device_count < 0) snprintf(inventory_label, sizeof(inventory_label), "unknown");
     else snprintf(inventory_label, sizeof(inventory_label), "%d devices", device_count);
+    load_update_state(&update_state);
+    if (update_state.checked_at <= 0) {
+        snprintf(update_badge, sizeof(update_badge), "not checked");
+        snprintf(update_detail, sizeof(update_detail), "Checks automatically while this page is open.");
+        update_class = "warn";
+    } else {
+        age = now - update_state.checked_at;
+        if (age < 0) age = 0;
+        if (age >= 86400) snprintf(update_age, sizeof(update_age), "%ldd ago", age / 86400);
+        else if (age >= 3600) snprintf(update_age, sizeof(update_age), "%ldh ago", age / 3600);
+        else if (age >= 60) snprintf(update_age, sizeof(update_age), "%ldm ago", age / 60);
+        else snprintf(update_age, sizeof(update_age), "just now");
+        if (update_state.changes < 0) {
+            snprintf(update_badge, sizeof(update_badge), "check failed");
+            update_class = "bad";
+        } else if (update_state.available) {
+            snprintf(update_badge, sizeof(update_badge), "%d update%s", update_state.changes, update_state.changes == 1 ? "" : "s");
+            update_class = "warn";
+        } else {
+            snprintf(update_badge, sizeof(update_badge), "current");
+            update_class = "ok";
+        }
+        snprintf(update_detail, sizeof(update_detail), "Checked %s. %s", update_age, update_state.message[0] ? update_state.message : "No details.");
+    }
     {
         char esc_id[128], cmd[384];
         if (hub_id_ok) {
@@ -3070,6 +3270,11 @@ static void status_panel(FILE *f, const struct mqtt_config *mqtt) {
         cloud_blocked ? "local control only" : "takes effect after restart");
     fprintf(f, "<div class='stat'><div class='label'>Activity API</div><div class='value'><span class='badge %s'>%s</span></div></div>",
         activity[0] ? "ok" : "warn", activity[0] ? "responding" : "quiet");
+    fprintf(f, "<div class='stat'><div class='label'>Software update</div><div class='value'><span id='dashUpdateBadge' class='badge %s'>", update_class);
+    html(f, update_badge);
+    fprintf(f, "</span></div><div id='dashUpdateDetail' class='muted mini'>");
+    html(f, update_detail);
+    fprintf(f, "</div></div>");
     fprintf(f, "</div><div class='quick-actions'><button type='button' data-view-target='control'><strong>Use a remote</strong><div class='muted mini'>Send saved buttons from the remote skin or command list.</div></button><button type='button' data-view-target='ir'><strong>Add or edit remotes</strong><div class='muted mini'>Create devices, search databases, learn buttons, and edit commands.</div></button><button type='button' data-view-target='lab'><strong>Bulk test IR codes</strong><div class='muted mini'>Search many code files, skip duplicates, then send a queue.</div></button><button type='button' data-view-target='mqtt'><strong>Set up Home Assistant</strong><div class='muted mini'>Configure MQTT topics, discovery, and state publishing.</div></button><button type='button' data-view-target='wifi'><strong>Change Wi-Fi</strong><div class='muted mini'>Update the network and reboot when you are ready.</div></button><button type='button' data-view-target='backup'><strong>Back up settings</strong><div class='muted mini'>Download a restore point before larger changes.</div></button></div><div class='grid' style='margin-top:12px'>");
     fprintf(f, "<details><summary>Network details</summary><pre>");
     html(f, ifconfig[0] ? ifconfig : "ath0 not available");
@@ -4139,6 +4344,8 @@ static void bluetooth_panel(FILE *f) {
 static void system_panel(FILE *f) {
     char info[8192], logs[8192];
     int cloud_blocked = load_cloud_blocker();
+    struct webui_auth_config auth;
+    load_webui_auth(&auth);
     run_cmd("echo '--- uname ---'; uname -a; echo; echo '--- memory ---'; cat /proc/meminfo; echo; echo '--- mounts ---'; mount; echo; echo '--- processes ---'; ps", info, sizeof(info));
     run_cmd("echo '--- startup log ---'; cat /cache/codex-init.log 2>/dev/null; echo; echo '--- recovery log ---'; cat /cache/codex-recovery.log 2>/dev/null; echo; echo '--- local service syslog ---'; logread 2>/dev/null | grep -i 'codex\\|mqtt' 2>/dev/null", logs, sizeof(logs));
     fprintf(f, "<section id='view-system' data-view='system' class='section'><div class='section-head'><div><h2>System</h2><div class='section-lead'>Check device information, read logs, update the web interface, or reboot when a saved change needs it.</div></div></div>");
@@ -4151,6 +4358,13 @@ static void system_panel(FILE *f) {
     fprintf(f, "<label class='inline-check'><input type='checkbox' name='cloudBlocker' value='1' %s> Block Logitech cloud services</label>", cloud_blocked ? "checked" : "");
     fprintf(f, "<div class='help'>Current saved mode: <strong>%s</strong>. Blocking prevents cloudapi, PubNub, and package manager tasks from starting.</div>", cloud_blocked ? "blocked" : "allowed after restart");
     fprintf(f, "<div class='actions'><button name='action' value='cloud' type='submit'>Save cloud blocker setting</button><button name='action' value='cloud_reboot' type='submit' class='secondary'>Save and reboot</button></div></form></div>");
+    fprintf(f, "<div class='panel' style='margin-top:12px'><h3>Web UI sign-in</h3><div class='help'>Optional HTTP Basic authentication for every page, API call, and export. Leave it off for a trusted local-only hub, or enable it when the hub is reachable by guests or other devices.</div><form method='post' action='/system#system' autocomplete='off'>");
+    fprintf(f, "<label class='inline-check'><input type='checkbox' name='authEnabled' value='1' %s> Require username and password</label>", auth.enabled ? "checked" : "");
+    fprintf(f, "<div class='grid two'><div><label>Username</label><input name='authUsername' autocomplete='username' required value='");
+    html(f, auth.username[0] ? auth.username : "admin");
+    fprintf(f, "'><div class='help'>Use plain text without a colon.</div></div><div><label>New password</label><input name='authPassword' type='password' autocomplete='new-password' placeholder='Leave blank to keep current password'><div class='help'>Required the first time you enable sign-in.</div></div></div>");
+    fprintf(f, "<div class='help'>Current mode: <strong>%s</strong>.</div>", auth.enabled ? "sign-in required" : "open on local network");
+    fprintf(f, "<div class='actions'><button name='action' value='auth' type='submit'>Save sign-in setting</button></div></form></div>");
     fprintf(f, "<div class='panel' style='margin-top:12px'><h3>Software update</h3><div class='help'>Check the public release files, copy newer binaries to the hub, verify checksums, and restart the local services. SSH access is not changed. The default public repository tries GitHub and CDN mirrors without a token. Use the token field only for private repositories.</div><form id='updateForm' autocomplete='off' onsubmit='return false'><div class='grid two'><div><label for='updateRepo'>Optional update mirror URL</label><input id='updateRepo' autocomplete='url' value='https://raw.githubusercontent.com/Ripthulhu/harmony-hub-control/main/payload/bin/'></div><div><label for='updateToken'>GitHub token (private repos only)</label><input id='updateToken' type='password' autocomplete='new-password' placeholder='optional; used only by this browser'></div></div><div class='actions'><button id='updateCheck' type='button' class='secondary'>Check for updates</button><button id='updateInstall' type='button'>Install update</button><button id='updateRefresh' type='button' class='secondary'>Show installed versions</button></div></form><pre id='updateLog' class='mini'>Ready. Check the public repo, or paste a token if the repo is private.</pre></div><div class='panel' style='margin-top:12px'><div class='help'>Refresh Home Assistant discovery if new devices or commands do not appear after changes.</div><form method='post' action='/system#system'><div class='actions'><button name='action' value='rediscover' type='submit'>Refresh Home Assistant discovery</button><button name='action' value='reboot' type='submit' class='secondary'>Reboot hub</button></div></form></div></section>");
 }
 
@@ -4274,6 +4488,33 @@ static void handle_system(int fd, const struct request *req) {
         } else {
             render_page(fd, enabled ? "Cloud blocker enabled. Reboot when ready to apply it." : "Cloud blocker disabled. Reboot when ready to allow Logitech cloud services.");
         }
+    } else if (strcmp(action, "auth") == 0) {
+        struct webui_auth_config old, cfg;
+        char username[64], password[128];
+        load_webui_auth(&old);
+        cfg = old;
+        cfg.enabled = form_checked(req->body, "authEnabled");
+        form_value(req->body, "authUsername", username, sizeof(username));
+        form_value(req->body, "authPassword", password, sizeof(password));
+        if (username[0]) snprintf(cfg.username, sizeof(cfg.username), "%s", username);
+        if (password[0]) snprintf(cfg.password, sizeof(cfg.password), "%s", password);
+        if (!safe_auth_field(cfg.username, 0)) {
+            render_page(fd, "Username is required and cannot contain a colon.");
+            return;
+        }
+        if (cfg.enabled && !cfg.password[0]) {
+            render_page(fd, "Enter a password before enabling web UI sign-in.");
+            return;
+        }
+        if (cfg.password[0] && !safe_auth_field(cfg.password, 1)) {
+            render_page(fd, "Password cannot contain control characters.");
+            return;
+        }
+        if (save_webui_auth(&cfg) != 0) {
+            render_page(fd, "Failed to save web UI sign-in setting.");
+            return;
+        }
+        render_page(fd, cfg.enabled ? "Web UI sign-in enabled. Your browser may ask you to sign in again on the next page load." : "Web UI sign-in disabled.");
     } else if (strcmp(action, "rediscover") == 0) {
         trigger_mqtt_discover();
         render_page(fd, "MQTT discovery reload requested.");
@@ -5477,6 +5718,54 @@ static void render_update_status_json(int fd) {
     fclose(f);
 }
 
+static void render_update_check_state_json(int fd) {
+    struct update_check_state st;
+    FILE *f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    load_update_state(&st);
+    fputs("{\"ok\":true,\"checkedAt\":", f); fprintf(f, "%ld", st.checked_at);
+    fputs(",\"available\":", f); fputs(st.available ? "true" : "false", f);
+    fputs(",\"changes\":", f); fprintf(f, "%d", st.changes);
+    fputs(",\"message\":", f); json_write_string(f, st.message);
+    fputs(",\"source\":", f); json_write_string(f, st.source);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+static void render_update_check_state_post_json(int fd, const struct request *req) {
+    struct update_check_state st;
+    char tmp[256];
+    FILE *f;
+    memset(&st, 0, sizeof(st));
+    form_value(req->body, "checkedAt", tmp, sizeof(tmp));
+    st.checked_at = atol(tmp);
+    if (st.checked_at <= 0) st.checked_at = time(NULL);
+    form_value(req->body, "available", tmp, sizeof(tmp));
+    st.available = (strcmp(tmp, "1") == 0 || strcasecmp(tmp, "true") == 0 ||
+        strcasecmp(tmp, "yes") == 0 || strcasecmp(tmp, "on") == 0) ? 1 : 0;
+    form_value(req->body, "changes", tmp, sizeof(tmp));
+    st.changes = tmp[0] ? atoi(tmp) : 0;
+    form_value(req->body, "message", st.message, sizeof(st.message));
+    if (!st.message[0]) snprintf(st.message, sizeof(st.message), "Update check completed.");
+    form_value(req->body, "source", st.source, sizeof(st.source));
+    if (save_update_state(&st) != 0) {
+        f = send_json_start(fd, "500 Internal Server Error");
+        if (!f) return;
+        fputs("{\"ok\":false,\"error\":\"failed to save update check state\"}\n", f);
+        fclose(f);
+        return;
+    }
+    f = send_json_start(fd, "200 OK");
+    if (!f) return;
+    fputs("{\"ok\":true,\"checkedAt\":", f); fprintf(f, "%ld", st.checked_at);
+    fputs(",\"available\":", f); fputs(st.available ? "true" : "false", f);
+    fputs(",\"changes\":", f); fprintf(f, "%d", st.changes);
+    fputs(",\"message\":", f); json_write_string(f, st.message);
+    fputs(",\"source\":", f); json_write_string(f, st.source);
+    fputs("}\n", f);
+    fclose(f);
+}
+
 static void render_update_begin_json(int fd, const struct request *req) {
     char *manifest;
     size_t i;
@@ -6295,7 +6584,11 @@ static void handle_client(int client) {
         free_request(&req);
         return;
     }
-    /* Local deployment: web UI is intentionally open on the LAN. */
+    if (!webui_auth_ok(&req)) {
+        send_auth_required(client);
+        free_request(&req);
+        return;
+    }
     if (req.body_truncated) {
         send_payload_too_large(client, &req);
         free_request(&req);
@@ -6337,6 +6630,10 @@ static void handle_client(int client) {
         render_bt_saved_command_json(client, &req);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/update-status") == 0) {
         render_update_status_json(client);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/api/update-check-state") == 0) {
+        render_update_check_state_json(client);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-check-state") == 0) {
+        render_update_check_state_post_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-begin") == 0) {
         render_update_begin_json(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/api/update-chunk") == 0) {
