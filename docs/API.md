@@ -181,7 +181,9 @@ when cloud tasks are allowed on the next network start.
 The System page can update the local control stack from this repository. The
 browser fetches `payload/bin/MANIFEST.txt` and selected `codex_*` binaries,
 uploads them to the hub in chunks, then the hub verifies MD5 hashes from the
-manifest before installing.
+manifest before installing. The default updater tries the GitHub contents API,
+raw GitHub, and jsDelivr mirrors so public updates still work when one browser
+fetch path is blocked.
 
 Low-level SSH/dropbear files are intentionally not updated by the web UI.
 
