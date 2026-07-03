@@ -31,6 +31,7 @@
 #define DEVICE_LIST "/data/resources/DeviceList.json"
 #define FUNCTION_LIST "/data/resources/FunctionList.json"
 #define PROTOCOL_LIST "/data/resources/ProtocolList.json"
+#define ACTIVITY_LIST "/data/resources/ActivityList.json"
 #define RESOURCE_RELOAD_FLAG "/data/codex/reload_resources"
 #define RESOURCE_BACKUP_DIR "/data/codex/resource-backups"
 #define IR_EVENT_LOG "/data/codex/ir-events.log"
@@ -50,6 +51,8 @@
 #define MAX_IR_COMMANDS 160
 #define MAX_IR_STORED_COMMANDS 2048
 #define MAX_IR_BATCH_COMMANDS 1024
+#define MAX_ACTIVITIES 32
+#define MAX_ACTIVITY_ROLES 8
 #define MAX_BT_SEQUENCE_BODY 32768
 #define MAX_BT_DEVICES 12
 #define MAX_BT_COMMANDS 32
@@ -145,6 +148,42 @@ struct ir_inventory {
     struct ir_device devices[MAX_IR_DEVICES];
 };
 
+struct activity_role {
+    char id[32];
+    char type[40];
+    char device_id[32];
+    char input_id[32];
+    char input_name[128];
+    int has_input;
+    int power_on_order;
+    int power_off_order;
+    long next_device_power_on_delay;
+    int has_delay;
+};
+
+struct activity {
+    char id[32];
+    char name[128];
+    char display_name[128];
+    int has_display_name;
+    int type;
+    int activity_group;
+    int activity_order;
+    int is_default;
+    int is_tuning_default;
+    char suggested_display[40];
+    char start_screen[40];
+    int role_count;
+    struct activity_role roles[MAX_ACTIVITY_ROLES];
+};
+
+struct activity_inventory {
+    int activity_count;
+    long max_activity_id;
+    long max_role_id;
+    struct activity activities[MAX_ACTIVITIES];
+};
+
 struct bt_saved_command {
     char name[128];
     char script[MAX_BT_SCRIPT_LEN];
@@ -232,7 +271,7 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
         unlink(tmp);
         return -1;
     }
-    fputc('\n', f);
+    if (len == 0 || data[len - 1] != '\n') fputc('\n', f);
     fclose(f);
     if (rename(tmp, path) != 0) {
         unlink(tmp);
@@ -1699,7 +1738,7 @@ static void render_remotecentral_fetch_json(int fd, const struct request *req) {
 static void request_resource_reload(void) {
     FILE *f = fopen(RESOURCE_RELOAD_FLAG, "w");
     if (f) {
-        fputs("DeviceList\nFunctionList\nProtocolList\n", f);
+        fputs("DeviceList\nFunctionList\nProtocolList\nActivityList\n", f);
         fclose(f);
     }
     sync();
@@ -1710,7 +1749,7 @@ static void backup_resources(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "mkdir -p " RESOURCE_BACKUP_DIR "; d=" RESOURCE_BACKUP_DIR "/$(date +%%Y%%m%%d_%%H%%M%%S); "
-        "mkdir -p \"$d\"; cp " DEVICE_LIST " " FUNCTION_LIST " " PROTOCOL_LIST " \"$d\" 2>/dev/null");
+        "mkdir -p \"$d\"; cp " DEVICE_LIST " " FUNCTION_LIST " " PROTOCOL_LIST " " ACTIVITY_LIST " \"$d\" 2>/dev/null");
     system(cmd);
 }
 
@@ -1748,6 +1787,7 @@ static void send_bundle_download(int fd) {
     bundle_value(f, "DeviceList.json", DEVICE_LIST, 0);
     bundle_value(f, "FunctionList.json", FUNCTION_LIST, 1);
     bundle_value(f, "ProtocolList.json", PROTOCOL_LIST, 1);
+    bundle_value(f, "ActivityList.json", ACTIVITY_LIST, 1);
     bundle_value(f, "mqtt-config.json", MQTT_CONFIG, 1);
     bundle_value(f, "wpa_supplicant.conf", WPA_CONFIG, 1);
     bundle_value(f, "bt-devices.json", BT_DEVICE_STORE, 1);
@@ -2214,6 +2254,695 @@ static int update_ir_device(const char *device_id, const char *name, const char 
     free(raw);
     request_resource_reload();
     snprintf(msg, msglen, "Updated device %s.", device_id);
+    return 0;
+}
+
+/* ---- Activities (ActivityList.json) ----
+ * Unlike devices (wrapped as {"Device":{...}}), activities are bare objects
+ * directly inside the "Activities":[...] array, and a role's SelectedInput
+ * object reuses the "Name"/"Id-" key names that also appear at the activity's
+ * own top level -- so field lookups that touch the activity object as a whole
+ * must exclude the nested "Roles":[...] span to avoid matching inside it. */
+
+static int safe_json_int_string(const char *s) {
+    if (!s || !s[0]) return 0;
+    if (*s == '-') s++;
+    if (!*s) return 0;
+    while (*s) {
+        if (!isdigit((unsigned char)*s)) return 0;
+        s++;
+    }
+    return 1;
+}
+
+static int find_activities_array(const char *raw, const char **arr, const char **arr_end) {
+    const char *key = strstr(raw, "\"Activities\"");
+    const char *a = key ? strchr(key, '[') : NULL;
+    const char *e = a ? find_matching_json(a, '[', ']') : NULL;
+    if (!a || !e) return -1;
+    *arr = a;
+    *arr_end = e;
+    return 0;
+}
+
+static int find_activity_span(const char *raw, const char *arr, const char *arr_end, const char *activity_id, const char **item_start, const char **item_end) {
+    char idneedle[64];
+    const char *cpos = arr + 1;
+    if (!safe_json_int_string(activity_id)) return -1;
+    snprintf(idneedle, sizeof(idneedle), "\"Id-\":%s", activity_id);
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end) {
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        if (!obj_end || obj_end > arr_end) break;
+        if (strstr(cpos, idneedle) && strstr(cpos, idneedle) < obj_end) {
+            *item_start = cpos;
+            *item_end = obj_end;
+            return 0;
+        }
+        cpos = obj_end + 1;
+    }
+    return -1;
+}
+
+static int find_activity_roles_array(const char *item_start, const char *item_end, const char **roles_arr, const char **roles_arr_end) {
+    const char *key = strstr(item_start, "\"Roles\"");
+    const char *a, *e;
+    if (!key || key >= item_end) return -1;
+    a = strchr(key, '[');
+    if (!a || a >= item_end) return -1;
+    e = find_matching_json(a, '[', ']');
+    if (!e || e > item_end) return -1;
+    *roles_arr = a;
+    *roles_arr_end = e;
+    return 0;
+}
+
+static int find_activity_role_span(const char *roles_arr, const char *roles_arr_end, const char *role_id, const char **role_start, const char **role_end) {
+    char idneedle[64];
+    const char *rpos = roles_arr + 1;
+    if (!safe_json_int_string(role_id)) return -1;
+    snprintf(idneedle, sizeof(idneedle), "\"Id-\":%s", role_id);
+    while ((rpos = strchr(rpos, '{')) != NULL && rpos < roles_arr_end) {
+        const char *robj_end = find_matching_json(rpos, '{', '}');
+        if (!robj_end || robj_end > roles_arr_end) break;
+        if (strstr(rpos, idneedle) && strstr(rpos, idneedle) < robj_end) {
+            *role_start = rpos;
+            *role_end = robj_end;
+            return 0;
+        }
+        rpos = robj_end + 1;
+    }
+    return -1;
+}
+
+/* Replace a bare (unquoted) scalar value -- number, bool, or null -- with a
+ * caller-supplied literal. Tolerates the field currently being a quoted
+ * string too (replaces the whole quoted span in that case). */
+static int replace_json_scalar_field(char **pdata, size_t *plen, const char *obj_start, const char *obj_end, const char *key, const char *literal) {
+    const char *raw = *pdata;
+    const char *field, *colon, *vstart, *vend;
+    field = find_key_range(obj_start, obj_end, key);
+    if (!field) return -1;
+    colon = strchr(field + strlen(key) + 2, ':');
+    if (!colon || colon >= obj_end) return -1;
+    vstart = colon + 1;
+    while (*vstart && vstart < obj_end && isspace((unsigned char)*vstart)) vstart++;
+    if (*vstart == '"') {
+        vend = vstart + 1;
+        while (*vend && vend < obj_end) {
+            if (*vend == '\\' && vend[1]) vend += 2;
+            else if (*vend == '"') break;
+            else vend++;
+        }
+        if (*vend != '"') return -1;
+        vend++;
+    } else {
+        vend = vstart;
+        while (vend < obj_end && *vend != ',' && *vend != '}') vend++;
+    }
+    return replace_span(pdata, plen, (size_t)(vstart - raw), (size_t)(vend - raw), literal);
+}
+
+/* Replace a string field's value, escaping/quoting it. Tolerates the field
+ * currently being null or any other bare scalar. */
+static int replace_json_string_field(char **pdata, size_t *plen, const char *obj_start, const char *obj_end, const char *key, const char *value) {
+    const char *raw = *pdata;
+    const char *field, *colon, *vstart, *vend;
+    char *escaped;
+    int rc;
+    field = find_key_range(obj_start, obj_end, key);
+    if (!field) return -1;
+    colon = strchr(field + strlen(key) + 2, ':');
+    if (!colon || colon >= obj_end) return -1;
+    vstart = colon + 1;
+    while (*vstart && vstart < obj_end && isspace((unsigned char)*vstart)) vstart++;
+    if (*vstart == '"') {
+        vend = vstart + 1;
+        while (*vend && vend < obj_end) {
+            if (*vend == '\\' && vend[1]) vend += 2;
+            else if (*vend == '"') break;
+            else vend++;
+        }
+        if (*vend != '"') return -1;
+        vend++;
+    } else {
+        vend = vstart;
+        while (vend < obj_end && *vend != ',' && *vend != '}') vend++;
+    }
+    escaped = json_escape_alloc(value);
+    if (!escaped) return -1;
+    rc = replace_span(pdata, plen, (size_t)(vstart - raw), (size_t)(vend - raw), escaped);
+    free(escaped);
+    return rc;
+}
+
+/* Locate an activity's top-level (non-Roles) segments, since a role's
+ * SelectedInput object can reuse the same "Name"/"Id-" key names. Field
+ * lookups against an activity's own scalar fields must search seg1 then
+ * seg2, never the whole (item_start,item_end) span directly. */
+static void activity_top_level_segments(const char *item_start, const char *item_end,
+        const char **seg1_start, const char **seg1_end, const char **seg2_start, const char **seg2_end) {
+    const char *roles_arr, *roles_arr_end;
+    if (find_activity_roles_array(item_start, item_end, &roles_arr, &roles_arr_end) == 0) {
+        *seg1_start = item_start; *seg1_end = roles_arr;
+        *seg2_start = roles_arr_end; *seg2_end = item_end;
+    } else {
+        *seg1_start = item_start; *seg1_end = item_end;
+        *seg2_start = NULL; *seg2_end = NULL;
+    }
+}
+
+static int update_activity_scalar_field(char **pdata, size_t *plen, const char *activity_id, const char *key, const char *literal) {
+    const char *arr, *arr_end, *item_start, *item_end;
+    const char *seg1_start, *seg1_end, *seg2_start, *seg2_end;
+    if (find_activities_array(*pdata, &arr, &arr_end) != 0) return -1;
+    if (find_activity_span(*pdata, arr, arr_end, activity_id, &item_start, &item_end) != 0) return -1;
+    activity_top_level_segments(item_start, item_end, &seg1_start, &seg1_end, &seg2_start, &seg2_end);
+    if (replace_json_scalar_field(pdata, plen, seg1_start, seg1_end, key, literal) == 0) return 0;
+    if (seg2_start && replace_json_scalar_field(pdata, plen, seg2_start, seg2_end, key, literal) == 0) return 0;
+    return -1;
+}
+
+static int update_activity_int_field(char **pdata, size_t *plen, const char *activity_id, const char *key, long value) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%ld", value);
+    return update_activity_scalar_field(pdata, plen, activity_id, key, buf);
+}
+
+static int update_activity_bool_field(char **pdata, size_t *plen, const char *activity_id, const char *key, int value) {
+    return update_activity_scalar_field(pdata, plen, activity_id, key, value ? "true" : "false");
+}
+
+static int update_activity_string_field(char **pdata, size_t *plen, const char *activity_id, const char *key, const char *value) {
+    const char *arr, *arr_end, *item_start, *item_end;
+    const char *seg1_start, *seg1_end, *seg2_start, *seg2_end;
+    if (find_activities_array(*pdata, &arr, &arr_end) != 0) return -1;
+    if (find_activity_span(*pdata, arr, arr_end, activity_id, &item_start, &item_end) != 0) return -1;
+    activity_top_level_segments(item_start, item_end, &seg1_start, &seg1_end, &seg2_start, &seg2_end);
+    if (replace_json_string_field(pdata, plen, seg1_start, seg1_end, key, value) == 0) return 0;
+    if (seg2_start && replace_json_string_field(pdata, plen, seg2_start, seg2_end, key, value) == 0) return 0;
+    return -1;
+}
+
+static int update_activity_role_scalar(char **pdata, size_t *plen, const char *activity_id, const char *role_id, const char *key, const char *literal) {
+    const char *arr, *arr_end, *item_start, *item_end, *roles_arr, *roles_arr_end, *role_start, *role_end;
+    if (find_activities_array(*pdata, &arr, &arr_end) != 0) return -1;
+    if (find_activity_span(*pdata, arr, arr_end, activity_id, &item_start, &item_end) != 0) return -1;
+    if (find_activity_roles_array(item_start, item_end, &roles_arr, &roles_arr_end) != 0) return -1;
+    if (find_activity_role_span(roles_arr, roles_arr_end, role_id, &role_start, &role_end) != 0) return -1;
+    return replace_json_scalar_field(pdata, plen, role_start, role_end, key, literal);
+}
+
+/* Replace a role's SelectedInput with either null (empty input_id) or a
+ * freshly built {"ChannelNumber":null,"Id-":<input_id>,"Name":<name>} object. */
+static int update_activity_role_input(char **pdata, size_t *plen, const char *activity_id, const char *role_id, const char *input_id, const char *input_name) {
+    const char *raw;
+    const char *arr, *arr_end, *item_start, *item_end, *roles_arr, *roles_arr_end, *role_start, *role_end;
+    const char *field, *colon, *vstart, *vend;
+    char literal[320];
+    char minted_id[32];
+    char *escaped_name;
+    int rc;
+    if (find_activities_array(*pdata, &arr, &arr_end) != 0) return -1;
+    if (find_activity_span(*pdata, arr, arr_end, activity_id, &item_start, &item_end) != 0) return -1;
+    if (find_activity_roles_array(item_start, item_end, &roles_arr, &roles_arr_end) != 0) return -1;
+    if (find_activity_role_span(roles_arr, roles_arr_end, role_id, &role_start, &role_end) != 0) return -1;
+    raw = *pdata;
+    field = find_key_range(role_start, role_end, "SelectedInput");
+    if (!field) return -1;
+    colon = strchr(field + strlen("SelectedInput") + 2, ':');
+    if (!colon || colon >= role_end) return -1;
+    vstart = colon + 1;
+    while (*vstart && vstart < role_end && isspace((unsigned char)*vstart)) vstart++;
+    if (*vstart == '{') {
+        vend = find_matching_json(vstart, '{', '}');
+        if (!vend || vend >= role_end) return -1;
+        vend++;
+    } else {
+        vend = vstart;
+        while (vend < role_end && *vend != ',' && *vend != '}') vend++;
+    }
+    if ((!input_id || !input_id[0]) && (!input_name || !input_name[0])) {
+        return replace_span(pdata, plen, (size_t)(vstart - raw), (size_t)(vend - raw), "null");
+    }
+    if (input_id && input_id[0] && !safe_json_int_string(input_id)) return -1;
+    if (!input_id || !input_id[0]) {
+        /* Input ids are cosmetic (just an Id-/Name pair) -- mint one in the
+         * same safe range if the caller has a name but no id to carry forward. */
+        snprintf(minted_id, sizeof(minted_id), "%ld", 90000000 + (long)(time(NULL) % 9000000));
+        input_id = minted_id;
+    }
+    escaped_name = json_escape_alloc(input_name ? input_name : "");
+    if (!escaped_name) return -1;
+    snprintf(literal, sizeof(literal), "{\"ChannelNumber\":null,\"Id-\":%s,\"Name\":%s}", input_id, escaped_name);
+    free(escaped_name);
+    rc = replace_span(pdata, plen, (size_t)(vstart - raw), (size_t)(vend - raw), literal);
+    return rc;
+}
+
+static int load_activity_inventory(struct activity_inventory *inv) {
+    char *raw;
+    size_t len = 0;
+    const char *arr, *arr_end, *cpos;
+    memset(inv, 0, sizeof(*inv));
+    raw = read_file_alloc(ACTIVITY_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) return -1;
+    if (find_activities_array(raw, &arr, &arr_end) != 0) {
+        free(raw);
+        return -1;
+    }
+    cpos = arr + 1;
+    while ((cpos = strchr(cpos, '{')) != NULL && cpos < arr_end && inv->activity_count < MAX_ACTIVITIES) {
+        struct activity *act = &inv->activities[inv->activity_count];
+        const char *obj_end = find_matching_json(cpos, '{', '}');
+        const char *roles_arr, *roles_arr_end, *rpos;
+        const char *seg1_start, *seg1_end, *seg2_start, *seg2_end;
+        long aid;
+        if (!obj_end || obj_end > arr_end) break;
+        /* "Id-" also appears on every nested role (and on each role's
+         * SelectedInput), so this must use the same Roles-excluding segments
+         * as Name/ActivityDisplayName below -- searching the whole span would
+         * pick up a role's Id- instead of the activity's own whenever "Id-"
+         * happens to appear before "Roles" in this activity's key order. */
+        activity_top_level_segments(cpos, obj_end, &seg1_start, &seg1_end, &seg2_start, &seg2_end);
+        aid = json_long_range(seg1_start, seg1_end, "Id-", -1);
+        if (aid <= 0 && seg2_start) aid = json_long_range(seg2_start, seg2_end, "Id-", -1);
+        if (aid <= 0) {
+            cpos = obj_end + 1;
+            continue;
+        }
+        snprintf(act->id, sizeof(act->id), "%ld", aid);
+        if (aid > inv->max_activity_id) inv->max_activity_id = aid;
+        if (!json_string_range(seg1_start, seg1_end, "Name", act->name, sizeof(act->name)) && seg2_start) {
+            json_string_range(seg2_start, seg2_end, "Name", act->name, sizeof(act->name));
+        }
+        act->has_display_name = json_has_nonnull_value(cpos, obj_end, "ActivityDisplayName");
+        if (act->has_display_name) {
+            if (!json_string_range(seg1_start, seg1_end, "ActivityDisplayName", act->display_name, sizeof(act->display_name)) && seg2_start) {
+                json_string_range(seg2_start, seg2_end, "ActivityDisplayName", act->display_name, sizeof(act->display_name));
+            }
+        }
+        act->type = (int)json_long_range(cpos, obj_end, "Type", 0);
+        act->activity_group = (int)json_long_range(cpos, obj_end, "ActivityGroup", 0);
+        act->activity_order = (int)json_long_range(cpos, obj_end, "ActivityOrder", 0);
+        act->is_default = json_bool_range(cpos, obj_end, "IsDefault", 0);
+        act->is_tuning_default = json_bool_range(cpos, obj_end, "IsTuningDefault", 0);
+        json_string_range(cpos, obj_end, "SuggestedDisplay", act->suggested_display, sizeof(act->suggested_display));
+        json_string_range(cpos, obj_end, "StartScreen", act->start_screen, sizeof(act->start_screen));
+        if (find_activity_roles_array(cpos, obj_end, &roles_arr, &roles_arr_end) == 0) {
+            rpos = roles_arr + 1;
+            while ((rpos = strchr(rpos, '{')) != NULL && rpos < roles_arr_end && act->role_count < MAX_ACTIVITY_ROLES) {
+                struct activity_role *role = &act->roles[act->role_count];
+                const char *robj_end = find_matching_json(rpos, '{', '}');
+                const char *sel_key, *sel_colon, *sel_start, *sel_end;
+                long rid, did;
+                if (!robj_end || robj_end > roles_arr_end) break;
+                rid = json_long_range(rpos, robj_end, "Id-", 0);
+                snprintf(role->id, sizeof(role->id), "%ld", rid);
+                if (rid > inv->max_role_id) inv->max_role_id = rid;
+                json_string_range(rpos, robj_end, "__type", role->type, sizeof(role->type));
+                did = json_long_range(rpos, robj_end, "DeviceId-", 0);
+                snprintf(role->device_id, sizeof(role->device_id), "%ld", did);
+                role->power_on_order = (int)json_long_range(rpos, robj_end, "PowerOnOrder", 0);
+                role->power_off_order = (int)json_long_range(rpos, robj_end, "PowerOffOrder", 0);
+                role->has_delay = json_has_nonnull_value(rpos, robj_end, "NextDevicePowerOnDelay");
+                if (role->has_delay) role->next_device_power_on_delay = json_long_range(rpos, robj_end, "NextDevicePowerOnDelay", 0);
+                role->has_input = json_has_nonnull_value(rpos, robj_end, "SelectedInput");
+                if (role->has_input) {
+                    sel_key = find_key_range(rpos, robj_end, "SelectedInput");
+                    sel_colon = sel_key ? strchr(sel_key + strlen("SelectedInput") + 2, ':') : NULL;
+                    sel_start = sel_colon ? sel_colon + 1 : NULL;
+                    while (sel_start && *sel_start && sel_start < robj_end && isspace((unsigned char)*sel_start)) sel_start++;
+                    sel_end = (sel_start && *sel_start == '{') ? find_matching_json(sel_start, '{', '}') : NULL;
+                    if (sel_start && sel_end && sel_end <= robj_end) {
+                        snprintf(role->input_id, sizeof(role->input_id), "%ld", json_long_range(sel_start, sel_end, "Id-", 0));
+                        json_string_range(sel_start, sel_end, "Name", role->input_name, sizeof(role->input_name));
+                    }
+                }
+                act->role_count++;
+                rpos = robj_end + 1;
+            }
+        }
+        inv->activity_count++;
+        cpos = obj_end + 1;
+    }
+    free(raw);
+    return 0;
+}
+
+/* Trivial: struct activity/activity_role hold no heap pointers. Kept for
+ * symmetry with free_ir_inventory/destroy_ir_inventory call sites. */
+static void free_activity_inventory(struct activity_inventory *inv) {
+    if (!inv) return;
+    inv->activity_count = 0;
+}
+
+static void destroy_activity_inventory(struct activity_inventory *inv) {
+    if (!inv) return;
+    free_activity_inventory(inv);
+    free(inv);
+}
+
+static int update_activity(const char *activity_id, const char *name, const char *display_name, int has_display_name,
+        long activity_order, int is_default, char *msg, size_t msglen) {
+    char *raw;
+    size_t len;
+    if (!safe_json_int_string(activity_id) || !safe_label(name)) {
+        snprintf(msg, msglen, "Activity fields cannot be empty or contain control characters.");
+        return -1;
+    }
+    if (has_display_name && !safe_label(display_name)) {
+        snprintf(msg, msglen, "Activity display name cannot contain control characters.");
+        return -1;
+    }
+    raw = read_file_alloc(ACTIVITY_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read ActivityList.");
+        return -1;
+    }
+    backup_resources();
+    if (update_activity_string_field(&raw, &len, activity_id, "Name", name) != 0 ||
+        (has_display_name
+            ? update_activity_string_field(&raw, &len, activity_id, "ActivityDisplayName", display_name) != 0
+            : update_activity_scalar_field(&raw, &len, activity_id, "ActivityDisplayName", "null") != 0) ||
+        update_activity_int_field(&raw, &len, activity_id, "ActivityOrder", activity_order) != 0 ||
+        update_activity_bool_field(&raw, &len, activity_id, "IsDefault", is_default) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to update activity %s.", activity_id);
+        return -1;
+    }
+    if (write_file_atomic(ACTIVITY_LIST, raw, len) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to save ActivityList.");
+        return -1;
+    }
+    free(raw);
+    request_resource_reload();
+    snprintf(msg, msglen, "Updated activity %s.", activity_id);
+    return 0;
+}
+
+static int update_activity_role(const char *activity_id, const char *role_id, const char *device_id,
+        const char *input_id, const char *input_name, long power_on_order, long power_off_order,
+        long next_delay, int has_delay, char *msg, size_t msglen) {
+    char *raw;
+    size_t len;
+    char power_on_buf[32], power_off_buf[32], delay_buf[32];
+    if (!safe_json_int_string(activity_id) || !safe_json_int_string(role_id) || !safe_json_int_string(device_id)) {
+        snprintf(msg, msglen, "Invalid activity, role, or device id.");
+        return -1;
+    }
+    if (input_id && input_id[0] && !safe_json_int_string(input_id)) {
+        snprintf(msg, msglen, "Invalid input id.");
+        return -1;
+    }
+    raw = read_file_alloc(ACTIVITY_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read ActivityList.");
+        return -1;
+    }
+    snprintf(power_on_buf, sizeof(power_on_buf), "%ld", power_on_order);
+    snprintf(power_off_buf, sizeof(power_off_buf), "%ld", power_off_order);
+    snprintf(delay_buf, sizeof(delay_buf), "%ld", next_delay);
+    backup_resources();
+    if (update_activity_role_scalar(&raw, &len, activity_id, role_id, "DeviceId-", device_id) != 0 ||
+        update_activity_role_input(&raw, &len, activity_id, role_id, input_id, input_name) != 0 ||
+        update_activity_role_scalar(&raw, &len, activity_id, role_id, "PowerOnOrder", power_on_buf) != 0 ||
+        update_activity_role_scalar(&raw, &len, activity_id, role_id, "PowerOffOrder", power_off_buf) != 0 ||
+        (has_delay
+            ? update_activity_role_scalar(&raw, &len, activity_id, role_id, "NextDevicePowerOnDelay", delay_buf) != 0
+            : update_activity_role_scalar(&raw, &len, activity_id, role_id, "NextDevicePowerOnDelay", "null") != 0)) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to update role on activity %s.", activity_id);
+        return -1;
+    }
+    if (write_file_atomic(ACTIVITY_LIST, raw, len) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to save ActivityList.");
+        return -1;
+    }
+    free(raw);
+    request_resource_reload();
+    snprintf(msg, msglen, "Updated role on activity %s.", activity_id);
+    return 0;
+}
+
+static int delete_activity(const char *activity_id, char *msg, size_t msglen) {
+    char *raw;
+    const char *arr, *arr_end, *item_start, *item_end;
+    size_t len;
+    if (!safe_json_int_string(activity_id)) {
+        snprintf(msg, msglen, "Invalid activity id.");
+        return -1;
+    }
+    raw = read_file_alloc(ACTIVITY_LIST, MAX_RESOURCE_FILE, &len);
+    if (!raw) {
+        snprintf(msg, msglen, "Failed to read ActivityList.");
+        return -1;
+    }
+    if (find_activities_array(raw, &arr, &arr_end) != 0 ||
+        find_activity_span(raw, arr, arr_end, activity_id, &item_start, &item_end) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Activity %s not found.", activity_id);
+        return -1;
+    }
+    backup_resources();
+    if (remove_json_span(&raw, &len, (size_t)(item_start - raw), (size_t)(item_end + 1 - raw)) != 0 ||
+        write_file_atomic(ACTIVITY_LIST, raw, len) != 0) {
+        free(raw);
+        snprintf(msg, msglen, "Failed to delete activity %s.", activity_id);
+        return -1;
+    }
+    free(raw);
+    request_resource_reload();
+    snprintf(msg, msglen, "Deleted activity %s.", activity_id);
+    return 0;
+}
+
+/* Known-good (Type, ActivityGroup, SuggestedDisplay, StartScreen, role-shape)
+ * combinations transcribed directly from real activities observed on two
+ * live hubs -- new activities only ever clone one of these, never a new
+ * combination. EnterActions/LeaveActions are always emitted as [] to match
+ * every observed real activity (the engine derives the sequence from Roles
+ * alone). "Game console" is confirmed on one hub only; "Watch TV" and
+ * "Smart TV" are confirmed independently on two. */
+struct activity_role_template {
+    const char *type;
+    const char *label;
+};
+
+struct activity_template {
+    const char *key;
+    const char *label;
+    int type;
+    int activity_group;
+    const char *suggested_display;
+    const char *start_screen;
+    int is_tuning_default;
+    int role_count;
+    struct activity_role_template roles[4];
+};
+
+static const struct activity_template ACTIVITY_TEMPLATES[] = {
+    { "playgame", "Game console", 3, 4, "PlayGame", "Commands", 0, 3,
+        { { "DisplayActivityRole", "Display device" },
+          { "PlayGameActivityRole", "Game console" },
+          { "VolumeActivityRole", "Volume device" },
+          { NULL, NULL } } },
+    { "watchtv", "Watch TV (tuner)", 1, 1, "WatchTV", "Favorites", 1, 3,
+        { { "DisplayActivityRole", "Display device" },
+          { "ChannelChangingActivityRole", "Channel source" },
+          { "VolumeActivityRole", "Volume device" },
+          { NULL, NULL } } },
+    { "smarttv", "Smart TV", 12, 0, "SmartTV", "Commands", 0, 4,
+        { { "DisplayActivityRole", "Display device" },
+          { "VolumeActivityRole", "Volume device" },
+          { "ChannelChangingActivityRole", "Channel source" },
+          { "SmartTVActivityRole", "Smart TV app control" } } },
+};
+#define ACTIVITY_TEMPLATE_COUNT (sizeof(ACTIVITY_TEMPLATES) / sizeof(ACTIVITY_TEMPLATES[0]))
+
+static const struct activity_template *find_activity_template(const char *key) {
+    size_t i;
+    if (!key) return NULL;
+    for (i = 0; i < ACTIVITY_TEMPLATE_COUNT; i++) {
+        if (strcmp(ACTIVITY_TEMPLATES[i].key, key) == 0) return &ACTIVITY_TEMPLATES[i];
+    }
+    return NULL;
+}
+
+static int create_activity_from_template(const char *template_key, const char *name,
+        const char *device_ids[], const char *input_ids[], const char *input_names[], int role_count,
+        char *msg, size_t msglen, char *created_id, size_t created_id_len) {
+    const struct activity_template *tpl;
+    struct ir_inventory *irinv;
+    struct activity_inventory *ainv;
+    long id, role_id_base, max_activity_id, max_role_id;
+    int i, order;
+    char *en = NULL, *item = NULL;
+    char *roles_buf;
+    size_t roles_cap, roles_len;
+
+    if (!name || !safe_label(name)) {
+        snprintf(msg, msglen, "Activity name cannot be empty or contain control characters.");
+        return -1;
+    }
+    tpl = find_activity_template(template_key);
+    if (!tpl) {
+        snprintf(msg, msglen, "Unknown activity template.");
+        return -1;
+    }
+    if (role_count != tpl->role_count) {
+        snprintf(msg, msglen, "This template needs exactly %d device role(s).", tpl->role_count);
+        return -1;
+    }
+
+    irinv = (struct ir_inventory *)calloc(1, sizeof(*irinv));
+    if (!irinv) {
+        snprintf(msg, msglen, "Not enough memory.");
+        return -1;
+    }
+    if (load_ir_inventory(irinv) != 0) {
+        destroy_ir_inventory(irinv);
+        snprintf(msg, msglen, "Failed to read DeviceList.");
+        return -1;
+    }
+    for (i = 0; i < role_count; i++) {
+        int found = 0, j;
+        if (!device_ids[i] || !safe_json_int_string(device_ids[i])) {
+            destroy_ir_inventory(irinv);
+            snprintf(msg, msglen, "Choose a device for the %s role.", tpl->roles[i].label);
+            return -1;
+        }
+        for (j = 0; j < irinv->device_count; j++) {
+            if (strcmp(irinv->devices[j].id, device_ids[i]) == 0) { found = 1; break; }
+        }
+        if (!found) {
+            destroy_ir_inventory(irinv);
+            snprintf(msg, msglen, "Device %s not found for the %s role.", device_ids[i], tpl->roles[i].label);
+            return -1;
+        }
+    }
+    destroy_ir_inventory(irinv);
+
+    ainv = (struct activity_inventory *)calloc(1, sizeof(*ainv));
+    if (!ainv) {
+        snprintf(msg, msglen, "Not enough memory.");
+        return -1;
+    }
+    if (load_activity_inventory(ainv) != 0) memset(ainv, 0, sizeof(*ainv));
+    max_activity_id = ainv->max_activity_id;
+    max_role_id = ainv->max_role_id;
+    order = ainv->activity_count;
+    destroy_activity_inventory(ainv);
+
+    id = max_activity_id + 1;
+    if (id < 90000000) id = 90000000 + (long)(time(NULL) % 9000000);
+    role_id_base = max_role_id + 1;
+    if (role_id_base < 90000000) role_id_base = 90000000 + (long)((time(NULL) + 1) % 9000000);
+
+    en = json_escape_alloc(name);
+    if (!en) {
+        snprintf(msg, msglen, "Not enough memory.");
+        return -1;
+    }
+
+    roles_cap = 4096;
+    roles_buf = (char *)malloc(roles_cap);
+    if (!roles_buf) {
+        free(en);
+        snprintf(msg, msglen, "Not enough memory.");
+        return -1;
+    }
+    roles_buf[0] = 0;
+    roles_len = 0;
+    for (i = 0; i < role_count; i++) {
+        char role_item[512];
+        char *input_part = NULL;
+        long this_role_id = role_id_base + i;
+        size_t item_len;
+        int have_input_name = input_names[i] && input_names[i][0] && safe_label(input_names[i]);
+        int have_input_id = input_ids[i] && input_ids[i][0] && safe_json_int_string(input_ids[i]);
+        if (have_input_name) {
+            /* Input ids are cosmetic (just an Id-/Name pair inside SelectedInput);
+             * mint one in the same safe range if the caller didn't carry one forward. */
+            char minted_id[32];
+            const char *use_id = input_ids[i];
+            char *en_input;
+            if (!have_input_id) {
+                snprintf(minted_id, sizeof(minted_id), "%ld", role_id_base + 1000 + i);
+                use_id = minted_id;
+            }
+            en_input = json_escape_alloc(input_names[i]);
+            if (!en_input) {
+                free(roles_buf);
+                free(en);
+                snprintf(msg, msglen, "Not enough memory.");
+                return -1;
+            }
+            input_part = (char *)malloc(320);
+            if (!input_part) {
+                free(en_input);
+                free(roles_buf);
+                free(en);
+                snprintf(msg, msglen, "Not enough memory.");
+                return -1;
+            }
+            snprintf(input_part, 320, "{\"ChannelNumber\":null,\"Id-\":%s,\"Name\":%s}", use_id, en_input);
+            free(en_input);
+        }
+        snprintf(role_item, sizeof(role_item),
+            "%s{\"DeviceId-\":%s,\"__type\":\"%s\",\"Id-\":%ld,\"SelectedInput\":%s,"
+            "\"PowerOnOrder\":%d,\"NextDevicePowerOnDelay\":null,\"PowerOffOrder\":%d}",
+            i == 0 ? "" : ",", device_ids[i], tpl->roles[i].type, this_role_id,
+            input_part ? input_part : "null", i + 1, i + 1);
+        free(input_part);
+        item_len = strlen(role_item);
+        if (roles_len + item_len + 1 > roles_cap) {
+            char *grown;
+            roles_cap = roles_cap * 2 + item_len;
+            grown = (char *)realloc(roles_buf, roles_cap);
+            if (!grown) {
+                free(roles_buf);
+                free(en);
+                snprintf(msg, msglen, "Not enough memory.");
+                return -1;
+            }
+            roles_buf = grown;
+        }
+        memcpy(roles_buf + roles_len, role_item, item_len + 1);
+        roles_len += item_len;
+    }
+
+    item = (char *)malloc(roles_len + 2048);
+    if (!item) {
+        free(roles_buf);
+        free(en);
+        snprintf(msg, msglen, "Not enough memory.");
+        return -1;
+    }
+    snprintf(item, roles_len + 2048,
+        "{\"DefaultStationName\":null,\"IsTuningDefault\":%s,\"AccountId-\":0,\"Alternatives\":null,"
+        "\"Zones\":null,\"EnterActions\":[],\"IsDefault\":false,\"Type\":%d,"
+        "\"BaseImageUri\":\"https://rcbu-prod-ssl-amr.myharmony.com/\",\"SuggestedDisplay\":\"%s\","
+        "\"ActivityGroup\":%d,\"IsMultiZone\":false,\"DefaultStation\":null,\"Name\":%s,"
+        "\"DateCreated\":\"/Date(%ld000+0000)/\",\"ActivityDisplayName\":null,\"StartScreen\":\"%s\","
+        "\"ImageKey\":null,\"State\":0,\"LeaveActions\":[],\"ActivityOrder\":%d,\"DefaultChannel\":null,"
+        "\"Roles\":[%s],\"DateModified\":\"/Date(%ld000+0000)/\",\"Id-\":%ld,\"Icon\":null}",
+        tpl->is_tuning_default ? "true" : "false", tpl->type, tpl->suggested_display, tpl->activity_group,
+        en, (long)time(NULL), tpl->start_screen, order, roles_buf, (long)time(NULL), id);
+    free(roles_buf);
+    free(en);
+
+    backup_resources();
+    if (append_top_array_item(ACTIVITY_LIST, "\"Activities\"", item) != 0) {
+        free(item);
+        snprintf(msg, msglen, "Failed to create activity.");
+        return -1;
+    }
+    free(item);
+    request_resource_reload();
+    if (created_id && created_id_len) snprintf(created_id, created_id_len, "%ld", id);
+    snprintf(msg, msglen, "Created activity %s (%ld) from the %s template.", name, id, tpl->label);
     return 0;
 }
 
@@ -2914,7 +3643,7 @@ static void page_head(FILE *f, const char *title) {
         "*{box-sizing:border-box}html,body{width:100%;max-width:100%;overflow-x:hidden}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.48 system-ui,-apple-system,Segoe UI,sans-serif}"
         "header{position:sticky;top:0;background:rgba(255,255,255,.98);backdrop-filter:saturate(1.15) blur(12px);border-bottom:1px solid var(--line);padding:12px 20px;z-index:3}"
         ".topbar{max-width:1280px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:center;gap:11px}.brand-mark{width:34px;height:34px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#fff;font-weight:750}.brand h1{letter-spacing:0}.brand small{display:block;color:var(--muted);font-size:12px}.top-status{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}"
-        ".app-shell{max-width:1280px;margin:0 auto;padding:22px 20px;display:grid;grid-template-columns:236px minmax(0,1fr);gap:22px}.side-menu{position:sticky;top:78px;align-self:start;display:grid;gap:5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px;box-shadow:var(--shadow);min-width:0;max-width:100%}.menu-item{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:center;text-align:left;border:0;background:transparent;color:var(--fg);border-radius:8px;padding:10px 11px;box-shadow:none;min-height:54px}.menu-item>*{min-width:0}.menu-item:hover{background:var(--soft)}.menu-item span:first-child{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:#edf3f2;color:var(--accent);font-size:0;position:relative}.menu-item span:first-child:before{content:\"\";display:block;width:13px;height:13px;border:2px solid currentColor;border-radius:4px}.menu-item[data-view-target=control] span:first-child:before{width:16px;height:16px;border-radius:50%;box-shadow:inset 0 0 0 4px #fff}.menu-item[data-view-target=ir] span:first-child:before{width:15px;height:9px;border-radius:9px}.menu-item[data-view-target=lab] span:first-child:before{width:15px;height:15px;border-radius:50%;box-shadow:inset 0 0 0 3px #fff}.menu-item[data-view-target=bluetooth] span:first-child:before{width:15px;height:15px;border-radius:50%;border-width:2px;box-shadow:0 -5px 0 -3px currentColor,0 5px 0 -3px currentColor}.menu-item[data-view-target=mqtt] span:first-child:before{width:14px;height:14px;border-radius:50%;border-width:2px}.menu-item[data-view-target=wifi] span:first-child:before{width:15px;height:10px;border:0;border-top:2px solid currentColor;border-radius:50%}.menu-item[data-view-target=backup] span:first-child:before{width:15px;height:12px;border-radius:3px}.menu-item[data-view-target=system] span:first-child:before{width:13px;height:13px;border-radius:50%}.menu-item strong{display:block;font-size:13px;line-height:1.15;overflow-wrap:anywhere}.menu-item small{display:block;color:var(--muted);font-size:11px;margin-top:2px;line-height:1.15;overflow-wrap:anywhere}.menu-item.active{background:var(--soft2);color:#0c514d}.menu-item.active span:first-child{background:#fff;box-shadow:inset 0 0 0 1px rgba(15,118,110,.14)}.content{min-width:0;max-width:100%;display:grid;gap:18px}.section{display:none;scroll-margin-top:94px;min-width:0;max-width:100%}.section.active{display:grid;gap:15px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:2px 0 4px}.section-lead{max-width:100%;color:var(--muted);font-size:13px;margin-top:5px;overflow-wrap:break-word}"
+        ".app-shell{max-width:1280px;margin:0 auto;padding:22px 20px;display:grid;grid-template-columns:236px minmax(0,1fr);gap:22px}.side-menu{position:sticky;top:78px;align-self:start;display:grid;gap:5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px;box-shadow:var(--shadow);min-width:0;max-width:100%}.menu-item{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:center;text-align:left;border:0;background:transparent;color:var(--fg);border-radius:8px;padding:10px 11px;box-shadow:none;min-height:54px}.menu-item>*{min-width:0}.menu-item:hover{background:var(--soft)}.menu-item span:first-child{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:#edf3f2;color:var(--accent);font-size:0;position:relative}.menu-item span:first-child:before{content:\"\";display:block;width:13px;height:13px;border:2px solid currentColor;border-radius:4px}.menu-item[data-view-target=control] span:first-child:before{width:16px;height:16px;border-radius:50%;box-shadow:inset 0 0 0 4px #fff}.menu-item[data-view-target=ir] span:first-child:before{width:15px;height:9px;border-radius:9px}.menu-item[data-view-target=lab] span:first-child:before{width:15px;height:15px;border-radius:50%;box-shadow:inset 0 0 0 3px #fff}.menu-item[data-view-target=activities] span:first-child:before{width:14px;height:14px;border-radius:3px;box-shadow:inset 0 0 0 3px #fff}.menu-item[data-view-target=bluetooth] span:first-child:before{width:15px;height:15px;border-radius:50%;border-width:2px;box-shadow:0 -5px 0 -3px currentColor,0 5px 0 -3px currentColor}.menu-item[data-view-target=mqtt] span:first-child:before{width:14px;height:14px;border-radius:50%;border-width:2px}.menu-item[data-view-target=wifi] span:first-child:before{width:15px;height:10px;border:0;border-top:2px solid currentColor;border-radius:50%}.menu-item[data-view-target=backup] span:first-child:before{width:15px;height:12px;border-radius:3px}.menu-item[data-view-target=system] span:first-child:before{width:13px;height:13px;border-radius:50%}.menu-item strong{display:block;font-size:13px;line-height:1.15;overflow-wrap:anywhere}.menu-item small{display:block;color:var(--muted);font-size:11px;margin-top:2px;line-height:1.15;overflow-wrap:anywhere}.menu-item.active{background:var(--soft2);color:#0c514d}.menu-item.active span:first-child{background:#fff;box-shadow:inset 0 0 0 1px rgba(15,118,110,.14)}.content{min-width:0;max-width:100%;display:grid;gap:18px}.section{display:none;scroll-margin-top:94px;min-width:0;max-width:100%}.section.active{display:grid;gap:15px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:2px 0 4px}.section-lead{max-width:100%;color:var(--muted);font-size:13px;margin-top:5px;overflow-wrap:break-word}"
         "h1{font-size:20px;margin:0}h2{font-size:24px;line-height:1.12;margin:0;font-weight:750}h3{font-size:15px;margin:0 0 10px}.panel h2{font-size:18px;line-height:1.2;margin:0 0 6px}.muted{color:var(--muted)}.mini{font-size:12px}.nowrap{white-space:nowrap}.subtle{font-size:12px;color:var(--muted);margin-top:2px}.help{font-size:12px;color:var(--muted);margin-top:5px}.help,.muted,.subtle,.callout{overflow-wrap:anywhere}.callout{border:1px solid #dbe7ef;border-left:4px solid var(--accent2);background:#fbfdff;border-radius:8px;padding:12px 14px;margin:0 0 12px;color:#263a52}.callout strong{display:block;margin-bottom:2px}.quick-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:14px}.quick-actions button{min-height:72px;text-align:left;background:#fff;color:var(--fg);border-color:var(--line);box-shadow:0 1px 2px rgba(20,40,32,.04);padding:14px}.quick-actions button strong{display:block;margin-bottom:4px}.quick-actions button:hover{border-color:#b9c8c4;background:#fbfefd}"
         ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.dashboard-cards{grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.panel,.stat,.setup-shell{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(20,40,32,.04);min-width:0;max-width:100%}.panel>*,.stat>*,.setup-shell>*{min-width:0;max-width:100%}.stat{min-height:92px;padding:17px}.stat .value{font-size:20px;font-weight:700;margin-top:5px}.stat .label{text-transform:uppercase;letter-spacing:0;color:var(--muted);font-size:11px}"
         ".kv{display:grid;grid-template-columns:132px 1fr;gap:6px 10px}.badge,.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:3px 9px;background:var(--wash);font-size:12px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}"
@@ -2932,7 +3661,7 @@ static void page_head(FILE *f, const char *title) {
         "</style></head><body>",
         f);
     fprintf(f,
-        "<header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><div><h1>Harmony Hub Control</h1><small>Local smart home console</small></div></div><div class='top-status'><span class='pill'>Local control</span><span class='pill %s'>Logitech cloud %s</span></div></div></header><main class='app-shell'><aside class='side-menu' aria-label='Main menu'><button type='button' class='menu-item active' data-view-target='overview'><span>D</span><div><strong>Dashboard</strong><small>Status</small></div></button><button type='button' class='menu-item' data-view-target='control'><span>R</span><div><strong>Control</strong><small>Send buttons</small></div></button><button type='button' class='menu-item' data-view-target='ir'><span>IR</span><div><strong>IR Setup</strong><small>Add remotes</small></div></button><button type='button' class='menu-item' data-view-target='lab'><span>L</span><div><strong>Bulk IR Test</strong><small>Queue IR codes</small></div></button><button type='button' class='menu-item' data-view-target='bluetooth'><span>BT</span><div><strong>Bluetooth</strong><small>Keyboard</small></div></button><button type='button' class='menu-item' data-view-target='mqtt'><span>M</span><div><strong>MQTT</strong><small>Home Assistant</small></div></button><button type='button' class='menu-item' data-view-target='wifi'><span>W</span><div><strong>Wi-Fi</strong><small>Network</small></div></button><button type='button' class='menu-item' data-view-target='backup'><span>B</span><div><strong>Backup</strong><small>Import/export</small></div></button><button type='button' class='menu-item' data-view-target='system'><span>S</span><div><strong>System</strong><small>Logs/update</small></div></button></aside><div class='content'>",
+        "<header><div class='topbar'><div class='brand'><div class='brand-mark'>H</div><div><h1>Harmony Hub Control</h1><small>Local smart home console</small></div></div><div class='top-status'><span class='pill'>Local control</span><span class='pill %s'>Logitech cloud %s</span></div></div></header><main class='app-shell'><aside class='side-menu' aria-label='Main menu'><button type='button' class='menu-item active' data-view-target='overview'><span>D</span><div><strong>Dashboard</strong><small>Status</small></div></button><button type='button' class='menu-item' data-view-target='control'><span>R</span><div><strong>Control</strong><small>Send buttons</small></div></button><button type='button' class='menu-item' data-view-target='ir'><span>IR</span><div><strong>IR Setup</strong><small>Add remotes</small></div></button><button type='button' class='menu-item' data-view-target='lab'><span>L</span><div><strong>Bulk IR Test</strong><small>Queue IR codes</small></div></button><button type='button' class='menu-item' data-view-target='activities'><span>A</span><div><strong>Activities</strong><small>Watch TV, Xbox...</small></div></button><button type='button' class='menu-item' data-view-target='bluetooth'><span>BT</span><div><strong>Bluetooth</strong><small>Keyboard</small></div></button><button type='button' class='menu-item' data-view-target='mqtt'><span>M</span><div><strong>MQTT</strong><small>Home Assistant</small></div></button><button type='button' class='menu-item' data-view-target='wifi'><span>W</span><div><strong>Wi-Fi</strong><small>Network</small></div></button><button type='button' class='menu-item' data-view-target='backup'><span>B</span><div><strong>Backup</strong><small>Import/export</small></div></button><button type='button' class='menu-item' data-view-target='system'><span>S</span><div><strong>System</strong><small>Logs/update</small></div></button></aside><div class='content'>",
         cloud_blocked ? "ok" : "warn",
         cloud_blocked ? "blocked" : "allowed");
 }
@@ -2992,6 +3721,9 @@ static void page_end(FILE *f) {
         "function irStatus(deviceId,msg){document.querySelectorAll('[data-ir-status]').forEach(el=>{if(el.dataset.irStatus===deviceId)el.textContent=msg;});}"
         "function showIrStoredDevice(id){if(!id)return;document.querySelectorAll('[data-ir-device-pick]').forEach(b=>b.classList.toggle('active',b.dataset.irDevicePick===id));document.querySelectorAll('[data-ir-device]').forEach(p=>p.classList.toggle('active',p.dataset.irDevice===id));selectDeviceEverywhere(id);irStatus(id,'Ready.');}"
         "document.querySelectorAll('[data-ir-device-pick]').forEach(b=>b.addEventListener('click',()=>showIrStoredDevice(b.dataset.irDevicePick)));"
+        "function showActivity(id){if(!id)return;document.querySelectorAll('[data-activity-pick]').forEach(b=>b.classList.toggle('active',b.dataset.activityPick===id));document.querySelectorAll('[data-activity-workspace]').forEach(p=>p.classList.toggle('active',p.dataset.activityWorkspace===id));}"
+        "document.querySelectorAll('[data-activity-pick]').forEach(b=>b.addEventListener('click',()=>showActivity(b.dataset.activityPick)));"
+        "const activityTemplateSelect=$('activityTemplate');if(activityTemplateSelect){function syncActivityTemplate(){document.querySelectorAll('.activity-role-slots').forEach(el=>{el.hidden=el.dataset.template!==activityTemplateSelect.value;});}activityTemplateSelect.addEventListener('change',syncActivityTemplate);syncActivityTemplate();}"
         "function irFormData(form){const data={};new FormData(form).forEach((v,k)=>data[k]=v);return data;}"
         "document.querySelectorAll('.ir-send-form').forEach(form=>form.addEventListener('submit',async e=>{e.preventDefault();const data=irFormData(form),btn=form.querySelector('button')||form;if(!data.deviceId||!data.command)return;try{btn.classList.add('sending');form.classList.add('sending');irStatus(data.deviceId,'Sending '+data.command+'...');const j=await postJson('/api/ir-send',data);irStatus(data.deviceId,'Sent '+data.command+(j.reply?': '+String(j.reply).slice(0,140):''));}catch(err){irStatus(data.deviceId,'Send failed: '+(err.message||err));}finally{setTimeout(()=>{btn.classList.remove('sending');form.classList.remove('sending');},220);}}));"
         "document.querySelectorAll('.ir-command-filter').forEach(input=>input.addEventListener('input',()=>{const id=input.dataset.commandFilter,q=normText(input.value||'');document.querySelectorAll('[data-command-list=\"'+id+'\"]').forEach(list=>Array.from(list.children).forEach(row=>{const t=normText(row.textContent||row.dataset.commandName||'');row.classList.toggle('hidden',!!q&&!t.includes(q));}));}));"
@@ -3355,6 +4087,7 @@ static void backup_panel(FILE *f) {
     fprintf(f, "<a class='button' href='/export/devices'>Devices</a>");
     fprintf(f, "<a class='button' href='/export/functions'>Functions</a>");
     fprintf(f, "<a class='button' href='/export/protocols'>Protocols</a>");
+    fprintf(f, "<a class='button' href='/export/activities'>Activities</a>");
     fprintf(f, "<a class='button' href='/export/mqtt'>MQTT</a>");
     fprintf(f, "<a class='button' href='/export/wifi'>Wi-Fi</a>");
     fprintf(f, "<a class='button' href='/export/cloud'>Cloud blocker</a>");
@@ -3366,6 +4099,7 @@ static void backup_panel(FILE *f) {
     fprintf(f, "<option value='devices'>DeviceList.json</option>");
     fprintf(f, "<option value='functions'>FunctionList.json</option>");
     fprintf(f, "<option value='protocols'>ProtocolList.json</option>");
+    fprintf(f, "<option value='activities'>ActivityList.json</option>");
     fprintf(f, "<option value='mqtt'>MQTT config</option>");
     fprintf(f, "<option value='wifi'>Wi-Fi config</option>");
     fprintf(f, "<option value='cloud'>Cloud blocker setting</option>");
@@ -4283,6 +5017,128 @@ static void bt_saved_devices_panel(FILE *f, const struct bt_inventory *inv) {
     fprintf(f, "</div>");
 }
 
+static void activity_new_form(FILE *f, const struct ir_inventory *devs) {
+    size_t t, r;
+    fprintf(f, "<div class='panel'><h3>Create a new activity</h3><div class='help'>New activities are cloned from a known-good template, then customized with your own devices. Startup/shutdown actions are always left for the hub to generate from the roles below, matching how every activity already on this hub works.</div>");
+    fprintf(f, "<form method='post' action='/activity/new#activities'>");
+    fprintf(f, "<div class='row'><div><label>Template</label><select id='activityTemplate' name='template'>");
+    for (t = 0; t < ACTIVITY_TEMPLATE_COUNT; t++) {
+        fprintf(f, "<option value='%s'>", ACTIVITY_TEMPLATES[t].key);
+        html(f, ACTIVITY_TEMPLATES[t].label);
+        fprintf(f, "</option>");
+    }
+    fprintf(f, "</select></div><div><label>Name</label><input name='name' required placeholder='Xbox'></div></div>");
+    for (t = 0; t < ACTIVITY_TEMPLATE_COUNT; t++) {
+        fprintf(f, "<div class='activity-role-slots'%s data-template='%s'>",
+            t == 0 ? "" : " hidden", ACTIVITY_TEMPLATES[t].key);
+        for (r = 0; r < (size_t)ACTIVITY_TEMPLATES[t].role_count; r++) {
+            fprintf(f, "<div class='row'><div><label>");
+            html(f, ACTIVITY_TEMPLATES[t].roles[r].label);
+            fprintf(f, "</label><select name='deviceId%d'>", (int)r);
+            ir_device_options(f, devs, NULL);
+            fprintf(f, "</select></div><div><label>Input name (optional)</label><input name='inputName%d' placeholder='HDMI 1'>"
+                "<input type='hidden' name='inputId%d' value=''></div></div>", (int)r, (int)r);
+        }
+        fprintf(f, "</div>");
+    }
+    fprintf(f, "<div class='actions'><button type='submit'>Create activity</button></div></form></div>");
+}
+
+static void activity_render_editor(FILE *f, const struct activity *act, const struct ir_inventory *devs, int active) {
+    int j;
+    fprintf(f, "<div class='ir-device-workspace%s' data-activity-workspace='", active ? " active" : "");
+    html(f, act->id);
+    fprintf(f, "'><div class='ir-work-head'><div><h3>");
+    html(f, act->name[0] ? act->name : "Unnamed activity");
+    fprintf(f, "</h3><div class='muted mini'>order %d%s</div></div></div>",
+        act->activity_order, act->is_default ? " / current default" : "");
+
+    fprintf(f, "<h3>Activity details</h3><form method='post' action='/activity/update#activities'><input type='hidden' name='activityId' value='");
+    html(f, act->id);
+    fprintf(f, "'><div class='row'><div><label>Name</label><input name='name' value='");
+    html(f, act->name);
+    fprintf(f, "'></div><div><label>Display name (optional)</label><input name='displayName' value='");
+    html(f, act->display_name);
+    fprintf(f, "'></div></div><div class='row'><div><label>Order</label><input name='activityOrder' inputmode='numeric' value='%d'></div>", act->activity_order);
+    fprintf(f, "<div><label class='inline-check'><input type='checkbox' name='isDefault' value='1' %s> Default activity</label>"
+        "<div class='help'>Setting this does not automatically clear the default flag on other activities.</div></div></div>",
+        act->is_default ? "checked" : "");
+    fprintf(f, "<div class='actions'><button type='submit'>Save activity details</button></div></form>");
+
+    fprintf(f, "<form method='post' action='/activity/delete#activities'><input type='hidden' name='activityId' value='");
+    html(f, act->id);
+    fprintf(f, "'><div class='actions'><button class='danger' type='submit'>Delete activity</button></div></form>");
+
+    fprintf(f, "<h3 style='margin-top:16px'>Device roles</h3><div class='help'>Each role controls one device during this activity.</div>");
+    for (j = 0; j < act->role_count; j++) {
+        const struct activity_role *role = &act->roles[j];
+        fprintf(f, "<form method='post' action='/activity/update-role#activities' class='row'><input type='hidden' name='activityId' value='");
+        html(f, act->id);
+        fprintf(f, "'><input type='hidden' name='roleId' value='");
+        html(f, role->id);
+        fprintf(f, "'><input type='hidden' name='inputId' value='");
+        html(f, role->input_id);
+        fprintf(f, "'><div><label>");
+        html(f, role->type);
+        fprintf(f, "</label><select name='deviceId'>");
+        ir_device_options(f, devs, role->device_id);
+        fprintf(f, "</select></div><div><label>Input name</label><input name='inputName' value='");
+        html(f, role->input_name);
+        fprintf(f, "'></div><div><label>Power on order</label><input name='powerOnOrder' inputmode='numeric' value='%d'></div>", role->power_on_order);
+        fprintf(f, "<div><label>Power off order</label><input name='powerOffOrder' inputmode='numeric' value='%d'></div>", role->power_off_order);
+        fprintf(f, "<div><label>Power-on delay ms (optional)</label><input name='nextDelay' inputmode='numeric' value='");
+        if (role->has_delay) fprintf(f, "%ld", role->next_device_power_on_delay);
+        fprintf(f, "'></div>");
+        fprintf(f, "<div><button type='submit'>Save role</button></div></form>");
+    }
+    fprintf(f, "</div>");
+}
+
+static void activity_panel(FILE *f) {
+    struct activity_inventory *inv = (struct activity_inventory *)calloc(1, sizeof(*inv));
+    struct ir_inventory *devs = (struct ir_inventory *)calloc(1, sizeof(*devs));
+    int i;
+    if (!inv || !devs) {
+        free(inv);
+        free(devs);
+        return;
+    }
+    fprintf(f, "<section id='view-activities' data-view='activities' class='section'><div class='section-head'><div><h2>Activities</h2>"
+        "<div class='section-lead'>Edit existing activities or create a new one from a known-good template. This writes directly to the "
+        "hub's real activity list, the same file the physical remote and official app use.</div></div></div>");
+    load_ir_inventory(devs);
+    if (load_activity_inventory(inv) != 0) {
+        fprintf(f, "<div class='panel'><pre>Unable to read ");
+        html(f, ACTIVITY_LIST);
+        fprintf(f, "</pre></div></section>");
+        destroy_ir_inventory(devs);
+        free(inv);
+        return;
+    }
+    activity_new_form(f, devs);
+    if (inv->activity_count > 0) {
+        fprintf(f, "<div class='ir-stored-layout'><div class='panel'><h3>Edit existing activities</h3><div class='muted mini'>Choose an activity to edit its details or device roles.</div><div class='ir-device-picks'>");
+        for (i = 0; i < inv->activity_count; i++) {
+            fprintf(f, "<button type='button' class='ir-device-pick%s' data-activity-pick='", i == 0 ? " active" : "");
+            html(f, inv->activities[i].id);
+            fprintf(f, "'><div><strong>");
+            html(f, inv->activities[i].name[0] ? inv->activities[i].name : "Unnamed activity");
+            fprintf(f, "</strong><div class='muted mini'>order %d%s</div></div></button>",
+                inv->activities[i].activity_order, inv->activities[i].is_default ? " / default" : "");
+        }
+        fprintf(f, "</div></div><div class='panel'>");
+        for (i = 0; i < inv->activity_count; i++) {
+            activity_render_editor(f, &inv->activities[i], devs, i == 0);
+        }
+        fprintf(f, "</div></div>");
+    } else {
+        fprintf(f, "<div class='panel'><h3>No activities yet</h3><div class='muted'>Create one above using a template.</div></div>");
+    }
+    fprintf(f, "</section>");
+    destroy_ir_inventory(devs);
+    free(inv);
+}
+
 static void bluetooth_panel(FILE *f) {
     struct bt_inventory btinv;
     const struct bt_quick_key commands[] = {
@@ -4432,6 +5288,7 @@ static void render_page(int fd, const char *message) {
     ir_control_panel(f);
     ir_panel(f);
     ir_lab_panel(f);
+    activity_panel(f);
     bluetooth_panel(f);
     backup_panel(f);
     system_panel(f);
@@ -4592,6 +5449,7 @@ static const char *import_path_for_target(const char *target) {
     if (strcmp(target, "devices") == 0) return DEVICE_LIST;
     if (strcmp(target, "functions") == 0) return FUNCTION_LIST;
     if (strcmp(target, "protocols") == 0) return PROTOCOL_LIST;
+    if (strcmp(target, "activities") == 0) return ACTIVITY_LIST;
     if (strcmp(target, "mqtt") == 0) return MQTT_CONFIG;
     if (strcmp(target, "wifi") == 0) return WPA_CONFIG;
     if (strcmp(target, "cloud") == 0) return CLOUD_BLOCKER_CONFIG;
@@ -4604,6 +5462,7 @@ static const char *import_label_for_target(const char *target) {
     if (strcmp(target, "devices") == 0) return "DeviceList.json";
     if (strcmp(target, "functions") == 0) return "FunctionList.json";
     if (strcmp(target, "protocols") == 0) return "ProtocolList.json";
+    if (strcmp(target, "activities") == 0) return "ActivityList.json";
     if (strcmp(target, "mqtt") == 0) return "MQTT config";
     if (strcmp(target, "wifi") == 0) return "Wi-Fi config";
     if (strcmp(target, "cloud") == 0) return "cloud blocker setting";
@@ -4652,6 +5511,10 @@ static int validate_import_payload(const char *target, const char *payload, char
         snprintf(msg, msglen, "ProtocolList import must contain Protocols.");
         return -1;
     }
+    if (strcmp(target, "activities") == 0 && !strstr(payload, "\"Activities\"")) {
+        snprintf(msg, msglen, "ActivityList import must contain Activities.");
+        return -1;
+    }
     if (strcmp(target, "mqtt") == 0 && (!strstr(payload, "\"broker\"") || !strstr(payload, "\"baseTopic\""))) {
         snprintf(msg, msglen, "MQTT import must contain broker and baseTopic.");
         return -1;
@@ -4671,26 +5534,28 @@ static void handle_import_bundle(int fd, const char *payload) {
     char msg[256];
     char cloud[32] = "";
     char *cloud_value;
-    char *devices, *functions, *protocols, *mqtt, *wifi, *bluetooth;
+    char *devices, *functions, *protocols, *activities, *mqtt, *wifi, *bluetooth;
     devices = (char *)malloc(MAX_REQUEST_BODY);
     functions = (char *)malloc(MAX_REQUEST_BODY);
     protocols = (char *)malloc(MAX_REQUEST_BODY);
+    activities = (char *)malloc(MAX_REQUEST_BODY);
     mqtt = (char *)malloc(MAX_REQUEST_BODY);
     wifi = (char *)malloc(MAX_REQUEST_BODY);
     bluetooth = (char *)malloc(MAX_REQUEST_BODY);
-    if (!devices || !functions || !protocols || !mqtt || !wifi || !bluetooth) {
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+    if (!devices || !functions || !protocols || !activities || !mqtt || !wifi || !bluetooth) {
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         render_page(fd, "Not enough memory to import bundle.");
         return;
     }
     bluetooth[0] = 0;
+    activities[0] = 0;
     if (bundle_extract(payload, "DeviceList.json", devices, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "FunctionList.json", functions, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "ProtocolList.json", protocols, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "mqtt-config.json", mqtt, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0 ||
         bundle_extract(payload, "wpa_supplicant.conf", wifi, MAX_REQUEST_BODY, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     if (validate_import_payload("devices", devices, msg, sizeof(msg)) != 0 ||
@@ -4699,20 +5564,26 @@ static void handle_import_bundle(int fd, const char *payload) {
         validate_import_payload("mqtt", mqtt, msg, sizeof(msg)) != 0 ||
         validate_import_payload("wifi", wifi, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
+        return;
+    }
+    json_string(payload, "ActivityList.json", activities, MAX_REQUEST_BODY);
+    if (activities[0] && validate_import_payload("activities", activities, msg, sizeof(msg)) != 0) {
+        render_page(fd, msg);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     json_string(payload, "bt-devices.json", bluetooth, MAX_REQUEST_BODY);
     if (bluetooth[0] && validate_import_payload("bluetooth", bluetooth, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     json_string(payload, "cloud-blocker.conf", cloud, sizeof(cloud));
     cloud_value = trim_payload(cloud);
     if (cloud_value[0] && validate_import_payload("cloud", cloud_value, msg, sizeof(msg)) != 0) {
         render_page(fd, msg);
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     backup_resources();
@@ -4723,25 +5594,30 @@ static void handle_import_bundle(int fd, const char *payload) {
         write_file_atomic(MQTT_CONFIG, mqtt, strlen(mqtt)) != 0 ||
         write_file_atomic(WPA_CONFIG, wifi, strlen(wifi)) != 0) {
         render_page(fd, "Failed to import owner bundle.");
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     chmod(MQTT_CONFIG, 0600);
     chmod(WPA_CONFIG, 0600);
+    if (activities[0] && write_file_atomic(ACTIVITY_LIST, activities, strlen(activities)) != 0) {
+        render_page(fd, "Bundle imported most files, but failed to save ActivityList.");
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
+        return;
+    }
     if (bluetooth[0] && write_file_atomic(BT_DEVICE_STORE, bluetooth, strlen(bluetooth)) != 0) {
         render_page(fd, "Bundle imported most files, but failed to save Bluetooth devices.");
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     if (bluetooth[0]) chmod(BT_DEVICE_STORE, 0644);
     if (cloud_value[0] && save_cloud_blocker(cloud_value_enabled(cloud_value)) != 0) {
         render_page(fd, "Bundle imported most files, but failed to save the cloud blocker setting.");
-        free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+        free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
         return;
     }
     request_resource_reload();
     render_page(fd, "Backup bundle imported. Reboot when ready if Wi-Fi settings changed.");
-    free(devices); free(functions); free(protocols); free(mqtt); free(wifi); free(bluetooth);
+    free(devices); free(functions); free(protocols); free(activities); free(mqtt); free(wifi); free(bluetooth);
 }
 
 static void handle_import(int fd, const struct request *req) {
@@ -4777,7 +5653,7 @@ static void handle_import(int fd, const struct request *req) {
         return;
     }
     len = strlen(payload);
-    if (strcmp(target, "devices") == 0 || strcmp(target, "functions") == 0 || strcmp(target, "protocols") == 0) {
+    if (strcmp(target, "devices") == 0 || strcmp(target, "functions") == 0 || strcmp(target, "protocols") == 0 || strcmp(target, "activities") == 0) {
         backup_resources();
     } else {
         backup_settings();
@@ -6465,6 +7341,82 @@ static void handle_ir_delete_command(int fd, const struct request *req) {
     render_page(fd, msg);
 }
 
+static void handle_activity_new(int fd, const struct request *req) {
+    char template_key[24], name[128], msg[512];
+    char device_ids[MAX_ACTIVITY_ROLES][32], input_ids[MAX_ACTIVITY_ROLES][32], input_names[MAX_ACTIVITY_ROLES][128];
+    const char *device_id_ptrs[MAX_ACTIVITY_ROLES], *input_id_ptrs[MAX_ACTIVITY_ROLES], *input_name_ptrs[MAX_ACTIVITY_ROLES];
+    const struct activity_template *tpl;
+    int i, role_count;
+    char field[24];
+    form_value(req->body, "template", template_key, sizeof(template_key));
+    form_value(req->body, "name", name, sizeof(name));
+    tpl = find_activity_template(template_key);
+    role_count = tpl ? tpl->role_count : 0;
+    if (role_count > MAX_ACTIVITY_ROLES) role_count = MAX_ACTIVITY_ROLES;
+    for (i = 0; i < role_count; i++) {
+        snprintf(field, sizeof(field), "deviceId%d", i);
+        form_value(req->body, field, device_ids[i], sizeof(device_ids[i]));
+        snprintf(field, sizeof(field), "inputId%d", i);
+        form_value(req->body, field, input_ids[i], sizeof(input_ids[i]));
+        snprintf(field, sizeof(field), "inputName%d", i);
+        form_value(req->body, field, input_names[i], sizeof(input_names[i]));
+        device_id_ptrs[i] = device_ids[i];
+        input_id_ptrs[i] = input_ids[i];
+        input_name_ptrs[i] = input_names[i];
+    }
+    if (!tpl) {
+        snprintf(msg, sizeof(msg), "Unknown activity template.");
+    } else {
+        create_activity_from_template(template_key, name, device_id_ptrs, input_id_ptrs, input_name_ptrs,
+            role_count, msg, sizeof(msg), NULL, 0);
+    }
+    render_page(fd, msg);
+}
+
+static void handle_activity_update(int fd, const struct request *req) {
+    char activity_id[32], name[128], display_name[128], order_buf[32], msg[512];
+    long activity_order;
+    int is_default, has_display_name;
+    form_value(req->body, "activityId", activity_id, sizeof(activity_id));
+    form_value(req->body, "name", name, sizeof(name));
+    form_value(req->body, "displayName", display_name, sizeof(display_name));
+    form_value(req->body, "activityOrder", order_buf, sizeof(order_buf));
+    has_display_name = display_name[0] != 0;
+    activity_order = order_buf[0] ? strtol(order_buf, NULL, 10) : 0;
+    is_default = form_checked(req->body, "isDefault");
+    update_activity(activity_id, name, display_name, has_display_name, activity_order, is_default, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_activity_update_role(int fd, const struct request *req) {
+    char activity_id[32], role_id[32], device_id[32], input_id[32], input_name[128];
+    char power_on_buf[32], power_off_buf[32], delay_buf[32], msg[512];
+    long power_on_order, power_off_order, next_delay;
+    int has_delay;
+    form_value(req->body, "activityId", activity_id, sizeof(activity_id));
+    form_value(req->body, "roleId", role_id, sizeof(role_id));
+    form_value(req->body, "deviceId", device_id, sizeof(device_id));
+    form_value(req->body, "inputId", input_id, sizeof(input_id));
+    form_value(req->body, "inputName", input_name, sizeof(input_name));
+    form_value(req->body, "powerOnOrder", power_on_buf, sizeof(power_on_buf));
+    form_value(req->body, "powerOffOrder", power_off_buf, sizeof(power_off_buf));
+    form_value(req->body, "nextDelay", delay_buf, sizeof(delay_buf));
+    power_on_order = power_on_buf[0] ? strtol(power_on_buf, NULL, 10) : 0;
+    power_off_order = power_off_buf[0] ? strtol(power_off_buf, NULL, 10) : 0;
+    has_delay = delay_buf[0] != 0;
+    next_delay = has_delay ? strtol(delay_buf, NULL, 10) : 0;
+    update_activity_role(activity_id, role_id, device_id, input_id, input_name,
+        power_on_order, power_off_order, next_delay, has_delay, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
+static void handle_activity_delete(int fd, const struct request *req) {
+    char activity_id[32], msg[512];
+    form_value(req->body, "activityId", activity_id, sizeof(activity_id));
+    delete_activity(activity_id, msg, sizeof(msg));
+    render_page(fd, msg);
+}
+
 static void handle_bt_device(int fd, const struct request *req) {
     char device_id[64], name[128], type[40], bdaddr[32], msg[512];
     form_value(req->body, "deviceId", device_id, sizeof(device_id));
@@ -6698,6 +7650,8 @@ static void handle_client(int client) {
         send_file_download(client, FUNCTION_LIST, "FunctionList.json", "application/json");
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/protocols") == 0) {
         send_file_download(client, PROTOCOL_LIST, "ProtocolList.json", "application/json");
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/activities") == 0) {
+        send_file_download(client, ACTIVITY_LIST, "ActivityList.json", "application/json");
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/mqtt") == 0) {
         send_file_download(client, MQTT_CONFIG, "mqtt-config.json", "application/json");
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/export/wifi") == 0) {
@@ -6732,6 +7686,14 @@ static void handle_client(int client) {
         handle_ir_delete_device(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/ir/delete-command") == 0) {
         handle_ir_delete_command(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/activity/new") == 0) {
+        handle_activity_new(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/activity/update") == 0) {
+        handle_activity_update(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/activity/update-role") == 0) {
+        handle_activity_update_role(client, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/activity/delete") == 0) {
+        handle_activity_delete(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/device") == 0) {
         handle_bt_device(client, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/bt/delete-device") == 0) {
