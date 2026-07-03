@@ -2411,6 +2411,31 @@ static void activity_top_level_segments(const char *item_start, const char *item
     }
 }
 
+/* Same idea one level deeper: a role's own "Id-" must not be shadowed by its
+ * nested SelectedInput object's "Id-" (SelectedInput can appear before the
+ * role's own Id- in key order, e.g. {"SelectedInput":{...,"Id-":X},...,"Id-":Y}).
+ * Search seg1 then seg2 for role-level fields, never the raw (role_start,role_end) span. */
+static void activity_role_top_level_segments(const char *role_start, const char *role_end,
+        const char **seg1_start, const char **seg1_end, const char **seg2_start, const char **seg2_end) {
+    const char *key = find_key_range(role_start, role_end, "SelectedInput");
+    const char *colon, *vstart, *vend;
+    if (key && key < role_end) {
+        colon = strchr(key + strlen("SelectedInput") + 2, ':');
+        vstart = (colon && colon < role_end) ? colon + 1 : NULL;
+        while (vstart && *vstart && vstart < role_end && isspace((unsigned char)*vstart)) vstart++;
+        if (vstart && *vstart == '{') {
+            vend = find_matching_json(vstart, '{', '}');
+            if (vend && vend < role_end) {
+                *seg1_start = role_start; *seg1_end = key;
+                *seg2_start = vend + 1; *seg2_end = role_end;
+                return;
+            }
+        }
+    }
+    *seg1_start = role_start; *seg1_end = role_end;
+    *seg2_start = NULL; *seg2_end = NULL;
+}
+
 static int update_activity_scalar_field(char **pdata, size_t *plen, const char *activity_id, const char *key, const char *literal) {
     const char *arr, *arr_end, *item_start, *item_end;
     const char *seg1_start, *seg1_end, *seg2_start, *seg2_end;
@@ -2554,9 +2579,12 @@ static int load_activity_inventory(struct activity_inventory *inv) {
                 struct activity_role *role = &act->roles[act->role_count];
                 const char *robj_end = find_matching_json(rpos, '{', '}');
                 const char *sel_key, *sel_colon, *sel_start, *sel_end;
+                const char *rseg1_start, *rseg1_end, *rseg2_start, *rseg2_end;
                 long rid, did;
                 if (!robj_end || robj_end > roles_arr_end) break;
-                rid = json_long_range(rpos, robj_end, "Id-", 0);
+                activity_role_top_level_segments(rpos, robj_end, &rseg1_start, &rseg1_end, &rseg2_start, &rseg2_end);
+                rid = json_long_range(rseg1_start, rseg1_end, "Id-", 0);
+                if (rid == 0 && rseg2_start) rid = json_long_range(rseg2_start, rseg2_end, "Id-", 0);
                 snprintf(role->id, sizeof(role->id), "%ld", rid);
                 if (rid > inv->max_role_id) inv->max_role_id = rid;
                 json_string_range(rpos, robj_end, "__type", role->type, sizeof(role->type));
